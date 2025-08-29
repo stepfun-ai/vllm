@@ -17,7 +17,8 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     get_sentence_transformer_tokenizer_config)
-from vllm.transformers_utils.tokenizers import MistralTokenizer
+from vllm.transformers_utils.tokenizers import (MistralTokenizer,
+                                                StepAudio2Tokenizer)
 from vllm.transformers_utils.utils import check_gguf_file
 from vllm.utils import make_async
 
@@ -33,7 +34,7 @@ else:
 logger = init_logger(__name__)
 
 AnyTokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast,
-                     TokenizerBase]
+                     TokenizerBase, StepAudio2Tokenizer]
 
 
 def decode_tokens(
@@ -212,6 +213,14 @@ def get_tokenizer(
                                                     revision=revision,
                                                     download_dir=download_dir,
                                                     **kwargs)
+    elif tokenizer_mode == "step_audio_2":
+        tokenizer = StepAudio2Tokenizer.from_pretrained(
+            str(tokenizer_name),
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     else:
         try:
             tokenizer = AutoTokenizer.from_pretrained(

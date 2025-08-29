@@ -255,7 +255,7 @@ def is_init_field(cls: ConfigType, name: str) -> bool:
     return next(f for f in fields(cls) if f.name == name).init
 
 
-TokenizerMode = Literal["auto", "slow", "mistral", "custom"]
+TokenizerMode = Literal["auto", "slow", "mistral", "custom", "step_audio_2"]
 ModelDType = Literal["auto", "half", "float16", "bfloat16", "float", "float32"]
 MMEncoderTPMode = Literal["weights", "data"]
 
@@ -501,6 +501,8 @@ class ModelConfig:
     logits_processors: Optional[list[Union[str, type[LogitsProcessor]]]] = None
     """One or more logits processors' fully-qualified class names or class
     definitions"""
+    audio_parser: Optional[str] = None
+    """Set custom parser for model deps. """
 
     def compute_hash(self) -> str:
         """
@@ -3925,7 +3927,8 @@ class VllmConfig:
             f"chunked_prefill_enabled={self.scheduler_config.chunked_prefill_enabled}, "  # noqa
             f"use_async_output_proc={self.model_config.use_async_output_proc}, "
             f"pooler_config={self.model_config.pooler_config!r}, "
-            f"compilation_config={self.compilation_config!r}")
+            f"compilation_config={self.compilation_config!r}, "
+            f"audio_parser={self.model_config.audio_parser!r}")
 
 
 _current_vllm_config: Optional[VllmConfig] = None

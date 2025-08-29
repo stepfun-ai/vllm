@@ -15,6 +15,7 @@ from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
 from pydantic import TypeAdapter
 
+from vllm.audio_parser import AudioParser, AudioParserManager
 from vllm.config import ModelConfig
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (ChatTemplateContentFormatOption,
@@ -73,6 +74,7 @@ class OpenAIServingChat(OpenAIServing):
         enable_auto_tools: bool = False,
         exclude_tools_when_tool_choice_none: bool = False,
         tool_parser: Optional[str] = None,
+        audio_parser: Optional[str] = None,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
@@ -145,6 +147,18 @@ class OpenAIServingChat(OpenAIServing):
                 self.default_sampling_params["stop_token_ids"] = []
             self.default_sampling_params["stop_token_ids"].extend(
                 get_stop_tokens_for_assistant_actions())
+
+        if audio_parser:
+            assert audio_parser == "step_audio_2_tts_ta4", "Only support step_audio_2_tts_ta4_parser now for custom audio parser."  # noqa: E501
+
+        self.step_audio_2_tts_ta4_parser: Optional[Callable[
+            [AnyTokenizer], AudioParser]] = None
+        self.step_audio_2_tts_ta4_parser_instance = None
+        self.enable_step_audio_2_tts_ta4_parser = (
+            audio_parser == "step_audio_2_tts_ta4")  # noqa: E501
+        if self.enable_step_audio_2_tts_ta4_parser:
+            self.step_audio_2_tts_ta4_parser = AudioParserManager.get_audio_parser(
+                audio_parser)
 
         # NOTE(woosuk): While OpenAI's chat completion API supports browsing
         # for some models, currently vLLM doesn't support it. Please use the
@@ -483,6 +497,9 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        # For step_audio_2
+        need_byte_fall_back_token_ids = [[]] * num_choices
+
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant()
@@ -511,7 +528,7 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or self.reasoning_parser:
+        if tool_choice_auto or self.reasoning_parser or self.enable_step_audio_2_tts_ta4_parser:  # noqa: E501
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[]] * num_choices
             # For reasoning parser and tool call all enabled
@@ -521,6 +538,10 @@ class OpenAIServingChat(OpenAIServing):
             all_previous_token_ids = None
         else:
             all_previous_token_ids = None
+
+        if self.enable_step_audio_2_tts_ta4_parser and self.step_audio_2_tts_ta4_parser_instance is None:  # noqa: E501
+            self.step_audio_2_tts_ta4_parser_instance = self.step_audio_2_tts_ta4_parser(  # noqa: E501
+                tokenizer)
 
         try:
             if self.reasoning_parser:
@@ -561,6 +582,10 @@ class OpenAIServingChat(OpenAIServing):
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+
+                    if self.enable_step_audio_2_tts_ta4_parser:
+                        is_tts_ta4_output = self.step_audio_2_tts_ta4_parser_instance.is_tts_ta4_output(  # noqa: E501
+                            res.prompt_token_ids)
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -680,7 +705,8 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: Optional[DeltaMessage]
 
                     # just update previous_texts and previous_token_ids
-                    if ((tool_choice_auto or self.reasoning_parser)
+                    if ((tool_choice_auto or self.reasoning_parser
+                         or self.enable_step_audio_2_tts_ta4_parser)
                             and not self.use_harmony):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
@@ -752,7 +778,7 @@ class OpenAIServingChat(OpenAIServing):
                                         name=tool_choice_function_name,
                                         arguments=delta_text),
                                     index=i)
-                                function_name_returned[i] = True
+                                # function_name_returned[i] = True
 
                             delta_message = DeltaMessage(tool_calls=[
                                 delta_tool_call,
@@ -887,7 +913,8 @@ class OpenAIServingChat(OpenAIServing):
                         delta_message = DeltaMessage(content=delta_text)
 
                     # update the previous values for the next iteration
-                    if ((tool_choice_auto or self.reasoning_parser)
+                    if ((tool_choice_auto or self.reasoning_parser
+                         or self.enable_step_audio_2_tts_ta4_parser)
                             and not self.use_harmony):
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
@@ -907,6 +934,34 @@ class OpenAIServingChat(OpenAIServing):
                     #   get the next token without streaming a chunk
                     if delta_message is None:
                         continue
+
+                    if self.enable_step_audio_2_tts_ta4_parser and is_tts_ta4_output:  # noqa: E501
+                        text_token_ids, audio_token_ids, other_token_ids = \
+                            self.step_audio_2_tts_ta4_parser_instance.extract_tts_content_streaming( # noqa: E501
+                                previous_token_ids=previous_token_ids,
+                                current_token_ids=current_token_ids,
+                                delta_token_ids=output.token_ids,
+                                is_tts_ta4_output=is_tts_ta4_output)
+                        current_tts_text = tokenizer.decode(text_token_ids)
+                        check_byte_fallback = "�" in current_tts_text
+                        if check_byte_fallback:
+                            need_byte_fall_back_token_ids[i].extend(
+                                text_token_ids)
+                            # tts_text_trans_before = current_tts_text
+                            current_tts_text = tokenizer.decode(
+                                need_byte_fall_back_token_ids[i])
+                            # logger.info(
+                            #     f"[byte-fallback] - current_text={tts_text_trans_before}, current_text_token_ids={text_token_ids}, need_byte_fall_back_token_ids={need_byte_fall_back_token_ids[i]}, after_trans_text={current_tts_text}"  # noqa: E501
+                            # )
+                            if "�" in current_tts_text:
+                                continue
+                            else:
+                                need_byte_fall_back_token_ids[i] = []
+                        delta_message.tts_content[
+                            'tts_text'] = current_tts_text
+                        delta_message.tts_content[
+                            'tts_audio'] = tokenizer.decode(audio_token_ids)
+                        delta_message.content = ""  # after function call, the content should be null  # noqa: E501
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1020,7 +1075,7 @@ class OpenAIServingChat(OpenAIServing):
                             total_tokens=num_prompt_tokens + completion_tokens,
                         )
 
-                    data = chunk.model_dump_json(exclude_unset=True)
+                    data = chunk.model_dump_json(exclude_unset=False)
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage
@@ -1111,6 +1166,12 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
         else:
             history_tool_call_cnt = 0
+
+        if self.enable_step_audio_2_tts_ta4_parser:
+            step_audio_2_tts_ta4_parser = self.step_audio_2_tts_ta4_parser(
+                tokenizer)
+            is_tts_ta4_output = step_audio_2_tts_ta4_parser.is_tts_ta4_output(
+                final_res.prompt_token_ids)
 
         role = self.get_chat_request_role(request)
         for output in final_res.outputs:
@@ -1282,7 +1343,6 @@ class OpenAIServingChat(OpenAIServing):
                     message = ChatMessage(role=role,
                                           reasoning_content=reasoning_content,
                                           content=ret_content)
-
             # undetermined case that is still important to handle
             else:
                 logger.error(
@@ -1292,6 +1352,18 @@ class OpenAIServingChat(OpenAIServing):
                 message = ChatMessage(role=role,
                                       reasoning_content=reasoning_content,
                                       content=content)
+
+            if self.enable_step_audio_2_tts_ta4_parser and is_tts_ta4_output:
+                text_token_ids, audio_token_ids, other_token_ids = \
+                    step_audio_2_tts_ta4_parser.extract_tts_content_nonstreaming(
+                        token_ids,
+                        request=request,
+                        is_tts_ta4_output=is_tts_ta4_output)
+                message.tts_content['tts_text'] = tokenizer.decode(
+                    text_token_ids)
+                message.tts_content['tts_audio'] = tokenizer.decode(
+                    audio_token_ids)
+                message.content = ""  # after function call, the content should be null # noqa: E501
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,

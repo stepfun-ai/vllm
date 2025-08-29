@@ -1681,6 +1681,7 @@ class ChatMessage(OpenAIBaseModel):
     audio: Optional[OpenAIChatCompletionAudio] = None
     function_call: Optional[FunctionCall] = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    tts_content: Optional[dict[str, str]] = Field(default_factory=dict)
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning_content: Optional[str] = None
@@ -1739,6 +1740,7 @@ class DeltaMessage(OpenAIBaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+    tts_content: Optional[dict[str, str]] = Field(default_factory=dict)
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):

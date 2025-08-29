@@ -1763,6 +1763,7 @@ async def init_app_state(
         exclude_tools_when_tool_choice_none=args.
         exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
+        audio_parser=args.audio_parser,
         reasoning_parser=args.reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,

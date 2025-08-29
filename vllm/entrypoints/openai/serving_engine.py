@@ -33,6 +33,7 @@ from vllm.entrypoints.chat_utils import (ChatCompletionMessageParam,
                                          ConversationMessage,
                                          apply_hf_chat_template,
                                          apply_mistral_chat_template,
+                                         apply_step_audio_2_chat_template,
                                          parse_chat_messages_futures,
                                          resolve_chat_template_content_format)
 from vllm.entrypoints.context import ConversationContext
@@ -73,7 +74,8 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.sequence import Logprob, PromptLogprobs
 from vllm.tracing import (contains_trace_headers, extract_trace_headers,
                           log_tracing_disabled_warning)
-from vllm.transformers_utils.tokenizer import AnyTokenizer, MistralTokenizer
+from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
+                                               StepAudio2Tokenizer)
 from vllm.utils import (AsyncMicrobatchTokenizer, is_list_of,
                         merge_async_iterators, random_uuid)
 
@@ -890,6 +892,12 @@ class OpenAIServing:
             request_prompt = apply_mistral_chat_template(
                 tokenizer,
                 messages=messages,
+                **_chat_template_kwargs,
+            )
+        elif isinstance(tokenizer, StepAudio2Tokenizer):
+            request_prompt = apply_step_audio_2_chat_template(
+                tokenizer,
+                conversation=conversation,
                 **_chat_template_kwargs,
             )
         else:
