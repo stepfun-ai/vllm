@@ -32,6 +32,8 @@ from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from .utils import (flatten_bn, init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
 
+AUDIO_START_TOKEN_ID = 151688
+AUDIO_END_TOKEN_ID = 151689
 AUDIO_PATCH_TOKEN_ID = 151690
 
 
@@ -107,10 +109,7 @@ class Step1fProcessor:
     ) -> tuple[str, list[int]]:
         num_audio_tokens = self.get_num_audio_tokens(audio_feat_len)
         text = "<audio_start>" + "<audio_patch>" * num_audio_tokens + "<audio_end>"  # noqa: E501
-        token_ids = [self.tokenizer.convert_tokens_to_ids("<audio_start>")
-                     ] + [self.audio_token_id] * num_audio_tokens + [
-                         self.tokenizer.convert_tokens_to_ids("<audio_end>")
-                     ]
+        token_ids = [AUDIO_START_TOKEN_ID] + [AUDIO_PATCH_TOKEN_ID] * num_audio_tokens + [AUDIO_END_TOKEN_ID]
         return text, token_ids
 
     def replace_placeholder(self, text: str, placeholder: str,
@@ -333,7 +332,7 @@ class Step1fAudioMultiModalProcessor(
         out_mm_kwargs: MultiModalKwargs,
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        audio_token_id = processor.audio_token_id
+        audio_token_id = AUDIO_PATCH_TOKEN_ID
 
         out_mm_data = out_mm_kwargs.get_data()
 
