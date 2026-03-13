@@ -5,7 +5,7 @@
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class AnthropicError(BaseModel):
@@ -40,6 +40,7 @@ class AnthropicContentBlock(BaseModel):
     source: dict[str, Any] | None = None
     # For tool use/result
     id: str | None = None
+    tool_use_id: str | None = None
     name: str | None = None
     input: dict[str, Any] | None = None
     content: str | list[dict[str, Any]] | None = None
@@ -76,8 +77,14 @@ class AnthropicTool(BaseModel):
 class AnthropicToolChoice(BaseModel):
     """Tool Choice definition"""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_name_required_for_tool(self) -> "AnthropicToolChoice":
+        if self.type == "tool" and not self.name:
+            raise ValueError("tool_choice.name is required when type is 'tool'")
+        return self
 
 
 class AnthropicMessagesRequest(BaseModel):
@@ -168,3 +175,33 @@ class AnthropicMessagesResponse(BaseModel):
     def model_post_init(self, __context):
         if not self.id:
             self.id = f"msg_{int(time.time() * 1000)}"
+
+
+class AnthropicContextManagement(BaseModel):
+    """Context management information for token counting."""
+
+    original_input_tokens: int
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic messages.count_tokens request"""
+
+    model: str
+    messages: list[AnthropicMessage]
+    system: str | list[AnthropicContentBlock] | None = None
+    tool_choice: AnthropicToolChoice | None = None
+    tools: list[AnthropicTool] | None = None
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, v):
+        if not v:
+            raise ValueError("Model is required")
+        return v
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """Anthropic messages.count_tokens response"""
+
+    input_tokens: int
+    context_management: AnthropicContextManagement | None = None

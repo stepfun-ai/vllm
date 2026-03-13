@@ -4,7 +4,7 @@ from typing import Any
 
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -150,25 +150,17 @@ class MultiLayerEagleProposer(EagleProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
-            num_tokens_unpadded=num_tokens, num_tokens_padded=num_tokens
-        )
-        if use_cudagraphs:
-            cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
-                num_tokens_dp_padded
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(
+                num_tokens, use_cudagraphs=use_cudagraphs
             )
-            num_input_tokens = batch_desc.num_tokens
-        else:
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
-            num_input_tokens = num_tokens_dp_padded
-        if num_tokens_across_dp is not None:
-            num_tokens_across_dp[self.dp_rank] = num_input_tokens
+        )
 
         # Make sure to use EAGLE's own buffer during cudagraph capture.
         if (
-            self.attn_layer_names
+            self._draft_attn_layer_names
             and slot_mappings is not None
-            and self.attn_layer_names[0] in slot_mappings
+            and next(iter(self._draft_attn_layer_names)) in slot_mappings
         ):
             slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
         else:
