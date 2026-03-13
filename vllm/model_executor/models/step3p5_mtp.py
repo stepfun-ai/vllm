@@ -55,7 +55,7 @@ class Step3p5AMultiTokenPredictorLayer(nn.Module):
         self.enorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
+        self.lm_head = SharedHead(config=config, quant_config=quant_config)
         self.mtp_block = Step3p5DecoderLayer(
             vllm_config,
             prefix=f"{prefix}.mtp_block",
@@ -136,7 +136,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+            mtp_layer.lm_head.head, mtp_layer.lm_head(hidden_states)
         )
         return logits
 
@@ -262,6 +262,7 @@ class Step3p5MTP(nn.Module):
                         name = name.replace(".transformer.", ".")
                     if "shared_head" in name:
                         name = name.replace("shared_head.output", "shared_head.head")
+                        name = name.replace("shared_head", "lm_head")
                     if "embed_tokens" in name:
                         assert (
                             hasattr(self.config, "num_nextn_predict_layers")

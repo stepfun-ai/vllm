@@ -35,12 +35,6 @@ class MultiLayerEagleProposer(EagleProposer):
         self.num_speculative_tokens: int = (
             self.speculative_config.num_speculative_tokens
         )
-        if self.num_speculative_tokens != self.layer_num:
-            logger.warning_once(
-                "For multi_layer_eagle, num_speculative_tokens "
-                "does not match layer_num, adjusting to layer_num"
-            )
-            self.num_speculative_tokens = self.layer_num
 
     def adjust_input(
         self,

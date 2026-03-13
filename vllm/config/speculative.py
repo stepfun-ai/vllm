@@ -547,6 +547,17 @@ class SpeculativeConfig:
                         # Default to max value defined in draft model config.
                         self.num_speculative_tokens = n_predict
                     elif (
+                        self.method == "mtp"
+                        and self.enable_multi_layers_mtp
+                        and self.num_speculative_tokens > n_predict
+                    ):
+                        logger.warning_once(
+                            "For multi_layer_eagle, num_speculative_tokens "
+                            "is greater than the layer_num, adjusting to "
+                            "layer_num"
+                        )
+                        self.num_speculative_tokens = n_predict
+                    elif (
                         self.num_speculative_tokens > n_predict
                         and self.num_speculative_tokens % n_predict != 0
                     ):
