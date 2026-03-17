@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -40,9 +41,11 @@ class SharedHead(nn.Module):
         return self.norm(hidden_states)
 
 
+@support_torch_compile
 class Step3p5AMultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,
+        *,
         vllm_config: VllmConfig,
         prefix: str,
     ) -> None:
@@ -52,7 +55,7 @@ class Step3p5AMultiTokenPredictorLayer(nn.Module):
         self.enorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
+        self.lm_head = SharedHead(config=config, quant_config=quant_config)
         self.mtp_block = Step3p5DecoderLayer(
             vllm_config,
             prefix=f"{prefix}.mtp_block",
@@ -64,9 +67,12 @@ class Step3p5AMultiTokenPredictorLayer(nn.Module):
         positions: torch.Tensor,
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        embed_tokens: VocabParallelEmbedding | None = None,
         spec_step_index: int = 0,
     ) -> torch.Tensor:
-        assert inputs_embeds is not None
+        if inputs_embeds is None:
+            assert embed_tokens is not None
+            inputs_embeds = embed_tokens(input_ids)
         inputs_embeds = self.enorm(inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -92,8 +98,8 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): Step3p5AMultiTokenPredictorLayer(
-                    vllm_config,
-                    f"{prefix}.layers.{idx}",
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.layers.{idx}",
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -112,14 +118,13 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
+            self.embed_tokens,
             current_step_idx,
         )
 
@@ -131,7 +136,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
         logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
+            mtp_layer.lm_head.head, mtp_layer.lm_head(hidden_states)
         )
         return logits
 
@@ -257,6 +262,7 @@ class Step3p5MTP(nn.Module):
                         name = name.replace(".transformer.", ".")
                     if "shared_head" in name:
                         name = name.replace("shared_head.output", "shared_head.head")
+                        name = name.replace("shared_head", "lm_head")
                     if "embed_tokens" in name:
                         assert (
                             hasattr(self.config, "num_nextn_predict_layers")

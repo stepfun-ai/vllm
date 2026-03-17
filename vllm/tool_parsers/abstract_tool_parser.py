@@ -118,6 +118,12 @@ class ToolParser:
             "AbstractToolParser.extract_tool_calls_streaming has not been implemented!"
         )
 
+    def parser_should_check_for_unstreamed_tool_arg_tokens(self) -> bool:
+        """
+        Whether to check for unstreamed tool-argument tokens in serving
+        """
+        return True
+
 
 class ToolParserManager:
     """
