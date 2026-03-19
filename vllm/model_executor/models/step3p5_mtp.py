@@ -19,6 +19,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
+from .interfaces import SupportsPP
 from .step3p5 import Step3p5DecoderLayer, get_spec_layer_idx_from_weight_name
 from .utils import maybe_prefix
 
@@ -144,7 +145,7 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         return self.embed_tokens(input_ids)
 
 
-class Step3p5MTP(nn.Module):
+class Step3p5MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
