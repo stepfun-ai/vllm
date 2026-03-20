@@ -6,28 +6,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import MultiLayerEagleMetadata
-
-logger = init_logger(__name__)
-
-
-def _pp_debug_value(value: Any, limit: int = 32) -> Any:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().tolist()
-    elif hasattr(value, "tolist"):
-        value = value.tolist()
-    elif isinstance(value, tuple):
-        value = list(value)
-
-    if isinstance(value, list) and len(value) > limit:
-        return value[:limit] + ["..."]
-    return value
 
 
 BLOCK_HIDDEN = 128
@@ -85,7 +69,6 @@ class MultiLayerEagleProposer(EagleProposer):
             start_token_pos,
         )
         shift = torch.clamp(shift, min=0)
-        raw_shift = shift.clone()
 
         # Metadata updates (matches the original reference implementation).
         token_indices_to_sample.add_(shift)
@@ -108,27 +91,6 @@ class MultiLayerEagleProposer(EagleProposer):
 
         cached_lens = multi_layer_eagle_metadata.cached_len
         shift = torch.minimum(shift, cached_lens)
-        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
-            logger.error(
-                "PP_SPEC eagle_adjust batch=%d query_start_loc=%s "
-                "token_indices_to_sample=%s start_indices=%s end_indices=%s "
-                "start_positions=%s raw_shift=%s clipped_shift=%s "
-                "cached_len=%s seq_lens=%s slot_mapping=%s "
-                "target_token_ids=%s target_positions=%s",
-                batch_size,
-                _pp_debug_value(common_attn_metadata.query_start_loc_cpu),
-                _pp_debug_value(token_indices_to_sample),
-                _pp_debug_value(start_token_indices),
-                _pp_debug_value(end_token_indices),
-                _pp_debug_value(start_token_pos),
-                _pp_debug_value(raw_shift),
-                _pp_debug_value(shift),
-                _pp_debug_value(cached_lens),
-                _pp_debug_value(common_attn_metadata.seq_lens),
-                _pp_debug_value(slot_mapping),
-                _pp_debug_value(target_token_ids),
-                _pp_debug_value(target_positions),
-            )
 
         _multi_layer_eagle_shift_and_cache(
             batch_size=batch_size,
@@ -301,8 +263,6 @@ def _multi_layer_eagle_shift_and_cache(
     if src_slot_mapping.data_ptr() == dst_slot_mapping.data_ptr():
         src_slot_mapping = src_slot_mapping.clone()
 
-    cached_lens_before = cached_lens.clone()
-
     # Cache extraction for the next call.
     store_start = torch.maximum(
         start_token_indices,
@@ -325,25 +285,6 @@ def _multi_layer_eagle_shift_and_cache(
         .item()
     )
     num_blocks = max(1, (max_window_len + BLOCK_TOKENS - 1) // BLOCK_TOKENS)
-
-    logger.error(
-        "PP_SPEC eagle_cache_before batch=%d query_start_loc=%s "
-        "start_indices=%s end_indices=%s token_indices_to_sample=%s "
-        "shift=%s cached_lens_before=%s store_start=%s store_lens=%s "
-        "src_token_ids=%s src_positions=%s src_slot_mapping=%s",
-        batch_size,
-        _pp_debug_value(common_attn_metadata.query_start_loc_cpu),
-        _pp_debug_value(start_token_indices),
-        _pp_debug_value(end_token_indices),
-        _pp_debug_value(token_indices_to_sample),
-        _pp_debug_value(shift),
-        _pp_debug_value(cached_lens_before),
-        _pp_debug_value(store_start),
-        _pp_debug_value(store_lens),
-        _pp_debug_value(src_token_ids),
-        _pp_debug_value(src_positions),
-        _pp_debug_value(src_slot_mapping),
-    )
 
     _shift_and_gather_cache_1d_kernel[(batch_size, num_blocks)](
         src_token_ids,
@@ -414,19 +355,6 @@ def _multi_layer_eagle_shift_and_cache(
     )
 
     cached_lens.copy_(store_lens)
-    logger.error(
-        "PP_SPEC eagle_cache_after batch=%d cached_lens=%s "
-        "cached_token_ids=%s cached_slot_mappings=%s cached_positions=%s "
-        "dst_token_ids=%s dst_positions=%s dst_slot_mapping=%s",
-        batch_size,
-        _pp_debug_value(cached_lens),
-        _pp_debug_value(cached_prev_token_ids),
-        _pp_debug_value(cached_slot_mappings),
-        _pp_debug_value(cached_prev_positions),
-        _pp_debug_value(dst_token_ids),
-        _pp_debug_value(dst_positions),
-        _pp_debug_value(dst_slot_mapping),
-    )
     return
 
 

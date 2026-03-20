@@ -201,19 +201,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _pp_debug_value(value: Any, limit: int = 32) -> Any:
-    if isinstance(value, torch.Tensor):
-        value = value.detach().cpu().tolist()
-    elif isinstance(value, np.ndarray):
-        value = value.tolist()
-    elif isinstance(value, tuple):
-        value = list(value)
-
-    if isinstance(value, list) and len(value) > limit:
-        return value[:limit] + ["..."]
-    return value
-
-
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -444,8 +431,6 @@ class GPUModelRunner(
             self.parallel_config.distributed_executor_backend == "external_launcher"
             and len(get_pp_group().ranks) > 1
         )
-        self.use_pp = get_pp_group().world_size > 1
-
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
@@ -1104,14 +1089,6 @@ class GPUModelRunner(
             self.input_batch.num_accepted_tokens_cpu[:num_prev_reqs] = (
                 valid_sampled_token_count[:num_prev_reqs]
             )
-            if self.use_pp:
-                pp = get_pp_group()
-                logger.error(
-                    "PP_SPEC accepted_sync rank=%d req_ids=%s num_accepted=%s",
-                    pp.rank,
-                    self.input_batch.req_ids[:num_prev_reqs],
-                    _pp_debug_value(valid_sampled_token_count[:num_prev_reqs]),
-                )
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1261,17 +1238,6 @@ class GPUModelRunner(
         # rank as well instead of relying on a later hybrid-only path.
         accepted_tokens_cpu = accepted_tokens.cpu().numpy()
         self.input_batch.num_accepted_tokens_cpu[:num_reqs] = accepted_tokens_cpu
-        if self.use_pp:
-            pp = get_pp_group()
-            logger.error(
-                "PP_SPEC accepted rank=%d is_last=%s req_ids=%s "
-                "output_token_ids=%s num_accepted=%s",
-                pp.rank,
-                pp.is_last_rank,
-                self.input_batch.req_ids[:num_reqs],
-                _pp_debug_value(output_token_ids),
-                _pp_debug_value(accepted_tokens_cpu),
-            )
 
         if not self.model_config.is_hybrid:
             return
@@ -1843,57 +1809,6 @@ class GPUModelRunner(
         else:
             multi_layer_eagle_metadata = None
 
-        if self.use_pp and use_spec_decode:
-            pp = get_pp_group()
-            req_ids = self.input_batch.req_ids[:num_reqs]
-            logger.error(
-                "PP_SPEC worker_prepare rank=%d is_last=%s req_ids=%s "
-                "num_scheduled=%s cu_num_tokens=%s query_start_loc=%s "
-                "seq_lens=%s num_computed=%s num_prompt=%s num_accepted=%s "
-                "spec_tokens=%s input_ids=%s positions=%s",
-                pp.rank,
-                pp.is_last_rank,
-                req_ids,
-                _pp_debug_value(num_scheduled_tokens),
-                _pp_debug_value(cu_num_tokens),
-                _pp_debug_value(self.query_start_loc.cpu[: num_reqs + 1]),
-                _pp_debug_value(self.seq_lens.cpu[:num_reqs]),
-                _pp_debug_value(self.input_batch.num_computed_tokens_cpu[:num_reqs]),
-                _pp_debug_value(self.input_batch.num_prompt_tokens[:num_reqs]),
-                _pp_debug_value(self.input_batch.num_accepted_tokens_cpu[:num_reqs]),
-                {
-                    req_id: scheduler_output.scheduled_spec_decode_tokens.get(
-                        req_id, []
-                    )
-                    for req_id in req_ids
-                },
-                _pp_debug_value(self.input_ids.cpu[:total_num_scheduled_tokens]),
-                _pp_debug_value(positions_np[:total_num_scheduled_tokens]),
-            )
-            if spec_decode_metadata is not None:
-                logger.error(
-                    "PP_SPEC worker_prepare_indices rank=%d logits_indices=%s "
-                    "target_logits=%s bonus_logits=%s draft_token_ids=%s",
-                    pp.rank,
-                    _pp_debug_value(spec_decode_metadata.logits_indices),
-                    _pp_debug_value(spec_decode_metadata.target_logits_indices),
-                    _pp_debug_value(spec_decode_metadata.bonus_logits_indices),
-                    _pp_debug_value(spec_decode_metadata.draft_token_ids),
-                )
-            if multi_layer_eagle_metadata is not None:
-                logger.error(
-                    "PP_SPEC worker_prepare_cache rank=%d cached_len=%s "
-                    "cached_token_ids=%s cached_slot_mappings=%s "
-                    "cached_positions=%s",
-                    pp.rank,
-                    _pp_debug_value(multi_layer_eagle_metadata.cached_len),
-                    _pp_debug_value(multi_layer_eagle_metadata.cached_token_ids),
-                    _pp_debug_value(
-                        multi_layer_eagle_metadata.cached_slot_mappings
-                    ),
-                    _pp_debug_value(multi_layer_eagle_metadata.cached_positions),
-                )
-
         # Hot-Swap lora model
         if self.lora_config:
             assert (
@@ -2453,42 +2368,6 @@ class GPUModelRunner(
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
-
-        if self.use_pp:
-            pp = get_pp_group()
-            req_ids = self.input_batch.req_ids[: len(num_draft_tokens)]
-            invalid_req_indices = np.flatnonzero(
-                cu_num_scheduled_tokens < num_sampled_tokens
-            ).tolist()
-            if invalid_req_indices:
-                logger.error(
-                    "PP_SPEC underflow rank=%d is_last=%s bad_req_ids=%s "
-                    "req_ids=%s cu_num_scheduled=%s num_draft=%s "
-                    "num_sampled=%s",
-                    pp.rank,
-                    pp.is_last_rank,
-                    [req_ids[idx] for idx in invalid_req_indices],
-                    req_ids,
-                    _pp_debug_value(cu_num_scheduled_tokens),
-                    _pp_debug_value(num_draft_tokens),
-                    _pp_debug_value(num_sampled_tokens),
-                )
-            logger.error(
-                "PP_SPEC metadata rank=%d is_last=%s req_ids=%s "
-                "cu_num_scheduled=%s num_draft=%s num_sampled=%s "
-                "logits_indices=%s target_logits=%s bonus_logits=%s "
-                "draft_token_ids=%s",
-                pp.rank,
-                pp.is_last_rank,
-                req_ids,
-                _pp_debug_value(cu_num_scheduled_tokens),
-                _pp_debug_value(num_draft_tokens),
-                _pp_debug_value(num_sampled_tokens),
-                _pp_debug_value(logits_indices),
-                _pp_debug_value(target_logits_indices),
-                _pp_debug_value(bonus_logits_indices),
-                _pp_debug_value(draft_token_ids),
-            )
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3949,38 +3828,6 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        logger.error(f"spec_decode_metadata: {spec_decode_metadata}")
-        logger.error(f"multi_layer_eagle_metadata: {multi_layer_eagle_metadata}")
-        logger.error(f"spec_decode_common_attn_metadata: {spec_decode_common_attn_metadata}")
-        if self.use_pp and spec_decode_common_attn_metadata is not None:
-            pp = get_pp_group()
-            logger.error(
-                "PP_SPEC worker_execute rank=%d is_last=%s query_start_loc=%s "
-                "num_actual_tokens=%s seq_lens=%s slot_mapping=%s "
-                "num_computed=%s",
-                pp.rank,
-                pp.is_last_rank,
-                _pp_debug_value(spec_decode_common_attn_metadata.query_start_loc_cpu),
-                spec_decode_common_attn_metadata.num_actual_tokens,
-                _pp_debug_value(spec_decode_common_attn_metadata._seq_lens_cpu),
-                _pp_debug_value(spec_decode_common_attn_metadata.slot_mapping),
-                _pp_debug_value(
-                    spec_decode_common_attn_metadata._num_computed_tokens_cpu
-                ),
-            )
-        if self.use_pp and multi_layer_eagle_metadata is not None:
-            pp = get_pp_group()
-            logger.error(
-                "PP_SPEC worker_execute_cache rank=%d is_last=%s cached_len=%s "
-                "cached_token_ids=%s cached_slot_mappings=%s "
-                "cached_positions=%s",
-                pp.rank,
-                pp.is_last_rank,
-                _pp_debug_value(multi_layer_eagle_metadata.cached_len),
-                _pp_debug_value(multi_layer_eagle_metadata.cached_token_ids),
-                _pp_debug_value(multi_layer_eagle_metadata.cached_slot_mappings),
-                _pp_debug_value(multi_layer_eagle_metadata.cached_positions),
-            )
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             apply_grammar_bitmask(
@@ -4034,7 +3881,6 @@ class GPUModelRunner(
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
-        logger.info(f"spec_config: {spec_config}")
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
