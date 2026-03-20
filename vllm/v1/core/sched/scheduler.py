@@ -390,6 +390,21 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens, self.max_model_len - 1 - request.num_computed_tokens
             )
 
+            if self.use_pp and request.spec_token_ids:
+                logger.error(
+                    "PP_SPEC schedule req=%s num_tokens=%d num_tokens_with_spec=%d "
+                    "num_computed=%d placeholders=%d spec_len=%d num_new_tokens=%d "
+                    "spec_tokens=%s",
+                    request.request_id,
+                    request.num_tokens,
+                    request.num_tokens_with_spec,
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                    len(request.spec_token_ids),
+                    num_new_tokens,
+                    request.spec_token_ids,
+                )
+
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -1044,6 +1059,17 @@ class Scheduler(SchedulerInterface):
                     req.num_computed_tokens : req.num_computed_tokens + num_tokens
                 ]
                 new_token_ids.append(token_ids)
+                if spec_decode_tokens.get(req_id) or token_ids:
+                    logger.error(
+                        "PP_SPEC cached req=%s num_scheduled=%d spec_len=%d "
+                        "num_computed=%d num_tokens=%d new_token_ids=%s",
+                        req_id,
+                        num_scheduled_tokens[req_id],
+                        len(spec_decode_tokens.get(req_id, ())),
+                        req.num_computed_tokens,
+                        req.num_tokens,
+                        token_ids,
+                    )
             scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
@@ -1321,6 +1347,17 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            if self.use_pp and (scheduled_spec_token_ids or generated_token_ids):
+                logger.error(
+                    "PP_SPEC output_before req=%s generated=%s scheduled_spec=%s "
+                    "num_tokens=%d num_computed=%d placeholders=%d",
+                    req_id,
+                    generated_token_ids,
+                    scheduled_spec_token_ids,
+                    request.num_tokens,
+                    request.num_computed_tokens,
+                    request.num_output_placeholders,
+                )
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
@@ -1356,6 +1393,17 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                if self.use_pp:
+                    logger.error(
+                        "PP_SPEC output_after req=%s new_token_ids=%s num_tokens=%d "
+                        "num_computed=%d placeholders=%d stopped=%s",
+                        req_id,
+                        new_token_ids,
+                        request.num_tokens,
+                        request.num_computed_tokens,
+                        request.num_output_placeholders,
+                        stopped,
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

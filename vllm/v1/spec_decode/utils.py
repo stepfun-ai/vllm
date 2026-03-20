@@ -161,8 +161,21 @@ def create_vllm_config_for_draft_model(
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
     old_spec_config = old.speculative_config
+    draft_rank = old.parallel_config.rank
+    if old_spec_config.uses_local_step3p5_mtp_drafter():
+        target_tp = old.parallel_config.tensor_parallel_size
+        target_pp = old.parallel_config.pipeline_parallel_size
+        target_rank = old.parallel_config.rank
+        target_pp_rank = target_rank // target_tp
+        target_tp_rank = target_rank % target_tp
+        assert target_pp_rank == target_pp - 1, (
+            "Local step3p5 MTP drafter should only run on the last "
+            f"pipeline stage, but got pp rank {target_pp_rank} / {target_pp}"
+        )
+        draft_rank = target_tp_rank
+
     new_parallel_config = replace(
-        old_spec_config.draft_parallel_config, rank=old.parallel_config.rank
+        old_spec_config.draft_parallel_config, rank=draft_rank
     )
     new: VllmConfig = replace(
         old,

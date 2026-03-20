@@ -602,9 +602,16 @@ class SpeculativeConfig:
                     )
                 )
 
+                draft_pipeline_parallel_size = (
+                    1
+                    if self.uses_local_step3p5_mtp_drafter()
+                    else self.target_parallel_config.pipeline_parallel_size
+                )
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        draft_pipeline_parallel_size,
                     )
                 )
         return self
@@ -740,13 +747,20 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        draft_pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
+        Some draft models are loaded locally on the last target PP rank, so
+        their PP size can be overridden independently of the target model.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if draft_pipeline_parallel_size is None
+                else draft_pipeline_parallel_size
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -849,6 +863,16 @@ class SpeculativeConfig:
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
+
+    def uses_local_step3p5_mtp_drafter(self) -> bool:
+        if not (
+            self.method == "mtp"
+            and self.enable_multi_layers_mtp
+            and self.draft_model_config is not None
+        ):
+            return False
+        hf_text_config = getattr(self.draft_model_config, "hf_text_config", None)
+        return getattr(hf_text_config, "model_type", None) == "step3p5_mtp"
 
     def __repr__(self) -> str:
         method = self.method
