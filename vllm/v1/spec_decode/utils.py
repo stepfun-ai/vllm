@@ -150,29 +150,29 @@ def compute_new_slot_mapping(
 
 
 def create_vllm_config_for_draft_model(
-    target_model_vllm_config: VllmConfig,
+    target_model_vllm_config: VllmConfig
 ) -> VllmConfig:
     """The vllm_config is configured for the target model, e.g.
     its quant_config and parallel_config. But the draft model is potentially
     quantized differently, and has potentially different tensor_parallel_size.
     This function creates a new vllm_config configured for the drafter.
     The vllm_config is useful when loading the draft model with get_model().
+
+    This helper returns the original target config for the common case and only
+    rewrites rank/parallel info when the drafter is configured to run locally
+    on the last target PP stage. This keeps runtime behavior unchanged for the
+    common case while still handling PP rank remapping.
     """
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
     old_spec_config = old.speculative_config
-    draft_rank = old.parallel_config.rank
-    if old_spec_config.uses_local_step3p5_mtp_drafter():
-        target_tp = old.parallel_config.tensor_parallel_size
-        target_pp = old.parallel_config.pipeline_parallel_size
-        target_rank = old.parallel_config.rank
-        target_pp_rank = target_rank // target_tp
-        target_tp_rank = target_rank % target_tp
-        assert target_pp_rank == target_pp - 1, (
-            "Local step3p5 MTP drafter should only run on the last "
-            f"pipeline stage, but got pp rank {target_pp_rank} / {target_pp}"
-        )
-        draft_rank = target_tp_rank
+    needs_rank_remap = old_spec_config.needs_partial_pp_draft_remap(
+        old.parallel_config
+    )
+    if not needs_rank_remap:
+        return old
+
+    draft_rank = old_spec_config.resolve_partial_pp_draft_rank(old.parallel_config)
 
     new_parallel_config = replace(
         old_spec_config.draft_parallel_config, rank=draft_rank

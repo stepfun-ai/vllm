@@ -201,7 +201,7 @@ class MultiLayerEagleProposer(EagleProposer):
         for fwd_idx in range(self.layer_num):
             with set_forward_context(
                 None,
-                self.runtime_vllm_config,
+                self.draft_vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
