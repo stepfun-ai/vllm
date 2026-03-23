@@ -13,7 +13,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import MultiLayerEagleMetadata
 
-
 BLOCK_HIDDEN = 128
 BLOCK_TOKENS = 128
 

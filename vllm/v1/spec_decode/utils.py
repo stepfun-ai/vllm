@@ -150,7 +150,7 @@ def compute_new_slot_mapping(
 
 
 def create_vllm_config_for_draft_model(
-    target_model_vllm_config: VllmConfig
+    target_model_vllm_config: VllmConfig,
 ) -> VllmConfig:
     """The vllm_config is configured for the target model, e.g.
     its quant_config and parallel_config. But the draft model is potentially
@@ -166,9 +166,7 @@ def create_vllm_config_for_draft_model(
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
     old_spec_config = old.speculative_config
-    needs_rank_remap = old_spec_config.needs_partial_pp_draft_remap(
-        old.parallel_config
-    )
+    needs_rank_remap = old_spec_config.needs_partial_pp_draft_remap(old.parallel_config)
     if not needs_rank_remap:
         return old
 

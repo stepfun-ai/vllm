@@ -901,6 +901,7 @@ class SpeculativeConfig:
     def needs_partial_pp_draft_remap(
         self, target_parallel_config: ParallelConfig
     ) -> bool:
+        """Whether draft PP is smaller than target PP and needs rank remap."""
         if self.draft_parallel_config is None:
             return False
         return (
@@ -908,7 +909,14 @@ class SpeculativeConfig:
             > self.draft_parallel_config.pipeline_parallel_size
         )
 
-    def resolve_partial_pp_draft_rank(self, target_parallel_config: ParallelConfig) -> int:
+    def resolve_partial_pp_draft_rank(
+        self, target_parallel_config: ParallelConfig
+    ) -> int:
+        """Map a target rank to the local draft rank for partial-PP drafting.
+
+        Currently this only supports running the draft model with `draft_pp=1`
+        on the last target PP stage.
+        """
         if not self.needs_partial_pp_draft_remap(target_parallel_config):
             return target_parallel_config.rank
 

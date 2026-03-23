@@ -1243,9 +1243,7 @@ class GPUModelRunner(
             return
 
         if self.cache_config.mamba_cache_mode == "align":
-            for i, num_tokens in enumerate(
-                accepted_tokens_cpu
-            ):
+            for i, num_tokens in enumerate(accepted_tokens_cpu):
                 self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
 
             mamba_utils.postprocess_mamba(
@@ -1339,9 +1337,12 @@ class GPUModelRunner(
             self.multi_layer_eagle_num, dtype=torch.int64, device=self.device
         )
 
-    def _sync_multi_layer_eagle_cache_to_requests(
-        self, req_ids: Iterable[str]
-    ) -> None:
+    def _sync_multi_layer_eagle_cache_to_requests(self, req_ids: Iterable[str]) -> None:
+        """Sync per-request cached tensors from InputBatch for unscheduled reqs.
+
+        Multi-layer EAGLE keeps per-request cached tensors that must stay
+        consistent with `input_batch` after condense/remove operations.
+        """
         if not self.enable_multi_layer_eagle:
             return
 
@@ -3845,10 +3846,10 @@ class GPUModelRunner(
         did_pp_prev_sampled_broadcast = False
         if self.use_async_scheduling:
             pp = get_pp_group()
+            # For external-launcher PP with broadcast_pp_output=True, logits
+            # computation already broadcasts PP outputs to all stages.
             need_pp_prev_sampled_broadcast = (
-                not self.broadcast_pp_output
-                and pp.world_size > 1
-                and pp.is_last_rank
+                not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank
             )
             if (
                 need_pp_prev_sampled_broadcast
@@ -4072,9 +4073,7 @@ class GPUModelRunner(
         assert draft_token_ids.dim() == 2 and draft_token_ids.shape[-1] == (
             self.num_spec_tokens
         ), "PP+async expects draft_token_ids to have shape [num_reqs, num_spec_tokens]"
-        torch.distributed.broadcast(
-            draft_token_ids, src=pp.rank, group=pp.device_group
-        )
+        torch.distributed.broadcast(draft_token_ids, src=pp.rank, group=pp.device_group)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4132,11 +4131,13 @@ class GPUModelRunner(
     def _get_padded_draft_token_ids(
         self, num_reqs: int | None = None
     ) -> torch.Tensor | None:
+        """Return int32 draft ids padded to [num_reqs, num_spec_tokens]."""
         draft_token_ids = self._draft_token_ids
         if draft_token_ids is None:
             return None
         if torch.is_tensor(draft_token_ids):
-            return draft_token_ids.to(dtype=torch.int32)
+            # `input_ids` buffers are int32, so keep scatter source dtype aligned.
+            return cast(torch.Tensor, draft_token_ids).to(dtype=torch.int32)
 
         num_reqs = num_reqs if num_reqs is not None else len(draft_token_ids)
         padded_draft_token_ids = torch.zeros(
