@@ -42,6 +42,7 @@ from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     compute_new_slot_mapping,
     copy_and_expand_eagle_inputs_kernel,
+    create_vllm_config_for_draft_model,
     eagle_prepare_inputs_padded_kernel,
     eagle_prepare_next_token_padded_kernel,
     extend_all_queries_by_N,
@@ -65,6 +66,7 @@ class SpecDecodeBaseProposer:
         self.vllm_config = vllm_config
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
+        self.draft_vllm_config = create_vllm_config_for_draft_model(vllm_config)
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
@@ -119,13 +121,13 @@ class SpecDecodeBaseProposer:
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
 
-        self.compilation_config = self.vllm_config.compilation_config
+        self.compilation_config = self.draft_vllm_config.compilation_config
 
         # Cudagraph dispatcher for PIECEWISE-only dispatching in eagle.
         # Keys are initialized later via initialize_cudagraph_keys() called from
         # gpu_model_runner._check_and_update_cudagraph_mode after
         # adjust_cudagraph_sizes_for_spec_decode is called.
-        self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
+        self.cudagraph_dispatcher = CudagraphDispatcher(self.draft_vllm_config)
 
         # persistent buffers for cuda graph
         self.input_ids = torch.zeros(
@@ -493,7 +495,7 @@ class SpecDecodeBaseProposer:
 
             with set_forward_context(
                 per_layer_attn_metadata,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -710,7 +712,7 @@ class SpecDecodeBaseProposer:
 
             with set_forward_context(
                 per_layer_attn_metadata,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -1156,7 +1158,7 @@ class SpecDecodeBaseProposer:
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(
@@ -1314,7 +1316,7 @@ class SpecDecodeBaseProposer:
 
         with set_model_tag("eagle_head"):
             model = get_model(
-                vllm_config=self.vllm_config,
+                vllm_config=self.draft_vllm_config,
                 model_config=self.speculative_config.draft_model_config,
                 load_config=self.speculative_config.draft_load_config,
             )
@@ -1332,7 +1334,7 @@ class SpecDecodeBaseProposer:
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config,
+            self.draft_vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
         self._draft_attn_layer_names = (
@@ -1585,7 +1587,7 @@ class SpecDecodeBaseProposer:
 
             with set_forward_context(
                 None,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -1656,7 +1658,7 @@ class SpecDecodeBaseProposer:
         Called from the model runner's initialize_metadata_builders.
         """
         all_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config,
+            self.draft_vllm_config,
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
@@ -1694,7 +1696,7 @@ class SpecDecodeBaseProposer:
                         kv_cache_group_id=self.kv_cache_gid,
                     )
                     attn_group.create_metadata_builders(
-                        self.vllm_config,
+                        self.draft_vllm_config,
                         self.device,
                         kernel_block_size=kernel_block_size,
                     )
@@ -1719,11 +1721,11 @@ class SpecDecodeBaseProposer:
         # coordinate across ranks
         # TODO(Flechman): support DBO ubatching
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if self.draft_vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
-                    parallel_config=self.vllm_config.parallel_config,
+                    parallel_config=self.draft_vllm_config.parallel_config,
                     allow_microbatching=False,
                     num_tokens_padded=num_tokens_padded,
                     cudagraph_mode=cudagraph_mode.value,

@@ -157,12 +157,23 @@ def create_vllm_config_for_draft_model(
     quantized differently, and has potentially different tensor_parallel_size.
     This function creates a new vllm_config configured for the drafter.
     The vllm_config is useful when loading the draft model with get_model().
+
+    This helper returns the original target config for the common case and only
+    rewrites rank/parallel info when the drafter is configured to run locally
+    on the last target PP stage. This keeps runtime behavior unchanged for the
+    common case while still handling PP rank remapping.
     """
     old = target_model_vllm_config
     assert old.speculative_config is not None, "speculative_config is not set"
     old_spec_config = old.speculative_config
+    needs_rank_remap = old_spec_config.needs_partial_pp_draft_remap(old.parallel_config)
+    if not needs_rank_remap:
+        return old
+
+    draft_rank = old_spec_config.resolve_partial_pp_draft_rank(old.parallel_config)
+
     new_parallel_config = replace(
-        old_spec_config.draft_parallel_config, rank=old.parallel_config.rank
+        old_spec_config.draft_parallel_config, rank=draft_rank
     )
     new: VllmConfig = replace(
         old,

@@ -200,6 +200,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -430,7 +431,6 @@ class GPUModelRunner(
             self.parallel_config.distributed_executor_backend == "external_launcher"
             and len(get_pp_group().ranks) > 1
         )
-
         # Model-related.
         self.num_query_heads = model_config.get_num_attention_heads(parallel_config)
         self.inputs_embeds_size = model_config.get_inputs_embeds_size()
@@ -731,6 +731,7 @@ class GPUModelRunner(
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_token_req_ids: list[str] | None = None
+        self._pp_valid_sampled_token_count: torch.Tensor | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -993,6 +994,7 @@ class GPUModelRunner(
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
         unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        self._sync_multi_layer_eagle_cache_to_requests(unscheduled_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -1074,6 +1076,19 @@ class GPUModelRunner(
         # Wait until valid_sampled_tokens_count is copied to cpu,
         # then use it to update actual num_computed_tokens of each request.
         valid_sampled_token_count = self._get_valid_sampled_token_count()
+        if (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.num_spec_tokens > 0
+            and not is_last_rank
+            and valid_sampled_token_count
+        ):
+            num_prev_reqs = min(
+                len(valid_sampled_token_count), self.input_batch.num_reqs
+            )
+            self.input_batch.num_accepted_tokens_cpu[:num_prev_reqs] = (
+                valid_sampled_token_count[:num_prev_reqs]
+            )
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -1206,39 +1221,29 @@ class GPUModelRunner(
     ) -> None:
         """Update the cached states after model execution.
 
-        This is used for MTP/EAGLE for hybrid models, as in linear attention,
-        only the last token's state is kept. In MTP/EAGLE, for draft tokens
-        the state are kept util we decide how many tokens are accepted for
-        each sequence, and a shifting is done during the next iteration
-        based on the number of accepted tokens.
+        This is used for speculative decoding bookkeeping. Hybrid models also
+        need the extra state maintenance below, while PP+async needs the host
+        copy of accepted-token counts to be refreshed for the next step.
         """
-        if not self.speculative_config or not self.model_config.is_hybrid:
+        if not self.speculative_config:
             return
 
         # Find the number of accepted tokens for each sequence.
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (
-            (
-                torch.cat(
-                    [
-                        output_token_ids,
-                        torch.full(
-                            (num_reqs, 1),
-                            -1,
-                            device=output_token_ids.device,
-                        ),
-                    ],
-                    dim=1,
-                )
-                == -1
-            )
-            .int()
-            .argmax(-1)
-        )
+        accepted_tokens = self._get_valid_sampled_token_count_tensor(output_token_ids)
+        self.num_accepted_tokens.gpu[:num_reqs] = accepted_tokens
+
+        # `worker_prepare` reads the CPU-backed accepted counts when it builds
+        # the next speculative batch. Keep that copy in sync on the last PP
+        # rank as well instead of relying on a later hybrid-only path.
+        accepted_tokens_cpu = accepted_tokens.cpu().numpy()
+        self.input_batch.num_accepted_tokens_cpu[:num_reqs] = accepted_tokens_cpu
+
+        if not self.model_config.is_hybrid:
+            return
+
         if self.cache_config.mamba_cache_mode == "align":
-            for i, num_tokens in enumerate(
-                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-            ):
+            for i, num_tokens in enumerate(accepted_tokens_cpu):
                 self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
 
             mamba_utils.postprocess_mamba(
@@ -1250,10 +1255,6 @@ class GPUModelRunner(
                 self.compilation_config.static_forward_context,
                 self.model.get_mamba_state_copy_func(),
                 self._get_mamba_copy_bufs(),
-            )
-        else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
 
     def _update_streaming_request(
@@ -1335,6 +1336,41 @@ class GPUModelRunner(
         req_state.cached_slot_mappings = torch.zeros(
             self.multi_layer_eagle_num, dtype=torch.int64, device=self.device
         )
+
+    def _sync_multi_layer_eagle_cache_to_requests(self, req_ids: Iterable[str]) -> None:
+        """Sync per-request cached tensors from InputBatch for unscheduled reqs.
+
+        Multi-layer EAGLE keeps per-request cached tensors that must stay
+        consistent with `input_batch` after condense/remove operations.
+        """
+        if not self.enable_multi_layer_eagle:
+            return
+
+        for req_id in req_ids:
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            req_state = self.requests.get(req_id)
+            if req_index is None or req_state is None:
+                continue
+
+            assert req_state.cached_len is not None
+            assert req_state.cached_token_ids is not None
+            assert req_state.cached_hidden_states is not None
+            assert req_state.cached_slot_mappings is not None
+            assert req_state.cached_positions is not None
+
+            req_state.cached_len[0] = self.input_batch.cached_len[req_index]
+            req_state.cached_token_ids.copy_(
+                self.input_batch.cached_token_ids[req_index]
+            )
+            req_state.cached_hidden_states.copy_(
+                self.input_batch.cached_hidden_states[req_index]
+            )
+            req_state.cached_slot_mappings.copy_(
+                self.input_batch.cached_slot_mappings[req_index]
+            )
+            req_state.cached_positions.copy_(
+                self.input_batch.cached_positions[req_index]
+            )
 
     def _extract_mm_kwargs(
         self,
@@ -1493,20 +1529,19 @@ class GPUModelRunner(
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if not spec_flattened_indices:
             return
 
-        assert isinstance(self._draft_token_ids, torch.Tensor)
+        draft_token_ids = self._get_padded_draft_token_ids(self.input_batch.num_reqs)
+        if draft_token_ids is None:
+            return
+
         draft_tokens_index_tensor = torch.tensor(
             spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
         prev_draft_token_indices_tensor = torch.tensor(
             prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
-
-        # because input_ids dtype is torch.int32,
-        # so convert draft_token_ids to torch.int32 here.
-        draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
 
         self.input_ids.gpu.scatter_(
             dim=0,
@@ -1986,7 +2021,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(self.drafter, EagleProposer):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -3758,6 +3797,9 @@ class GPUModelRunner(
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and get_pp_group().world_size > 1:
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                if self.speculative_config is not None and self.num_spec_tokens > 0:
+                    self._pp_receive_valid_sampled_token_count()
+                    self._pp_receive_draft_token_ids()
             if not kv_connector_output:
                 return None  # type: ignore[return-value]
 
@@ -3799,15 +3841,24 @@ class GPUModelRunner(
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+
+        need_pp_prev_sampled_broadcast = False
+        did_pp_prev_sampled_broadcast = False
         if self.use_async_scheduling:
             pp = get_pp_group()
-            # For torchrun external_launcher PP mode with broadcast_pp_output=True,
-            # PP outputs have been broadcasted to all ranks at logits computation.
-            # Therefore, here is no need to send sampled token ids again in this case.
-            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+            # For external-launcher PP with broadcast_pp_output=True, logits
+            # computation already broadcasts PP outputs to all stages.
+            need_pp_prev_sampled_broadcast = (
+                not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank
+            )
+            if (
+                need_pp_prev_sampled_broadcast
+                and sampler_output.sampled_token_ids.shape[-1] == 1
+            ):
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+                did_pp_prev_sampled_broadcast = True
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -3898,6 +3949,35 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        if need_pp_prev_sampled_broadcast and not did_pp_prev_sampled_broadcast:
+            # In speculative decode, sampled_token_ids can be [num_reqs, num_spec + 1].
+            # Broadcast the reduced per-request next token ids prepared earlier.
+            prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
+            assert prev_sampled_token_ids is not None, (
+                "PP+async expects prev_sampled_token_ids before broadcast"
+            )
+            self._pp_broadcast_prev_sampled_token_ids(prev_sampled_token_ids)
+        if (
+            need_pp_prev_sampled_broadcast
+            and self.speculative_config is not None
+            and self.num_spec_tokens > 0
+        ):
+            valid_sampled_token_count = self._get_valid_sampled_token_count_tensor(
+                sampler_output.sampled_token_ids
+            )
+            self._pp_broadcast_valid_sampled_token_count(valid_sampled_token_count)
+
+            draft_token_ids = self._get_padded_draft_token_ids(
+                len(self.input_batch.req_ids)
+            )
+            if draft_token_ids is None:
+                draft_token_ids = torch.zeros(
+                    (len(self.input_batch.req_ids), self.num_spec_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            self._pp_broadcast_draft_token_ids(draft_token_ids)
+
         # Clear KV connector metadata after draft model runs (if spec decode).
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
@@ -3973,6 +4053,28 @@ class GPUModelRunner(
             sampled_token_ids, src=pp.rank, group=pp.device_group
         )
 
+    def _pp_broadcast_valid_sampled_token_count(
+        self, valid_sampled_token_count: torch.Tensor
+    ) -> None:
+        """Broadcast valid sampled-token counts from last PP stage."""
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        assert valid_sampled_token_count.dim() == 1, (
+            "PP+async expects valid_sampled_token_count to have shape [num_reqs]"
+        )
+        torch.distributed.broadcast(
+            valid_sampled_token_count, src=pp.rank, group=pp.device_group
+        )
+
+    def _pp_broadcast_draft_token_ids(self, draft_token_ids: torch.Tensor) -> None:
+        """Broadcast drafted token ids from last PP stage."""
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        assert draft_token_ids.dim() == 2 and draft_token_ids.shape[-1] == (
+            self.num_spec_tokens
+        ), "PP+async expects draft_token_ids to have shape [num_reqs, num_spec_tokens]"
+        torch.distributed.broadcast(draft_token_ids, src=pp.rank, group=pp.device_group)
+
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
@@ -3998,11 +4100,57 @@ class GPUModelRunner(
                 req_state.output_token_ids.append(-1)
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
+    def _pp_receive_valid_sampled_token_count(self) -> None:
+        """Receive valid sampled-token counts broadcast from last PP stage."""
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        recv = torch.empty(
+            (self.input_batch.num_reqs,), dtype=torch.int32, device=self.device
+        )
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        self._pp_valid_sampled_token_count = recv.cpu()
+
+    def _pp_receive_draft_token_ids(self) -> None:
+        """Receive drafted token ids broadcast from last PP stage."""
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        recv = torch.empty(
+            (self.input_batch.num_reqs, self.num_spec_tokens),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        self._draft_token_ids = recv
+
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
         return DraftTokenIds(req_ids, draft_token_ids)
+
+    def _get_padded_draft_token_ids(
+        self, num_reqs: int | None = None
+    ) -> torch.Tensor | None:
+        """Return int32 draft ids padded to [num_reqs, num_spec_tokens]."""
+        draft_token_ids = self._draft_token_ids
+        if draft_token_ids is None:
+            return None
+        if torch.is_tensor(draft_token_ids):
+            # `input_ids` buffers are int32, so keep scatter source dtype aligned.
+            return cast(torch.Tensor, draft_token_ids).to(dtype=torch.int32)
+
+        num_reqs = num_reqs if num_reqs is not None else len(draft_token_ids)
+        padded_draft_token_ids = torch.zeros(
+            (num_reqs, self.num_spec_tokens), dtype=torch.int32, device=self.device
+        )
+        for req_idx, token_ids in enumerate(draft_token_ids[:num_reqs]):
+            if not token_ids:
+                continue
+            num_tokens = min(len(token_ids), self.num_spec_tokens)
+            padded_draft_token_ids[req_idx, :num_tokens] = torch.tensor(
+                token_ids[:num_tokens], dtype=torch.int32, device=self.device
+            )
+        return padded_draft_token_ids
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -4068,6 +4216,11 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
+        if self._pp_valid_sampled_token_count is not None:
+            counts = self._pp_valid_sampled_token_count.tolist()
+            self._pp_valid_sampled_token_count = None
+            return counts
+
         # Wait until valid_sampled_tokens_count is copied to cpu,
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
@@ -4078,6 +4231,31 @@ class GPUModelRunner(
         assert counts_cpu is not None
         sampled_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+
+    def _get_valid_sampled_token_count_tensor(
+        self, sampled_token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        num_reqs = sampled_token_ids.size(0)
+        return (
+            (
+                torch.cat(
+                    [
+                        sampled_token_ids,
+                        torch.full(
+                            (num_reqs, 1),
+                            -1,
+                            device=sampled_token_ids.device,
+                            dtype=sampled_token_ids.dtype,
+                        ),
+                    ],
+                    dim=1,
+                )
+                == -1
+            )
+            .int()
+            .argmax(-1)
+            .to(dtype=torch.int32)
+        )
 
     def propose_draft_token_ids(
         self,
@@ -5046,10 +5224,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -5609,9 +5791,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
@@ -5768,9 +5954,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(self.drafter, EagleProposer | ExtractHiddenStatesProposer)
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
@@ -6142,6 +6332,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and get_pp_group().is_last_rank
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

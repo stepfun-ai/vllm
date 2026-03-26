@@ -85,9 +85,17 @@ class SpeculativeConfig:
     draft_tensor_parallel_size: int | None = Field(default=None, ge=1)
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
+    draft_pipeline_parallel_size: int | None = Field(default=None, ge=1)
+    """The degree of pipeline parallelism for the draft model.
+
+    Defaults to the target model's pipeline parallel size. Set this to 1 to
+    run the drafter locally on the last target PP stage."""
     tensor_parallel_size: int | None = None
     """Users should pass "draft_tensor_parallel_size". This parameter's purpose is to
     warn users when they mistakenly provide the wrong argument."""
+    pipeline_parallel_size: int | None = None
+    """Users should pass "draft_pipeline_parallel_size". This parameter's
+    purpose is to warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
     quantization: me_quant.QuantizationMethods | None = None
@@ -602,9 +610,17 @@ class SpeculativeConfig:
                     )
                 )
 
+                self.draft_pipeline_parallel_size = (
+                    SpeculativeConfig._verify_and_get_draft_pp(
+                        self.target_parallel_config,
+                        self.draft_pipeline_parallel_size,
+                    )
+                )
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        self.draft_pipeline_parallel_size,
                     )
                 )
         return self
@@ -718,6 +734,30 @@ class SpeculativeConfig:
             )
         return speculative_draft_tensor_parallel_size
 
+    @staticmethod
+    def _verify_and_get_draft_pp(
+        target_parallel_config: ParallelConfig,
+        speculative_draft_pipeline_parallel_size: int | None,
+    ) -> int:
+        """
+        Verifies and adjusts the pipeline parallel size for a draft model
+        specified using speculative_draft_pipeline_parallel_size.
+        """
+        if speculative_draft_pipeline_parallel_size is None:
+            return target_parallel_config.pipeline_parallel_size
+
+        if speculative_draft_pipeline_parallel_size not in (
+            1,
+            target_parallel_config.pipeline_parallel_size,
+        ):
+            raise ValueError(
+                f"{speculative_draft_pipeline_parallel_size=} cannot be "
+                "other value than 1 or target model "
+                f"pipeline_parallel_size="
+                f"{target_parallel_config.pipeline_parallel_size}"
+            )
+        return speculative_draft_pipeline_parallel_size
+
     def update_arch_(self):
         """
         EagleConfig and ExtractHiddenStatesConfig update architectures, so update all
@@ -740,13 +780,15 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        speculative_draft_pipeline_parallel_size: int,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
-        This is mostly a copy of the target parallel config, except the tp_size.
+        This is mostly a copy of the target parallel config, except the tp/pp
+        sizes used by the draft model.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=speculative_draft_pipeline_parallel_size,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -763,6 +805,12 @@ class SpeculativeConfig:
             raise ValueError(
                 "'tensor_parallel_size' is not a valid argument in the "
                 "speculative_config. Please pass 'draft_tensor_parallel_size' instead."
+            )
+        if self.pipeline_parallel_size is not None:
+            raise ValueError(
+                "'pipeline_parallel_size' is not a valid argument in the "
+                "speculative_config. Please pass "
+                "'draft_pipeline_parallel_size' instead."
             )
 
         if self.num_speculative_tokens is None:
@@ -849,6 +897,56 @@ class SpeculativeConfig:
 
     def uses_extract_hidden_states(self) -> bool:
         return self.method == "extract_hidden_states"
+
+    def needs_partial_pp_draft_remap(
+        self, target_parallel_config: ParallelConfig
+    ) -> bool:
+        """Whether draft PP is smaller than target PP and needs rank remap."""
+        if self.draft_parallel_config is None:
+            return False
+        return (
+            target_parallel_config.pipeline_parallel_size
+            > self.draft_parallel_config.pipeline_parallel_size
+        )
+
+    def resolve_partial_pp_draft_rank(
+        self, target_parallel_config: ParallelConfig
+    ) -> int:
+        """Map a target rank to the local draft rank for partial-PP drafting.
+
+        Currently this only supports running the draft model with `draft_pp=1`
+        on the last target PP stage.
+        """
+        if not self.needs_partial_pp_draft_remap(target_parallel_config):
+            return target_parallel_config.rank
+
+        assert self.draft_parallel_config is not None
+        draft_pp = self.draft_parallel_config.pipeline_parallel_size
+        if draft_pp != 1:
+            raise ValueError(
+                "Partial pp drafter rank remapping only supports "
+                "draft_pipeline_parallel_size=1 when target PP is larger."
+            )
+
+        target_tp = target_parallel_config.tensor_parallel_size
+        draft_tp = self.draft_parallel_config.tensor_parallel_size
+        if draft_tp != target_tp:
+            raise ValueError(
+                "Partial pp drafter rank remapping requires "
+                "draft_tensor_parallel_size to equal target tensor_parallel_size. "
+                f"Got draft_tp={draft_tp}, target_tp={target_tp}."
+            )
+
+        target_pp = target_parallel_config.pipeline_parallel_size
+        target_rank = target_parallel_config.rank
+        target_pp_rank = target_rank // target_tp
+        target_tp_rank = target_rank % target_tp
+        if target_pp_rank != target_pp - 1:
+            raise ValueError(
+                "Partial pp drafter should only run on the last "
+                f"pipeline stage, but got pp rank {target_pp_rank} / {target_pp}"
+            )
+        return target_tp_rank
 
     def __repr__(self) -> str:
         method = self.method

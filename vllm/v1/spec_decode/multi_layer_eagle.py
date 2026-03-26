@@ -6,15 +6,12 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import MultiLayerEagleMetadata
-
-logger = init_logger(__name__)
 
 BLOCK_HIDDEN = 128
 BLOCK_TOKENS = 128
@@ -203,7 +200,7 @@ class MultiLayerEagleProposer(EagleProposer):
         for fwd_idx in range(self.layer_num):
             with set_forward_context(
                 None,
-                self.vllm_config,
+                self.draft_vllm_config,
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
