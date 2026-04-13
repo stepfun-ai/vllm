@@ -503,6 +503,7 @@ _MULTIMODAL_MODELS = {
     ),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),  # noqa: E501
+    "Step3p6ForConditionalGeneration": ("step3p6", "Step3p6ForConditionalGeneration"),  # noqa: E501
     "TarsierForConditionalGeneration": ("tarsier", "TarsierForConditionalGeneration"),  # noqa: E501
     "Tarsier2ForConditionalGeneration": (
         "qwen2_vl",
