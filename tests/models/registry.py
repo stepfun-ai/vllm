@@ -335,7 +335,7 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "HYV3ForCausalLM": _HfExamplesInfo("tencent/Hy3-preview", trust_remote_code=True),
     "HyperCLOVAXForCausalLM": _HfExamplesInfo(
         "naver-hyperclovax/HyperCLOVAX-SEED-Think-14B",
-        trust_remote_code=True,
+        min_transformers_version="5.9.0",
     ),
     "InternLMForCausalLM": _HfExamplesInfo(
         "internlm/internlm-chat-7b", trust_remote_code=True
@@ -1362,6 +1362,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     ),
     "StepVLForConditionalGeneration": _HfExamplesInfo(
         "stepfun-ai/Step3-VL-10B", trust_remote_code=True
+    ),
+    "Step3p7ForConditionalGeneration": _HfExamplesInfo(
+        "stepfun-ai/Step-3.7-Flash", is_available_online=False, trust_remote_code=True
     ),
     "UltravoxModel": _HfExamplesInfo(
         "fixie-ai/ultravox-v0_5-llama-3_2-1b",
