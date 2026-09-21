@@ -10,7 +10,6 @@ const STEP5_CONFIG: QwenCoderConfig = QwenCoderConfig {
     first_tool_call_start: "<tool_call>",
     next_tool_call_start: "<tool_call>",
     tool_call_end: "</tool_call>",
-    null_literal: Some("None"),
 };
 
 /// Step-5 uses Qwen Coder's inner XML grammar with bare tool-call boundaries.
