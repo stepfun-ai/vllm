@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 use super::qwen_coder::{Qwen3CoderToolParser, QwenCoderConfig};
-use super::{Result, Tool, ToolParser, ToolParserOutput};
+use super::{Result, StructuralTagBuilder, Tool, ToolParser, ToolParserOutput};
+
+mod structural_tag;
 
 const STEP5_CONFIG: QwenCoderConfig = QwenCoderConfig {
     parser_name: "Step-5",
@@ -14,8 +16,6 @@ const STEP5_CONFIG: QwenCoderConfig = QwenCoderConfig {
 
 /// Step-5 uses Qwen Coder's inner XML grammar with bare tool-call boundaries.
 /// Its template renders scalar null arguments as Python `None`.
-///
-/// TODO: add a Step-5 structural-tag builder for strict tool calling.
 pub struct Step5ToolParser {
     inner: Qwen3CoderToolParser,
 }
@@ -25,6 +25,10 @@ impl ToolParser for Step5ToolParser {
         Ok(Box::new(Self {
             inner: Qwen3CoderToolParser::with_config(tools, STEP5_CONFIG),
         }))
+    }
+
+    fn structural_tag_builder(&self) -> Option<&dyn StructuralTagBuilder> {
+        Some(&structural_tag::Step5StructuralTagBuilder)
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
