@@ -165,8 +165,6 @@ pub struct Config {
     pub coordinator_mode: CoordinatorMode,
     /// Backend model identifier used for engine-core loading.
     pub model: String,
-    /// Optional tokenizer identifier or local directory. Defaults to `model`.
-    pub tokenizer: Option<String>,
     /// Model name(s) exposed to clients via the OpenAI API. When non-empty,
     /// the first entry is used as the primary ID in responses and all entries
     /// are accepted in requests. When empty, falls back to `model`.
@@ -195,8 +193,6 @@ pub struct Config {
     /// Optional maximum number of top log probabilities accepted by the
     /// frontend. `None` delegates to the text layer default.
     pub max_logprobs: Option<i32>,
-    /// Optional hard vocabulary boundary for padded model checkpoints.
-    pub valid_vocab_size: Option<usize>,
     /// HTTP/API-server behavior switches.
     pub api_server_options: ApiServerOptions,
     /// CORS settings applied to every HTTP response.

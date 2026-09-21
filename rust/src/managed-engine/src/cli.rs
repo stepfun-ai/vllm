@@ -84,9 +84,7 @@ impl ManagedEngineArgs {
     pub fn into_config(
         self,
         model: String,
-        tokenizer: Option<String>,
         max_logprobs: Option<i32>,
-        valid_vocab_size: Option<usize>,
         profiler_config: Option<String>,
         reasoning_parser: Option<&str>,
         language_model_only: bool,
@@ -97,10 +95,6 @@ impl ManagedEngineArgs {
     ) -> ManagedEngineConfig {
         let mut python_args = self.python_args;
         // Manually forward some args to the Python engine.
-        if let Some(tokenizer) = tokenizer {
-            python_args.push("--tokenizer".to_string());
-            python_args.push(tokenizer);
-        }
         if let Some(max_model_len) = self.max_model_len {
             python_args.push("--max-model-len".to_string());
             python_args.push(max_model_len);
@@ -108,10 +102,6 @@ impl ManagedEngineArgs {
         if let Some(max_logprobs) = max_logprobs {
             python_args.push("--max-logprobs".to_string());
             python_args.push(max_logprobs.to_string());
-        }
-        if let Some(valid_vocab_size) = valid_vocab_size {
-            python_args.push("--valid-vocab-size".to_string());
-            python_args.push(valid_vocab_size.to_string());
         }
         if let Some(profiler_config) = profiler_config {
             python_args.push("--profiler-config".to_string());

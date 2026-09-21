@@ -53,14 +53,12 @@ fn serve_args_forward_python_flags_with_separator() {
                     uds: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
-                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
                         renderer: Auto,
                         language_model_only: false,
                         max_logprobs: None,
-                        valid_vocab_size: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -270,82 +268,6 @@ fn serve_args_forward_max_logprobs_to_frontend_and_managed_engine() {
         ]
     "#]]
     .assert_debug_eq(&engine_config.python_args);
-}
-
-#[test]
-fn serve_args_forward_valid_vocab_size_to_frontend_and_managed_engine() {
-    let cli = Cli::try_parse_from([
-        "vllm-rs",
-        "serve",
-        "/models/step5",
-        "--valid-vocab-size",
-        "128815",
-    ])
-    .unwrap();
-
-    let Command::Serve(args) = cli.command else {
-        panic!("expected serve args");
-    };
-    assert_eq!(args.runtime.valid_vocab_size, Some(128815));
-
-    let frontend_config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
-    assert_eq!(frontend_config.valid_vocab_size, Some(128815));
-
-    let engine_config = args.to_managed_engine_config(5555);
-    assert!(
-        engine_config
-            .python_args
-            .windows(2)
-            .any(|args| args[0] == "--valid-vocab-size" && args[1] == "128815")
-    );
-}
-
-#[test]
-fn serve_args_forward_tokenizer_to_frontend_and_managed_engine() {
-    let cli = Cli::try_parse_from([
-        "vllm-rs",
-        "serve",
-        "/models/step5",
-        "--tokenizer",
-        "/models/step5-tokenizer",
-    ])
-    .unwrap();
-
-    let Command::Serve(args) = cli.command else {
-        panic!("expected serve args");
-    };
-    assert_eq!(
-        args.runtime.tokenizer.as_deref(),
-        Some("/models/step5-tokenizer")
-    );
-
-    let frontend_config = args.to_frontend_config("tcp://127.0.0.1:62100".to_string());
-    assert_eq!(
-        frontend_config.tokenizer.as_deref(),
-        Some("/models/step5-tokenizer")
-    );
-
-    let engine_config = args.to_managed_engine_config(5555);
-    assert!(
-        engine_config
-            .python_args
-            .windows(2)
-            .any(|args| args == ["--tokenizer", "/models/step5-tokenizer"])
-    );
-}
-
-#[test]
-fn serve_args_reject_zero_valid_vocab_size() {
-    assert!(
-        Cli::try_parse_from([
-            "vllm-rs",
-            "serve",
-            "/models/step5",
-            "--valid-vocab-size",
-            "0",
-        ])
-        .is_err()
-    );
 }
 
 #[test]
@@ -830,14 +752,12 @@ fn frontend_args_accept_json() {
                     engine_count: 1,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
-                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: None,
                         reasoning_parser: None,
                         renderer: Auto,
                         language_model_only: false,
                         max_logprobs: None,
-                        valid_vocab_size: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -942,7 +862,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
         "--output-address",
         "ipc:///tmp/output.sock",
         "--args-json",
-        r#"{"model_tag":"Qwen/Qwen3-0.6B","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"max_logprobs":-1,"valid_vocab_size":128815,"shutdown_timeout":3}"#,
+        r#"{"model_tag":"Qwen/Qwen3-0.6B","engine_ready_timeout_secs":42,"tool_call_parser":"hermes","reasoning_parser":"qwen3_thinking","tokenizer_mode":"deepseek_v32","language_model_only":true,"max_logprobs":-1,"shutdown_timeout":3}"#,
     ])
     .unwrap();
 
@@ -961,36 +881,7 @@ fn frontend_args_json_accepts_supported_non_default_fields() {
     assert_eq!(args.runtime.renderer, RendererSelection::DeepSeekV32);
     assert!(args.runtime.language_model_only);
     assert_eq!(args.runtime.max_logprobs, Some(-1));
-    assert_eq!(args.runtime.valid_vocab_size, Some(128815));
     assert_eq!(args.runtime.shutdown_timeout, 3);
-}
-
-#[test]
-fn frontend_args_json_accepts_independent_tokenizer() {
-    let cli = Cli::try_parse_from([
-        "vllm-rs",
-        "frontend",
-        "--listen-fd",
-        "3",
-        "--input-address",
-        "ipc:///tmp/input.sock",
-        "--output-address",
-        "ipc:///tmp/output.sock",
-        "--args-json",
-        r#"{"model_tag":"/models/step5","tokenizer":"/models/step5-tokenizer"}"#,
-    ])
-    .unwrap();
-
-    let Command::Frontend(args) = cli.command else {
-        panic!("expected frontend args");
-    };
-    assert_eq!(
-        args.runtime.tokenizer.as_deref(),
-        Some("/models/step5-tokenizer")
-    );
-
-    let config = args.into_config();
-    assert_eq!(config.tokenizer.as_deref(), Some("/models/step5-tokenizer"));
 }
 
 #[test]
@@ -1449,14 +1340,12 @@ fn serve_args_accept_handshake_aliases() {
                     uds: None,
                     runtime: SharedRuntimeArgs {
                         model: "Qwen/Qwen3-0.6B",
-                        tokenizer: None,
                         engine_ready_timeout_secs: 600,
                         tool_call_parser: Auto,
                         reasoning_parser: Auto,
                         renderer: Auto,
                         language_model_only: false,
                         max_logprobs: None,
-                        valid_vocab_size: None,
                         grpc_port: None,
                         shutdown_timeout: 0,
                         http_timeout_keep_alive: None,
@@ -1595,7 +1484,6 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             },
             coordinator_mode: MaybeInProc,
             model: "Qwen/Qwen3-0.6B",
-            tokenizer: None,
             served_model_name: [],
             listener_mode: BindTcp {
                 host: "127.0.0.1",
@@ -1610,7 +1498,6 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,
-            valid_vocab_size: None,
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
@@ -1682,7 +1569,6 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             },
             coordinator_mode: MaybeInProc,
             model: "Qwen/Qwen3-0.6B",
-            tokenizer: None,
             served_model_name: [],
             listener_mode: BindTcp {
                 host: "127.0.0.1",
@@ -1697,7 +1583,6 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,
-            valid_vocab_size: None,
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,
@@ -1788,7 +1673,6 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                 address: "tcp://127.0.0.1:7000",
             },
             model: "Qwen/Qwen3-0.6B",
-            tokenizer: None,
             served_model_name: [],
             listener_mode: InheritedFd {
                 fd: 3,
@@ -1802,7 +1686,6 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
             limit_mm_per_prompt: {},
             chat_template_content_format: Auto,
             max_logprobs: None,
-            valid_vocab_size: None,
             api_server_options: ApiServerOptions {
                 enable_log_requests: false,
                 enable_prompt_tokens_details: false,

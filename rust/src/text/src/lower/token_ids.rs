@@ -65,22 +65,8 @@ pub(crate) fn validate_vocab_range(
     validate_param(
         "stop_token_ids",
         params.stop_token_ids.iter().copied(),
-        limits.logits_vocab_size(),
+        limits.model_vocab_size,
     )?;
-
-    if limits.valid_vocab_size.is_some() {
-        validate_param(
-            "eos_token_id",
-            params.eos_token_id,
-            limits.logits_vocab_size(),
-        )?;
-
-        validate_param(
-            "all_stop_token_ids",
-            params.all_stop_token_ids.iter().copied(),
-            limits.logits_vocab_size(),
-        )?;
-    }
 
     if let Some(token_ids) = params.allowed_token_ids.as_deref() {
         if token_ids.is_empty() {
@@ -89,7 +75,7 @@ pub(crate) fn validate_vocab_range(
         validate_param(
             "allowed_token_ids",
             token_ids.iter().copied(),
-            limits.sampling_tokenizer_vocab_size(),
+            limits.tokenizer_vocab_size,
         )?;
     }
 
@@ -97,7 +83,7 @@ pub(crate) fn validate_vocab_range(
         validate_param(
             "logit_bias",
             logit_bias.keys().copied(),
-            limits.logits_vocab_size(),
+            limits.model_vocab_size,
         )?;
     }
 
@@ -105,7 +91,7 @@ pub(crate) fn validate_vocab_range(
         validate_param(
             "logprob_token_ids",
             token_ids.iter().copied(),
-            limits.logits_vocab_size(),
+            limits.model_vocab_size,
         )?;
     }
 
@@ -113,7 +99,7 @@ pub(crate) fn validate_vocab_range(
         validate_param(
             "bad_words",
             bad_words_token_ids.iter().flatten().copied(),
-            limits.sampling_tokenizer_vocab_size(),
+            limits.tokenizer_vocab_size,
         )?;
     }
 

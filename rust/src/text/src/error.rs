@@ -13,21 +13,6 @@ pub use crate::lower::token_ids::TokenIdsError;
 pub enum Error {
     #[error("tokenizer error: {0}")]
     Tokenizer(String),
-    #[error(
-        "valid_vocab_size is currently supported only for Step5 models, \
-         got model_type {model_type:?}"
-    )]
-    UnsupportedValidVocabSize { model_type: Option<String> },
-    #[error(
-        "valid_vocab_size must be positive and no greater than model vocab size \
-         ({model_vocab_size}) and tokenizer vocab size ({tokenizer_vocab_size}), \
-         got {valid_vocab_size}"
-    )]
-    InvalidValidVocabSize {
-        valid_vocab_size: usize,
-        model_vocab_size: usize,
-        tokenizer_vocab_size: usize,
-    },
     #[error("text request `{request_id}` must contain at least one prompt token ID")]
     EmptyPromptTokenIds { request_id: String },
     #[error(

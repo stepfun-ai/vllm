@@ -149,24 +149,10 @@ fn encode_fastokens_ordinary(
 pub struct HuggingFaceTokenizer {
     backend: Backend,
     special_token_ids: Arc<[u32]>,
-    vocab_size: usize,
-}
-
-fn token_id_upper_bound(token_id: u32) -> usize {
-    usize::try_from(u64::from(token_id) + 1).unwrap_or(usize::MAX)
 }
 
 impl HuggingFaceTokenizer {
     fn from_hf_backend(tokenizer: HfTokenizer) -> Self {
-        let model_vocab_size = tokenizer.get_model().get_vocab_size();
-        let vocab_size = tokenizer
-            .get_added_tokens_decoder()
-            .keys()
-            .copied()
-            .max()
-            .map(token_id_upper_bound)
-            .unwrap_or_default()
-            .max(model_vocab_size);
         let special_token_ids = {
             let mut ids: Vec<u32> = tokenizer
                 .get_added_tokens_decoder()
@@ -181,23 +167,10 @@ impl HuggingFaceTokenizer {
         Self {
             backend: Backend::Hf(Box::new(tokenizer)),
             special_token_ids,
-            vocab_size,
         }
     }
 
     fn from_fastokens_backend(tokenizer: FastokensTokenizer) -> Self {
-        let model_vocab_size = tokenizer.model().vocab_size();
-        let vocab_size = tokenizer.added_tokens().map_or_else(
-            || model_vocab_size,
-            |added_tokens| {
-                added_tokens
-                    .iter()
-                    .map(|token| token_id_upper_bound(token.id))
-                    .max()
-                    .unwrap_or_default()
-                    .max(model_vocab_size)
-            },
-        );
         let special_token_ids = {
             let mut ids: Vec<u32> = tokenizer
                 .added_tokens()
@@ -219,7 +192,6 @@ impl HuggingFaceTokenizer {
         Self {
             backend,
             special_token_ids,
-            vocab_size,
         }
     }
 
@@ -305,7 +277,10 @@ impl Tokenizer for HuggingFaceTokenizer {
     }
 
     fn vocab_size(&self) -> usize {
-        self.vocab_size
+        match &self.backend {
+            Backend::Hf(t) => t.get_vocab_size(true),
+            Backend::Fastokens(t) | Backend::FastokensByteLevel(t) => t.vocab_size(),
+        }
     }
 
     fn id_to_token(&self, id: u32) -> Option<String> {
@@ -574,68 +549,6 @@ mod tests {
         ));
         let special_id = wrapper.token_to_id("<|im_end|>").expect("resolve added special token id");
         assert!(wrapper.is_special_id(special_id));
-    }
-
-    #[test]
-    fn constructors_do_not_double_count_added_tokens_that_reuse_model_ids() {
-        let mut tokenizer_json = ordinary_test_tokenizer_json(false, false);
-        let overlapping_token = tokenizer_json["model"]["vocab"]
-            .as_object()
-            .unwrap()
-            .iter()
-            .find_map(|(token, id)| (id.as_u64() == Some(0)).then(|| token.clone()))
-            .unwrap();
-        tokenizer_json["added_tokens"] = json!([
-            {
-                "id": 0,
-                "content": overlapping_token,
-                "single_word": false,
-                "lstrip": false,
-                "rstrip": false,
-                "normalized": false,
-                "special": true
-            },
-            {
-                "id": 256,
-                "content": SPECIAL_TOKEN,
-                "single_word": false,
-                "lstrip": false,
-                "rstrip": false,
-                "normalized": false,
-                "special": true
-            }
-        ]);
-
-        let dir = tempdir().expect("create temp dir");
-        let path = write_tokenizer_json(dir.path(), "tokenizer.json", &tokenizer_json);
-        let fastokens = HuggingFaceTokenizer::new_fastokens(&path).expect("load fastokens wrapper");
-        let hf = HuggingFaceTokenizer::new_hf(&path).expect("load hf wrapper");
-
-        assert_eq!(fastokens.vocab_size(), 257);
-        assert_eq!(fastokens.vocab_size(), hf.vocab_size());
-    }
-
-    #[test]
-    fn fastokens_vocab_size_is_an_exclusive_upper_bound_for_sparse_added_ids() {
-        let mut tokenizer_json = ordinary_test_tokenizer_json(false, false);
-        tokenizer_json["added_tokens"] = json!([
-            {
-                "id": 260,
-                "content": SPECIAL_TOKEN,
-                "single_word": false,
-                "lstrip": false,
-                "rstrip": false,
-                "normalized": false,
-                "special": true
-            }
-        ]);
-
-        let dir = tempdir().expect("create temp dir");
-        let path = write_tokenizer_json(dir.path(), "tokenizer.json", &tokenizer_json);
-        let tokenizer = HuggingFaceTokenizer::new_fastokens(&path).expect("load fastokens wrapper");
-
-        assert_eq!(tokenizer.token_to_id(SPECIAL_TOKEN), Some(260));
-        assert_eq!(tokenizer.vocab_size(), 261);
     }
 
     #[test]

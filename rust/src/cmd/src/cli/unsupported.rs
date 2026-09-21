@@ -178,6 +178,11 @@ pub struct TopLevelUnsupportedArgs {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Args, Serialize, Deserialize)]
 pub struct EngineUnsupportedArgs {
+    /// Name or path of the Hugging Face tokenizer to use. If unspecified, model
+    /// name or path will be used.
+    #[arg(long)]
+    pub tokenizer: Option<Unsupported>,
+
     /// Name or path of the Hugging Face config to use. If unspecified, model
     /// name or path will be used.
     #[arg(long)]

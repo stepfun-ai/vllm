@@ -94,7 +94,6 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         &config.model,
         LoadModelBackendsOptions {
             renderer: config.renderer,
-            tokenizer: config.tokenizer.clone(),
             language_model_only: config.language_model_only,
             chat_template: config.chat_template.clone(),
             chat_template_content_format: config.chat_template_content_format,
@@ -103,7 +102,6 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 .clone()
                 .unwrap_or_default(),
             limit_mm_per_prompt: config.limit_mm_per_prompt.clone(),
-            valid_vocab_size: config.valid_vocab_size,
         },
     )
     .await

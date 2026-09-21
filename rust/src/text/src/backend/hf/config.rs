@@ -179,37 +179,37 @@ impl ModelConfig {
     /// Return the effective Hugging Face `model_type` used by the Rust
     /// frontend.
     ///
-    /// A nested `text_config`, when present, is the selected text model and
-    /// therefore takes precedence over wrapper metadata at the top level.
+    /// This follows the same simplified text-config selection as the rest of
+    /// this type: the top-level config wins, otherwise a single nested
+    /// `text_config` may provide the value.
     pub fn model_type(&self) -> Option<&str> {
-        self.effective_text_config().model_type.as_deref()
-    }
-
-    /// Return the wrapper model type directly from the top-level config.
-    pub fn top_level_model_type(&self) -> Option<&str> {
-        self.model_type.as_deref()
-    }
-
-    /// Return whether this model uses a padded checkpoint vocabulary.
-    pub(super) fn supports_valid_vocab_size(&self) -> bool {
-        matches!(self.model_type(), Some("step5" | "step5_mtp"))
+        self.model_type.as_deref().or_else(|| self.text_config.as_deref()?.model_type())
     }
 
     /// Return the effective model vocabulary size, following the same
     /// simplified text-config selection as `model_type`.
     pub fn vocab_size(&self) -> Result<u32> {
-        self.effective_text_config().vocab_size.ok_or_else(|| {
-            Error::Tokenizer("the selected text config does not define `vocab_size`".to_string())
-        })
+        if let Some(vocab_size) = self.vocab_size {
+            Ok(vocab_size)
+        } else if let Some(text_config) = self.text_config.as_deref() {
+            text_config.vocab_size()
+        } else {
+            Err(Error::Tokenizer(
+                "the model config does not define `vocab_size`".to_string(),
+            ))
+        }
     }
 
     /// Return the effective model-side EOS token ids, following the same
     /// simplified text-config selection as `vocab_size`.
     pub(super) fn eos_token_ids(&self) -> &[u32] {
-        self.effective_text_config()
-            .eos_token_id
-            .as_ref()
-            .map_or(&[], OneOrManyTokenIds::as_slice)
+        if let Some(eos_token_id) = self.eos_token_id.as_ref() {
+            eos_token_id.as_slice()
+        } else if let Some(text_config) = self.text_config.as_deref() {
+            text_config.eos_token_ids()
+        } else {
+            &[]
+        }
     }
 
     /// Match Python's current expert-count priority on the selected text
@@ -343,13 +343,9 @@ mod tests {
         let config: ModelConfig = serde_json::from_str(
             r#"{
                 "model_type": "top_level",
-                "vocab_size": 1,
-                "eos_token_id": 2,
                 "num_experts": 64,
                 "text_config": {
-                    "model_type": "step5",
-                    "vocab_size": 128896,
-                    "eos_token_id": [128815, 128816],
+                    "model_type": "nested",
                     "num_local_experts": 8
                 }
             }"#,
@@ -357,11 +353,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.num_experts(), 8);
-        assert_eq!(config.model_type(), Some("step5"));
-        assert_eq!(config.top_level_model_type(), Some("top_level"));
-        assert_eq!(config.vocab_size().unwrap(), 128896);
-        assert_eq!(config.eos_token_ids(), &[128815, 128816]);
-        assert!(config.supports_valid_vocab_size());
+        assert_eq!(config.model_type(), Some("top_level"));
         assert!(config.is_moe());
     }
 
@@ -410,7 +402,7 @@ mod tests {
         let config: ModelConfig = serde_json::from_str(r#"{}"#).unwrap();
 
         let error = config.vocab_size().unwrap_err();
-        assert!(error.to_string().contains("selected text config does not define `vocab_size`"));
+        assert!(error.to_string().contains("does not define `vocab_size`"));
     }
 
     #[test]

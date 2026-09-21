@@ -44,14 +44,9 @@ pub(super) fn validate_logprobs(
     logprob_token_ids: Option<&[u32]>,
     sampling_limits: SamplingLimits,
 ) -> Result<(), LogprobsError> {
-    let vocab_size = sampling_limits.logits_vocab_size();
+    let vocab_size = sampling_limits.model_vocab_size;
     let max_logprobs =
         normalize_logprobs_count(sampling_limits.max_logprobs, vocab_size, "max_logprobs")?;
-    let max_logprobs = if sampling_limits.valid_vocab_size.is_some() {
-        max_logprobs.min(vocab_size)
-    } else {
-        max_logprobs
-    };
 
     validate_logprobs_count(logprobs, max_logprobs, vocab_size, "logprobs")?;
     validate_logprobs_count(prompt_logprobs, max_logprobs, vocab_size, "prompt_logprobs")?;

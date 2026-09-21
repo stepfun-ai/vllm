@@ -99,7 +99,6 @@ impl TextRequestProcessor {
             max_logprobs: self.max_logprobs,
             model_vocab_size: self.backend.model_vocab_size(),
             tokenizer_vocab_size: self.backend.tokenizer_vocab_size(),
-            valid_vocab_size: self.backend.valid_vocab_size(),
         };
 
         lower_text_request(

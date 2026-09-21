@@ -43,8 +43,6 @@ pub struct HfTextBackend {
     generation_config: GenerationConfig,
     /// Model vocabulary size from the selected text config.
     model_vocab_size: usize,
-    /// Effective vocabulary size for padded model checkpoints.
-    valid_vocab_size: Option<usize>,
     /// Model config (`config.json`).
     model_config: ModelConfig,
 }
@@ -62,12 +60,6 @@ impl HfTextBackend {
         let tokenizer = load_tokenizer(&files.tokenizer)?;
         let model_config = load_model_config(files.config_path.as_deref())?;
         let model_vocab_size = model_config.vocab_size()? as usize;
-        let valid_vocab_size = resolve_valid_vocab_size(
-            &model_config,
-            model_vocab_size,
-            tokenizer.vocab_size(),
-            None,
-        )?;
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
         let (primary_eos_token_id, extra_eos_token_ids) = resolve_eos_token_ids(
             &tokenizer_config,
@@ -89,22 +81,8 @@ impl HfTextBackend {
             extra_eos_token_ids,
             generation_config,
             model_vocab_size,
-            valid_vocab_size,
             model_config,
         })
-    }
-
-    /// Override the effective vocabulary size passed by the frontend launcher.
-    pub fn with_valid_vocab_size(mut self, valid_vocab_size: Option<usize>) -> Result<Self> {
-        if valid_vocab_size.is_some() {
-            self.valid_vocab_size = resolve_valid_vocab_size(
-                &self.model_config,
-                self.model_vocab_size,
-                self.tokenizer.vocab_size(),
-                valid_vocab_size,
-            )?;
-        }
-        Ok(self)
     }
 
     /// Expose the resolved model files for use by the chat backend to load the
@@ -163,10 +141,6 @@ impl TextBackend for HfTextBackend {
         self.model_vocab_size
     }
 
-    fn valid_vocab_size(&self) -> Option<usize> {
-        self.valid_vocab_size
-    }
-
     fn model_id(&self) -> &str {
         &self.model_id
     }
@@ -185,43 +159,11 @@ impl TextBackend for HfTextBackend {
     }
 }
 
-fn resolve_valid_vocab_size(
-    model_config: &ModelConfig,
-    model_vocab_size: usize,
-    tokenizer_vocab_size: usize,
-    configured_valid_vocab_size: Option<usize>,
-) -> Result<Option<usize>> {
-    if !model_config.supports_valid_vocab_size() {
-        if configured_valid_vocab_size.is_some() {
-            return Err(crate::Error::UnsupportedValidVocabSize {
-                model_type: model_config.model_type().map(str::to_string),
-            });
-        }
-        return Ok(None);
-    }
-
-    let valid_vocab_size = configured_valid_vocab_size.unwrap_or(tokenizer_vocab_size);
-    if valid_vocab_size == 0
-        || valid_vocab_size > model_vocab_size
-        || valid_vocab_size > tokenizer_vocab_size
-    {
-        return Err(crate::Error::InvalidValidVocabSize {
-            valid_vocab_size,
-            model_vocab_size,
-            tokenizer_vocab_size,
-        });
-    }
-    Ok(Some(valid_vocab_size))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{
-        GenerationConfig, HfTokenizerConfig, ModelConfig, resolve_eos_token_ids,
-        resolve_valid_vocab_size,
-    };
+    use super::{GenerationConfig, HfTokenizerConfig, ModelConfig, resolve_eos_token_ids};
     use vllm_tokenizer::Tokenizer;
 
     struct FakeTokenizer;
@@ -292,85 +234,5 @@ mod tests {
 
         assert_eq!(primary, Some(2));
         assert_eq!(extra, BTreeSet::from([200006, 200010]));
-    }
-
-    #[test]
-    fn step5_defaults_valid_vocab_size_to_tokenizer_length() {
-        let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
-
-        assert_eq!(
-            resolve_valid_vocab_size(&model_config, 128896, 128815, None).unwrap(),
-            Some(128815)
-        );
-    }
-
-    #[test]
-    fn nested_step5_metadata_overrides_incorrect_wrapper_values() {
-        let model_config: ModelConfig = serde_json::from_str(
-            r#"{
-                "model_type":"step5_multimodal",
-                "vocab_size":1,
-                "eos_token_id":2,
-                "text_config":{
-                    "model_type":"step5",
-                    "vocab_size":128896,
-                    "eos_token_id":[128815,128816]
-                }
-            }"#,
-        )
-        .unwrap();
-        let tokenizer_config: HfTokenizerConfig = serde_json::from_str("{}").unwrap();
-        let generation_config: GenerationConfig = serde_json::from_str("{}").unwrap();
-        let model_vocab_size = model_config.vocab_size().unwrap() as usize;
-
-        assert_eq!(
-            resolve_valid_vocab_size(&model_config, model_vocab_size, 128815, None).unwrap(),
-            Some(128815)
-        );
-
-        let (primary, extra) = resolve_eos_token_ids(
-            &tokenizer_config,
-            &model_config,
-            &generation_config,
-            &FakeTokenizer,
-        );
-        assert_eq!(primary, Some(128815));
-        assert_eq!(extra, BTreeSet::from([128816]));
-    }
-
-    #[test]
-    fn step5_accepts_smaller_explicit_valid_vocab_size() {
-        let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
-
-        assert_eq!(
-            resolve_valid_vocab_size(&model_config, 128896, 128815, Some(128800)).unwrap(),
-            Some(128800)
-        );
-    }
-
-    #[test]
-    fn step5_rejects_invalid_explicit_valid_vocab_sizes() {
-        let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"step5","vocab_size":128896}"#).unwrap();
-
-        for valid_vocab_size in [0, 128816, 128897] {
-            assert!(matches!(
-                resolve_valid_vocab_size(&model_config, 128896, 128815, Some(valid_vocab_size),),
-                Err(crate::Error::InvalidValidVocabSize { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn valid_vocab_size_rejects_unsupported_models() {
-        let model_config: ModelConfig =
-            serde_json::from_str(r#"{"model_type":"qwen2","vocab_size":128896}"#).unwrap();
-
-        assert!(matches!(
-            resolve_valid_vocab_size(&model_config, 128896, 128815, Some(128800)),
-            Err(crate::Error::UnsupportedValidVocabSize { .. })
-        ));
     }
 }

@@ -356,7 +356,6 @@ mod tests {
             max_logprobs: SamplingLimits::DEFAULT_MAX_LOGPROBS,
             model_vocab_size: 1000,
             tokenizer_vocab_size: 2000,
-            valid_vocab_size: None,
         }
     }
 
@@ -779,32 +778,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn lower_text_request_uses_valid_vocab_for_padded_models() {
-        let error = lower_text_request(
-            sample_request(),
-            vec![128815],
-            sample_sampling_hints(),
-            SamplingLimits {
-                model_vocab_size: 128896,
-                tokenizer_vocab_size: 128815,
-                valid_vocab_size: Some(128815),
-                ..sample_sampling_limits()
-            },
-            &stub_tokenizer(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::TokenIds(TokenIdsError::OutOfVocab {
-                parameter: "prompt",
-                token_ids,
-                vocab_size: 128815,
-            }) if token_ids == vec![128815]
-        ));
-    }
-
     #[tokio::test]
     #[file_serial(hf_qwen3)]
     async fn lower_text_request_uses_real_qwen_generation_defaults() {
@@ -846,7 +819,6 @@ mod tests {
                 max_logprobs: SamplingLimits::DEFAULT_MAX_LOGPROBS,
                 model_vocab_size: backend.model_vocab_size(),
                 tokenizer_vocab_size: backend.tokenizer_vocab_size(),
-                valid_vocab_size: backend.valid_vocab_size(),
             },
             &stub_tokenizer(),
         )
@@ -1087,120 +1059,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(params.logprobs, Some(-1));
-    }
-
-    #[test]
-    fn lower_sampling_params_caps_explicit_logprobs_at_valid_vocab() {
-        let error = lower_sampling_params_with_limits(
-            SamplingParams {
-                logprobs: Some(128850),
-                ..Default::default()
-            },
-            SamplingLimits {
-                max_logprobs: 128896,
-                model_vocab_size: 128896,
-                tokenizer_vocab_size: 128815,
-                valid_vocab_size: Some(128815),
-                ..sample_sampling_limits()
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::Logprobs(LogprobsError::TooManyCount {
-                parameter: "logprobs",
-                requested: 128850,
-                max_allowed: 128815,
-            })
-        ));
-    }
-
-    #[test]
-    fn lower_sampling_params_uses_valid_vocab_for_token_controls() {
-        let error = lower_sampling_params_with_limits(
-            SamplingParams {
-                stop_token_ids: Some(vec![128815]),
-                ..Default::default()
-            },
-            SamplingLimits {
-                model_vocab_size: 128896,
-                tokenizer_vocab_size: 128815,
-                valid_vocab_size: Some(128815),
-                ..sample_sampling_limits()
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::TokenIds(TokenIdsError::OutOfVocab {
-                parameter: "stop_token_ids",
-                token_ids,
-                vocab_size: 128815,
-            }) if token_ids == vec![128815]
-        ));
-    }
-
-    #[test]
-    fn lower_sampling_params_validates_injected_eos_against_valid_vocab() {
-        let error = lower_sampling_params(
-            SamplingParams::default(),
-            SamplingHints {
-                primary_eos_token_id: Some(128815),
-                ..sample_sampling_hints()
-            },
-            SamplingLimits {
-                model_vocab_size: 128896,
-                tokenizer_vocab_size: 128815,
-                valid_vocab_size: Some(128815),
-                ..sample_sampling_limits()
-            },
-            3,
-            &stub_tokenizer(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::TokenIds(TokenIdsError::OutOfVocab {
-                parameter: "eos_token_id",
-                token_ids,
-                vocab_size: 128815,
-            }) if token_ids == vec![128815]
-        ));
-    }
-
-    #[test]
-    fn lower_sampling_params_validates_ignored_extra_eos_against_valid_vocab() {
-        let error = lower_sampling_params(
-            SamplingParams {
-                ignore_eos: true,
-                ..Default::default()
-            },
-            SamplingHints {
-                extra_eos_token_ids: BTreeSet::from([128815]),
-                ..sample_sampling_hints()
-            },
-            SamplingLimits {
-                model_vocab_size: 128896,
-                tokenizer_vocab_size: 128815,
-                valid_vocab_size: Some(128815),
-                ..sample_sampling_limits()
-            },
-            3,
-            &stub_tokenizer(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            Error::TokenIds(TokenIdsError::OutOfVocab {
-                parameter: "all_stop_token_ids",
-                token_ids,
-                vocab_size: 128815,
-            }) if token_ids == vec![128815]
-        ));
     }
 
     #[test]

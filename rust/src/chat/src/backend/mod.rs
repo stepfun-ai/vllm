@@ -63,9 +63,6 @@ pub type DynChatTextBackend = Arc<dyn ChatTextBackend>;
 pub struct LoadModelBackendsOptions {
     /// Which chat renderer implementation to use.
     pub renderer: RendererSelection,
-    /// Optional tokenizer identifier or local directory. Defaults to the model
-    /// identifier.
-    pub tokenizer: Option<String>,
     /// Disable frontend-side multimodal preprocessing and render the model as
     /// language-only.
     pub language_model_only: bool,
@@ -80,8 +77,6 @@ pub struct LoadModelBackendsOptions {
     /// Maximum number of input items allowed per prompt for each modality.
     /// Unspecified modalities are unlimited.
     pub limit_mm_per_prompt: MmLimitPerPrompt,
-    /// Optional hard vocabulary boundary for padded model checkpoints.
-    pub valid_vocab_size: Option<usize>,
 }
 
 /// Shared backends loaded from a model id.

@@ -44,13 +44,12 @@ impl HfChatBackend {
     ) -> Result<Self> {
         let model_config = load_model_config(files.config_path.as_deref())?;
         let model_type = model_config.model_type().unwrap_or_default();
-        let top_level_model_type = model_config.top_level_model_type().unwrap_or_default();
         let multimodal_model_info = if options.language_model_only {
             None
         } else {
             MultimodalModelInfo::from_paths(
                 model_id.clone(),
-                (!top_level_model_type.is_empty()).then_some(top_level_model_type.to_string()),
+                (!model_type.is_empty()).then_some(model_type.to_string()),
                 MultimodalConfigFiles {
                     config: files.config_path.as_deref(),
                     preprocessor_config: files.preprocessor_config_path.as_deref(),
@@ -129,11 +128,9 @@ pub(super) async fn load_model_backends(
     model_id: &str,
     options: LoadModelBackendsOptions,
 ) -> Result<LoadedModelBackends> {
-    let files =
-        ResolvedModelFiles::new_with_tokenizer(model_id, options.tokenizer.as_deref()).await?;
+    let files = ResolvedModelFiles::new(model_id).await?;
     let text_backend =
-        HfTextBackend::from_resolved_model_files(files.clone(), model_id.to_string())?
-            .with_valid_vocab_size(options.valid_vocab_size)?;
+        HfTextBackend::from_resolved_model_files(files.clone(), model_id.to_string())?;
     let tokenizer = text_backend.tokenizer();
     let text_backend: DynTextBackend = Arc::new(text_backend);
 
@@ -231,13 +228,11 @@ mod tests {
             "test-model".to_string(),
             LoadModelBackendsOptions {
                 renderer,
-                tokenizer: None,
                 language_model_only: false,
                 chat_template_content_format: Default::default(),
                 chat_template: None,
                 default_chat_template_kwargs: HashMap::new(),
                 limit_mm_per_prompt: HashMap::new(),
-                valid_vocab_size: None,
             },
             test_tokenizer(),
         )
@@ -385,67 +380,6 @@ mod tests {
             r#"{"chat_template":"{{ messages[0].content }}"}"#,
         );
 
-        assert_eq!(prompt, "hello");
-    }
-
-    #[tokio::test]
-    async fn independent_local_tokenizer_is_used_for_text_and_chat_backends() {
-        let model_dir = tempdir().expect("create model dir");
-        let tokenizer_dir = tempdir().expect("create tokenizer dir");
-        write_json(
-            &model_dir.path().join("config.json"),
-            r#"{"model_type":"qwen2","vocab_size":2}"#,
-        );
-        write_json(
-            &tokenizer_dir.path().join("tokenizer.json"),
-            r#"{
-                "version":"1.0",
-                "truncation":null,
-                "padding":null,
-                "added_tokens":[],
-                "normalizer":null,
-                "pre_tokenizer":{"type":"Whitespace"},
-                "post_processor":null,
-                "decoder":null,
-                "model":{
-                    "type":"WordLevel",
-                    "vocab":{"[UNK]":0,"hello":1},
-                    "unk_token":"[UNK]"
-                }
-            }"#,
-        );
-        write_json(
-            &tokenizer_dir.path().join("tokenizer_config.json"),
-            r#"{
-                "unk_token":"[UNK]",
-                "chat_template":"{{ messages[0].content }}"
-            }"#,
-        );
-
-        let loaded = super::load_model_backends(
-            model_dir.path().to_str().expect("utf8 model path"),
-            LoadModelBackendsOptions {
-                tokenizer: Some(
-                    tokenizer_dir.path().to_str().expect("utf8 tokenizer path").to_string(),
-                ),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("load independent tokenizer");
-
-        assert_eq!(
-            loaded.text_backend.tokenizer().token_to_id("hello"),
-            Some(1)
-        );
-        let prompt = loaded
-            .chat_backend
-            .chat_renderer()
-            .render(&request_with_user_text("hello"))
-            .expect("render prompt")
-            .prompt
-            .into_text()
-            .expect("text prompt");
         assert_eq!(prompt, "hello");
     }
 
