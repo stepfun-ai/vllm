@@ -37,33 +37,10 @@ _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS: set[str] = {
     "step3_vl",
     "step3p7",
     "step5",
+    "step5_vl",
     "step5_mtp",
     "unlimited-ocr",
 }
-
-
-def _get_tokenizer_model_type_hint(
-    hf_config,
-    hf_text_config=None,
-) -> str | None:
-    """Prefer a known wrapper workaround, then the selected text model."""
-    top_level_model_type = getattr(hf_config, "model_type", None)
-    if top_level_model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
-        return top_level_model_type
-
-    if hf_text_config is None and hf_config is not None:
-        get_text_config = getattr(hf_config, "get_text_config", None)
-        if callable(get_text_config):
-            with contextlib.suppress(AttributeError, TypeError, ValueError):
-                hf_text_config = get_text_config()
-        if hf_text_config is None:
-            hf_text_config = getattr(hf_config, "text_config", None)
-
-    text_model_type = getattr(hf_text_config, "model_type", None)
-    if text_model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
-        return text_model_type
-    return top_level_model_type
-
 
 _VLLM_TOKENIZERS = {
     # ``cohere`` mode uses the standard cached HF tokenizer; only the
@@ -216,7 +193,6 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     revision: str | None = None,
     download_dir: str | None = None,
-    model_type_hint: str | None = None,
     **kwargs,
 ) -> _T:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
@@ -251,25 +227,17 @@ def get_tokenizer(
     # that generic config to AutoTokenizer can select the wrong tokenizer class.
     config_format = "hf" if tokenizer_cls_ is CachedHfTokenizer else "auto"
     config = None
-    hinted_incorrect_tokenizer_class = (
-        model_type_hint in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS
-    )
-    if not hinted_incorrect_tokenizer_class:
-        with contextlib.suppress(ValueError, OSError):
-            config = get_config(
-                tokenizer_name,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                config_format=config_format,
-            )
+    with contextlib.suppress(ValueError, OSError):
+        config = get_config(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            config_format=config_format,
+        )
 
     # Some models have an incorrect tokenizer_class on the hub.
     # For these model types, bypass AutoTokenizer and use TokenizersBackend directly.
-    model_type = (
-        model_type_hint
-        if hinted_incorrect_tokenizer_class
-        else _get_tokenizer_model_type_hint(config)
-    )
+    model_type = getattr(config, "model_type", None) if config else None
     if model_type in _MODEL_TYPES_WITH_INCORRECT_TOKENIZER_CLASS:
         from transformers.tokenization_utils_tokenizers import TokenizersBackend
 
@@ -314,9 +282,5 @@ def cached_tokenizer_from_config(model_config: "ModelConfig", **kwargs):
         tokenizer_mode=model_config.tokenizer_mode,
         revision=model_config.tokenizer_revision,
         trust_remote_code=model_config.trust_remote_code,
-        model_type_hint=_get_tokenizer_model_type_hint(
-            model_config.hf_config,
-            getattr(model_config, "hf_text_config", None),
-        ),
         **kwargs,
     )
