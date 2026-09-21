@@ -332,6 +332,19 @@ impl RoundtripCase {
         }
     }
 
+    /// Step-5's bare reasoning tags and adjacent XML tool calls.
+    fn step5() -> Self {
+        Self {
+            model_id: "stepfun-ai/Step-5-Preview",
+            assistant_stop_suffix: "<|im_end|>\n",
+            tool_call_parser: ParserSelection::Auto,
+            reasoning_parser: ParserSelection::Auto,
+            thinking_behavior: ThinkingBehavior::Always { value: true },
+            json_fmt: compact_json_fmt(),
+            sort_json_keys: false,
+        }
+    }
+
     /// Nemotron V3 with `<think>` / `</think>` reasoning tags.
     fn nemotron_v3() -> Self {
         Self {
@@ -405,6 +418,7 @@ roundtrip_tests! {
     glm52 => [reasoning_and_content, tool_call_mix],
     seed_oss => [reasoning_and_content, tool_call_mix],
     step3p5 => [reasoning_and_content],
+    step5 => [reasoning_and_content, tool_call_mix, step5_template_edges],
     nemotron_v3 => [reasoning_and_content],
     gemma4 => [tool_call_mix], // Gemma4 strips reasoning in history if there's no tool call
     kimi_k25 => [tool_call_mix], // Kimi K2.5 strips reasoning in history
@@ -554,6 +568,61 @@ async fn run_roundtrip_tool_call_mix(
         result.closed_completion
     );
 
+    Ok(())
+}
+
+/// Exercise Step-5's bare boundaries and Python scalar rendering through its real template.
+async fn run_roundtrip_step5_template_edges(
+    case: &RoundtripCase,
+    backends: &vllm_chat::LoadedModelBackends,
+) -> Result<()> {
+    let arguments = r#"{"flag":true,"empty":null,"text":"None","payload":{"city":"杭州"}}"#;
+    let request = roundtrip_request(
+        "roundtrip-step5-template-edges",
+        vec![ChatMessage::text(ChatRole::User, "Convert these values.")],
+        vec![ChatTool {
+            name: "convert".into(),
+            description: None,
+            parameters: serde_json::json!({"type": "object", "properties": {
+                "flag": {"type": "boolean"},
+                "empty": {"type": ["string", "null"]},
+                "text": {"type": "string"},
+                "payload": {"type": "object"}
+            }}),
+            strict: None,
+        }],
+        // This template always opens reasoning, including with enable_thinking=false.
+        Some(false),
+        case.thinking_behavior,
+    );
+    let assistant = AssistantMessage {
+        content: vec![
+            AssistantContentBlock::Reasoning {
+                text: "\nreasoning\n".into(),
+            },
+            AssistantContentBlock::Text {
+                text: "\n\nanswer\n\n".into(),
+            },
+            AssistantContentBlock::ToolCall(AssistantToolCall {
+                id: "convert:0".into(),
+                name: "convert".into(),
+                arguments: arguments.into(),
+            }),
+        ],
+    };
+    let result = run_roundtrip(case, backends, &request, assistant).await?;
+    assert_eq!(
+        result.parsed_message.reasoning().as_deref(),
+        Some("\nreasoning\n")
+    );
+    assert_eq!(result.parsed_message.text(), "\n\nanswer\n\n");
+    let calls: Vec<_> = result.parsed_message.tool_calls().collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].arguments, arguments);
+    assert_eq!(
+        result.rerendered_closed_completion,
+        result.closed_completion
+    );
     Ok(())
 }
 

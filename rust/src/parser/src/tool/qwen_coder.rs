@@ -35,6 +35,8 @@ pub(crate) struct QwenCoderConfig {
     pub(crate) next_tool_call_start: &'static str,
     /// Marker that closes a tool-call block.
     pub(crate) tool_call_end: &'static str,
+    /// Additional null spelling emitted by the model's chat template.
+    pub(crate) null_literal: Option<&'static str>,
 }
 
 const QWEN_CODER_CONFIG: QwenCoderConfig = QwenCoderConfig {
@@ -43,6 +45,7 @@ const QWEN_CODER_CONFIG: QwenCoderConfig = QwenCoderConfig {
     first_tool_call_start: "\n\n<tool_call>",
     next_tool_call_start: "\n<tool_call>",
     tool_call_end: TOOL_CALL_END,
+    null_literal: None,
 };
 
 type QwenCoderInput<'i> = Partial<&'i str>;
@@ -120,6 +123,20 @@ impl Qwen3CoderToolParser {
             }
             QwenCoderEvent::ToolCall { name, raw_params } => {
                 self.mode = QwenCoderMode::Text;
+                let raw_params = raw_params
+                    .into_iter()
+                    .map(|(key, mut value)| {
+                        if self.config.null_literal == Some(value.as_str())
+                            && self
+                                .tool_parameters
+                                .convert_param_with_schema(&name, &key, "null".to_owned())
+                                .is_null()
+                        {
+                            value = "null".to_owned();
+                        }
+                        (key, value)
+                    })
+                    .collect();
                 let arguments = self.tool_parameters.convert_params_with_schema(&name, raw_params);
                 let arguments = serde_json::to_string(&arguments)
                     .map_err(|error| parsing_failed!("failed to serialize arguments: {}", error))?;

@@ -10,6 +10,7 @@ const SEED_OSS_CONFIG: QwenCoderConfig = QwenCoderConfig {
     first_tool_call_start: "\n\n<seed:tool_call>",
     next_tool_call_start: "\n<seed:tool_call>",
     tool_call_end: "</seed:tool_call>",
+    null_literal: None,
 };
 
 /// Tool parser for Seed-OSS XML-style tool calls.
