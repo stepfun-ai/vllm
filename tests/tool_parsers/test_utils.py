@@ -26,10 +26,11 @@ class TestCoerceToSchemaType:
             assert coerce_to_schema_type("NULL", "null") is None
             assert coerce_to_schema_type("Null", "null") is None
 
-        def test_none_string_never_converted(self):
-            assert coerce_to_schema_type("none", "null") == "none"
-            assert coerce_to_schema_type("none", "string") == "none"
-            assert coerce_to_schema_type("none", ["string", "null"]) == "none"
+        @pytest.mark.parametrize("value", ["None", "none", "NONE"])
+        def test_python_none_follows_null_schema(self, value):
+            assert coerce_to_schema_type(value, "null") is None
+            assert coerce_to_schema_type(value, "string") == value
+            assert coerce_to_schema_type(value, ["string", "null"]) is None
 
         def test_nil_string_never_converted(self):
             assert coerce_to_schema_type("nil", "string") == "nil"

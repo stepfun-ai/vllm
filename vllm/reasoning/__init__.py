@@ -132,6 +132,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "step3p5_reasoning_parser",
         "Step3p5ReasoningParser",
     ),
+    "step5": (
+        "deepseek_r1_reasoning_parser",
+        "DeepSeekR1ReasoningParser",
+    ),
     "inkling": (
         "inkling_reasoning_parser",
         "InklingParserReasoningAdapter",
