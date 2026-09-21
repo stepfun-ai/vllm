@@ -89,7 +89,6 @@ class LLMEngine:
         self.should_execute_dummy_batch = False
 
         self.renderer = renderer = renderer_from_config(self.vllm_config)
-        self.vllm_config.resolve_valid_vocab_size(renderer.tokenizer)
 
         # Convert EngineInput --> EngineCoreRequest.
         self.input_processor = InputProcessor(self.vllm_config, renderer)

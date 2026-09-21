@@ -48,8 +48,8 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             self.vocab_mapping: VocabMapping | None = VocabMapping(
                 target_tokenizer=target_tokenizer,
                 draft_tokenizer=draft_tokenizer,
-                target_vocab_size=spec.target_model_config.get_valid_vocab_size(),
-                draft_vocab_size=spec.draft_model_config.get_valid_vocab_size(),
+                target_vocab_size=spec.target_model_config.get_vocab_size(),
+                draft_vocab_size=spec.draft_model_config.get_vocab_size(),
                 device=device,
             )
         else:

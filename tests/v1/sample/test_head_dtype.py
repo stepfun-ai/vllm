@@ -200,8 +200,7 @@ def test_get_top_tokens_honors_head_dtype(default_vllm_config):
     lm_head = _FakeLmHead(
         weight,
         shard_indices=types.SimpleNamespace(
-            num_org_vocab_padding=0,
-            org_vocab_start_index=0,
+            num_org_vocab_padding=0, org_vocab_start_index=0
         ),
     )
 
@@ -210,44 +209,6 @@ def test_get_top_tokens_honors_head_dtype(default_vllm_config):
         dim=-1
     )
     assert torch.equal(top, expected)
-
-
-def test_valid_vocab_size_truncates_logits_and_local_argmax(default_vllm_config):
-    import types
-
-    vocab_size, valid_vocab_size, hidden_size = 8, 5, 2
-    lp = LogitsProcessor(
-        vocab_size,
-        valid_vocab_size=valid_vocab_size,
-    )
-    lp.head_dtype = torch.float32
-
-    hidden_states = torch.tensor([[1.0, 0.0]], dtype=torch.bfloat16)
-    weight = torch.zeros(vocab_size, hidden_size, dtype=torch.bfloat16)
-    weight[3, 0] = 4.0
-    # The largest logit belongs to checkpoint padding and must never be
-    # returned by the speculative local-argmax path.
-    weight[7, 0] = 100.0
-    lm_head = _FakeLmHead(
-        weight,
-        shard_indices=types.SimpleNamespace(
-            org_vocab_start_index=0,
-            org_vocab_end_index=vocab_size,
-        ),
-    )
-
-    logits = lp._get_logits(hidden_states, lm_head, None)
-    top = lp.get_top_tokens(lm_head, hidden_states)
-
-    assert logits.shape[-1] == valid_vocab_size
-    assert logits.dtype == torch.float32
-    assert top.item() == 3
-
-
-@pytest.mark.parametrize("valid_vocab_size", [0, -1, 9])
-def test_invalid_valid_vocab_size_is_rejected(default_vllm_config, valid_vocab_size):
-    with pytest.raises(ValueError, match="valid_vocab_size"):
-        LogitsProcessor(8, valid_vocab_size=valid_vocab_size)
 
 
 @pytest.mark.core_model

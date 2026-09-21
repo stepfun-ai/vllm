@@ -155,7 +155,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing (e.g. hybrid models with fp8 KV cache).
         self.kv_block_zeroer: KVBlockZeroer | None = None
 
-        self.vocab_size = self.model_config.get_valid_vocab_size()
+        self.vocab_size = self.model_config.get_vocab_size()
         self.max_model_len = self.model_config.max_model_len
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_num_reqs = self.scheduler_config.max_num_seqs

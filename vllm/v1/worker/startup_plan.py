@@ -58,24 +58,10 @@ def compute_plan_fingerprint(
     from vllm import __version__ as vllm_version
 
     capability = current_platform.get_device_capability()
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    draft_model_config = getattr(speculative_config, "draft_model_config", None)
     factors = {
         "schema": PLAN_SCHEMA_VERSION,
         "vllm": vllm_version,
         "vllm_config": vllm_config.compute_hash(),
-        # ``ModelConfig.compute_hash`` intentionally ignores valid_vocab_size
-        # because it does not change hidden-state computation.  It does,
-        # however, change sampler/logits buffer sizing and therefore the
-        # memory-profiling result persisted by this module.
-        "valid_vocab_sizes": {
-            "target": getattr(
-                getattr(vllm_config, "model_config", None),
-                "valid_vocab_size",
-                None,
-            ),
-            "draft": getattr(draft_model_config, "valid_vocab_size", None),
-        },
         "device_name": current_platform.get_device_name(),
         "device_total_memory": current_platform.get_device_total_memory(),
         "device_capability": str(capability) if capability else "",

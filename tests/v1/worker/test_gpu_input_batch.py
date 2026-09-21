@@ -476,60 +476,6 @@ def test_placeholder_spec_token_ids_written_verbatim():
     assert input_batch.token_ids_cpu[0, 3:6].tolist() == [13, -1, -1]
 
 
-def test_valid_vocab_size_controls_sampling_metadata():
-    valid_vocab_size = 1000
-    input_batch = InputBatch(
-        max_num_reqs=1,
-        max_model_len=8,
-        max_num_batched_tokens=8,
-        device=torch.device("cpu"),
-        vocab_size=VOCAB_SIZE,
-        valid_vocab_size=valid_vocab_size,
-        block_sizes=[16],
-        kernel_block_sizes=[16],
-        max_num_blocks_per_req=[1],
-    )
-    req = CachedRequestState(
-        req_id="req",
-        prompt_token_ids=[10, 11],
-        mm_features=[],
-        sampling_params=SamplingParams(
-            top_k=-1,
-            logprobs=-1,
-            allowed_token_ids=[10, 11],
-        ),
-        block_ids=([],),
-        generator=None,
-        num_computed_tokens=0,
-        output_token_ids=[],
-    )
-
-    input_batch.add_request(req)
-    metadata = input_batch._make_sampling_metadata()
-
-    assert input_batch.top_k_cpu[0] == valid_vocab_size
-    assert metadata.top_k is None
-    assert metadata.max_num_logprobs == valid_vocab_size
-    assert metadata.allowed_token_ids_mask is not None
-    assert metadata.allowed_token_ids_mask.shape[-1] == valid_vocab_size
-
-
-@pytest.mark.parametrize("valid_vocab_size", [0, -1, VOCAB_SIZE + 1])
-def test_invalid_valid_vocab_size_is_rejected(valid_vocab_size):
-    with pytest.raises(ValueError, match="valid_vocab_size"):
-        InputBatch(
-            max_num_reqs=1,
-            max_model_len=8,
-            max_num_batched_tokens=8,
-            device=torch.device("cpu"),
-            vocab_size=VOCAB_SIZE,
-            valid_vocab_size=valid_vocab_size,
-            block_sizes=[16],
-            kernel_block_sizes=[16],
-            max_num_blocks_per_req=[1],
-        )
-
-
 @pytest.mark.parametrize(
     ("pooling_params", "expect_device_prompt_token_ids", "expect_cpu_prompt_token_ids"),
     [

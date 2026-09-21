@@ -129,7 +129,7 @@ class StructuredOutputManager:
         if self.backend is None:
             assert request.sampling_params is not None
             backend = request.sampling_params.structured_outputs._backend
-            vocab_size = self.vllm_config.model_config.get_valid_vocab_size()
+            vocab_size = self.vllm_config.model_config.get_vocab_size()
             if backend == "xgrammar":
                 self.backend = XgrammarBackend(
                     self.vllm_config,

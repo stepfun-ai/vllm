@@ -8,10 +8,7 @@ import pytest
 from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
 
 from vllm.sampling_params import SamplingParams
-from vllm.tokenizers.detokenizer_utils import (
-    convert_ids_list_to_tokens,
-    detokenize_incrementally,
-)
+from vllm.tokenizers.detokenizer_utils import convert_ids_list_to_tokens
 from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.detokenizer import (
@@ -243,43 +240,6 @@ def test_oov_decode(tokenizer, fast):
 
     assert decoded_text == ""
     assert out_ids == [len(tokenizer)]
-
-
-class _SparseTokenizer:
-    is_fast = True
-
-    def __len__(self) -> int:
-        return 2
-
-    def get_vocab(self) -> dict[str, int]:
-        return {"zero": 0, "sparse-added-token": 1000}
-
-    def get_added_vocab(self) -> dict[str, int]:
-        return {"sparse-added-token": 1000}
-
-    def convert_ids_to_tokens(
-        self,
-        token_ids: list[int],
-        skip_special_tokens: bool = False,
-    ) -> list[str]:
-        sparse_token = "sparse-added-token"
-        return [sparse_token if token_id == 1000 else "" for token_id in token_ids]
-
-    def convert_tokens_to_string(self, tokens: list[str]) -> str:
-        return "".join(tokens)
-
-
-def test_sparse_added_token_id_is_not_treated_as_oov():
-    new_tokens, new_text, _, _ = detokenize_incrementally(
-        _SparseTokenizer(),
-        all_input_ids=[1000],
-        prev_tokens=[],
-        prefix_offset=0,
-        read_offset=0,
-    )
-
-    assert new_tokens == ["sparse-added-token"]
-    assert new_text == "sparse-added-token"
 
 
 # ---------- convert_ids_list_to_tokens collision tests ----------

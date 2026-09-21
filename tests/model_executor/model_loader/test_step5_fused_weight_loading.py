@@ -798,19 +798,6 @@ def test_step5_packed_mapping_exposes_dsa_partitions():
     ]
 
 
-def test_step5_model_requires_resolved_valid_vocab_size():
-    unresolved = SimpleNamespace(valid_vocab_size=None)
-
-    with pytest.raises(ValueError, match="resolve_valid_vocab_size"):
-        step5_model._require_resolved_valid_vocab_size(unresolved)
-
-    resolved = SimpleNamespace(
-        valid_vocab_size=128815,
-        get_valid_vocab_size=lambda: 128815,
-    )
-    assert step5_model._require_resolved_valid_vocab_size(resolved) == 128815
-
-
 @pytest.mark.parametrize(
     "model_cls",
     [

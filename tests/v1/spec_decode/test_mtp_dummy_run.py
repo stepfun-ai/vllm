@@ -881,7 +881,7 @@ def test_padded_next_token_warmup_covers_each_block_size(monkeypatch):
 
     proposer.warmup_prepare_next_token_ids_padded(
         num_reqs=1,
-        valid_vocab_size=128815,
+        vocab_size=128815,
     )
 
     assert next_token_launches == [

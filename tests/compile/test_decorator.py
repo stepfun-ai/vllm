@@ -56,7 +56,6 @@ def test_step5_mtp_layers_keep_distinct_compiled_constants(
     monkeypatch.setattr(mtp, "Step5MultiTokenPredictorLayer", DraftLayer)
     monkeypatch.setattr(mtp, "VocabParallelEmbedding", lambda *a: nn.Identity())
     monkeypatch.setattr(mtp, "LogitsProcessor", lambda *a, **kw: nn.Identity())
-    monkeypatch.setattr(mtp, "_require_resolved_valid_vocab_size", lambda _: 16)
     monkeypatch.setattr(
         mtp,
         "_get_mtp_config",

@@ -92,7 +92,7 @@ class DraftModelSpeculator(BaseSpeculator):
         # Non-HC models default to hc_mult=1 and are unaffected.
         hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
         self.hidden_size = self.hidden_size * hc_mult
-        self.vocab_size = self.draft_model_config.get_valid_vocab_size()
+        self.vocab_size = self.draft_model_config.get_vocab_size()
         self.dtype = vllm_config.model_config.dtype
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
         self.use_local_argmax_reduction = (
@@ -306,12 +306,6 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            if draft_logits.shape[-1] != logits.shape[-1]:
-                raise ValueError(
-                    "Draft logits buffer vocabulary size must match computed "
-                    f"logits, got {draft_logits.shape[-1]} and "
-                    f"{logits.shape[-1]}."
-                )
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(

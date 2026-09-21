@@ -484,50 +484,6 @@ def test_lm_head_logits_processor(
         torch.testing.assert_close(lora_result, expected_result, rtol=rtol, atol=atol)
 
 
-@pytest.mark.skip_global_cleanup
-def test_lora_logits_processor_respects_valid_vocab_size(
-    default_vllm_config,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        "vllm.lora.layers.logits_processor.get_tensor_model_parallel_world_size",
-        lambda: 1,
-    )
-    monkeypatch.setattr(
-        "vllm.lora.layers.logits_processor.get_tensor_model_parallel_rank",
-        lambda: 0,
-    )
-
-    class _FakePunicaWrapper:
-        @staticmethod
-        def add_lora_logits(logits, *args):
-            return logits
-
-    logits_processor = LogitsProcessor(8, valid_vocab_size=5)
-    logits_processor._apply_head = lambda *args: torch.arange(8).repeat(2, 1).float()
-    logits_processor._gather_logits = lambda logits: logits
-
-    lora_logits_processor = LogitsProcessorWithLoRA(
-        logits_processor,
-        hidden_size=2,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        sharded_to_full_mapping=None,
-    )
-    lora_logits_processor.punica_wrapper = _FakePunicaWrapper()
-    lora_logits_processor.lora_a_stacked = torch.empty(0)
-    lora_logits_processor.lora_b_stacked = torch.empty(0)
-    lora_logits_processor.sharded_to_full_mapping_gpu = None
-
-    logits = lora_logits_processor._get_logits(
-        hidden_states=torch.zeros(2, 2),
-        lm_head=object(),
-    )
-
-    assert logits is not None
-    assert logits.shape == (2, 5)
-
-
 @torch.inference_mode()
 @pytest.mark.parametrize("vocab_size", [258049, 300000])
 @pytest.mark.parametrize("device", DEVICES)

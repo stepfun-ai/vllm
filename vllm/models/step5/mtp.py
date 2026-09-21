@@ -28,7 +28,6 @@ from .model import (
     STEP5_PACKED_MODULES_MAPPING,
     Step5DecoderLayer,
     Step5MoE,
-    _require_resolved_valid_vocab_size,
     _reset_fused_qkv_indexer_load_state,
     _set_step5_moe_protocol_metadata,
     _validate_fused_qkv_indexer_weights,
@@ -159,12 +158,7 @@ class Step5MultiTokenPredictor(nn.Module):
             }
         )
 
-        self.logits_processor = LogitsProcessor(
-            config.vocab_size,
-            valid_vocab_size=_require_resolved_valid_vocab_size(
-                _get_mtp_vllm_config(vllm_config).model_config
-            ),
-        )
+        self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def forward(
         self,
@@ -241,9 +235,6 @@ class Step5MTP(nn.Module, MixtureOfExperts):
         super().__init__()
         self.config = _get_mtp_config(vllm_config)
         self.vllm_config = vllm_config
-        _require_resolved_valid_vocab_size(
-            _get_mtp_vllm_config(vllm_config).model_config
-        )
         self.model = Step5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )

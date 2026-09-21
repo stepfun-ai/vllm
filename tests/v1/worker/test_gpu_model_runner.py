@@ -801,34 +801,6 @@ def test_get_nans_in_logits(model_runner, dist_init):
     assert result == {"req_0": 2, "req_1": 0}
 
 
-def test_randomized_dummy_input_ids_use_effective_vocab_size(monkeypatch):
-    runner = object.__new__(GPUModelRunner)
-    runner.vllm_config = SimpleNamespace(
-        parallel_config=SimpleNamespace(data_parallel_size=1)
-    )
-    runner.model_config = SimpleNamespace(get_valid_vocab_size=lambda: 5)
-    runner.input_ids = SimpleNamespace(gpu=torch.zeros(4, dtype=torch.int64))
-    input_ids = torch.zeros(2, dtype=torch.int64)
-    seen_high: list[int] = []
-
-    def fake_randint_like(tensor, *, low, high):
-        assert low == 0
-        seen_high.append(high)
-        return torch.full_like(tensor, high - 1)
-
-    monkeypatch.setattr(torch, "randint_like", fake_randint_like)
-
-    with runner.maybe_randomize_inputs(
-        input_ids,
-        inputs_embeds=None,
-        randomize_inputs=True,
-    ):
-        assert input_ids.tolist() == [4, 4]
-
-    assert seen_high == [5]
-    assert input_ids.tolist() == [0, 0]
-
-
 def test_update_states_no_changes(model_runner, dist_init):
     req_id = "req_0"
 
@@ -1168,7 +1140,7 @@ def test_dummy_sampler_run_warms_speculative_runtime_variants(monkeypatch):
         block_size=64,
     )
     runner.input_batch = SimpleNamespace(
-        valid_vocab_size=7,
+        vocab_size=7,
         block_table=SimpleNamespace(block_tables=[block_table]),
     )
     synchronize = Mock()
@@ -1219,7 +1191,7 @@ def test_dummy_sampler_run_skips_disabled_padded_drafter_warmup(monkeypatch):
         block_size=64,
     )
     runner.input_batch = SimpleNamespace(
-        valid_vocab_size=7,
+        vocab_size=7,
         block_table=SimpleNamespace(block_tables=[block_table]),
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", Mock())

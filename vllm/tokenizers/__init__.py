@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .hf import maybe_make_thread_pool
-from .protocol import TokenizerLike, get_tokenizer_vocab_upper_bound
+from .protocol import TokenizerLike
 from .registry import (
     TokenizerRegistry,
     cached_get_tokenizer,
@@ -12,7 +12,6 @@ from .registry import (
 
 __all__ = [
     "TokenizerLike",
-    "get_tokenizer_vocab_upper_bound",
     "TokenizerRegistry",
     "cached_get_tokenizer",
     "get_tokenizer",

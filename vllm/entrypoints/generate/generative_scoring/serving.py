@@ -204,7 +204,7 @@ class ServingGenerativeScoring(BaseServing):
             )
 
         # Validate label_token_ids
-        vocab_size = self.model_config.get_valid_vocab_size()
+        vocab_size = self.model_config.get_vocab_size()
         for token_id in request.label_token_ids:
             if token_id < 0 or token_id >= vocab_size:
                 return self.create_error_response(

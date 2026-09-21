@@ -352,9 +352,6 @@ class ModelConfig:
     definitions"""
     io_processor_plugin: str | None = None
     """IOProcessor plugin name to load at model startup"""
-    valid_vocab_size: int | None = None
-    """Valid tokenizer vocabulary size for models whose checkpoint vocabulary
-    is padded. If unset, supported models derive it from the tokenizer."""
     renderer_num_workers: int = 1
     """Number of worker threads in the renderer thread pool. The pool is
     consumed by the async renderer path (e.g. the OpenAI-compatible API
@@ -432,7 +429,6 @@ class ModelConfig:
             "override_attention_dtype",
             "logits_processors",
             "io_processor_plugin",
-            "valid_vocab_size",
             "pooler_config",
             "multimodal_config",
             "limit_mm_per_prompt",
@@ -647,7 +643,6 @@ class ModelConfig:
         self._model_info = model_info
         self._architecture = arch
         logger.info("Resolved architecture: %s", arch)
-        self._verify_valid_vocab_size()
 
         # Set default tokenizer modes based on model architecture
         if self.tokenizer_mode == "auto":
@@ -1264,38 +1259,6 @@ class ModelConfig:
 
             self.enforce_eager = True
 
-    def supports_valid_vocab_size(self) -> bool:
-        return self.architecture in {
-            "Step5ForCausalLM",
-            "Step5ForConditionalGeneration",
-            "Step5MTP",
-        }
-
-    def requires_valid_vocab_size_resolution(self) -> bool:
-        return self.supports_valid_vocab_size() and self.valid_vocab_size is None
-
-    def _verify_valid_vocab_size(self) -> None:
-        valid_vocab_size = self.valid_vocab_size
-        if valid_vocab_size is None:
-            if self.requires_valid_vocab_size_resolution() and self.skip_tokenizer_init:
-                raise ValueError(
-                    "Step5 with skip_tokenizer_init requires an explicit "
-                    "valid_vocab_size because the checkpoint vocabulary is "
-                    "padded."
-                )
-            return
-        if not self.supports_valid_vocab_size():
-            raise ValueError(
-                "valid_vocab_size is currently supported only for Step5 "
-                f"models, got architecture {self.architecture}."
-            )
-        vocab_size = self.get_vocab_size()
-        if not 0 < valid_vocab_size <= vocab_size:
-            raise ValueError(
-                "valid_vocab_size must be positive and no greater than model "
-                f"vocab_size ({vocab_size}), got {valid_vocab_size}."
-            )
-
     def _verify_with_expert_parallelism(self) -> None:
         if not self.is_moe:
             raise ValueError(
@@ -1421,61 +1384,6 @@ class ModelConfig:
 
     def get_vocab_size(self) -> int:
         return self.model_arch_config.vocab_size
-
-    def get_valid_vocab_size(self) -> int:
-        return (
-            self.valid_vocab_size
-            if self.valid_vocab_size is not None
-            else self.get_vocab_size()
-        )
-
-    def set_valid_vocab_size(self, valid_vocab_size: int) -> None:
-        self.valid_vocab_size = valid_vocab_size
-        self._verify_valid_vocab_size()
-
-    def set_and_verify_valid_vocab_size(self, tokenizer: Any) -> None:
-        if not self.supports_valid_vocab_size():
-            return
-
-        from vllm.tokenizers import get_tokenizer_vocab_upper_bound
-
-        tokenizer_vocab_upper_bound = get_tokenizer_vocab_upper_bound(tokenizer)
-        vocab_size = self.get_vocab_size()
-        if not 0 < tokenizer_vocab_upper_bound <= vocab_size:
-            raise ValueError(
-                "Tokenizer token-ID upper bound must be positive and no greater "
-                f"than model vocab_size ({vocab_size}), got "
-                f"{tokenizer_vocab_upper_bound}."
-            )
-        if self.valid_vocab_size is None:
-            self.set_valid_vocab_size(tokenizer_vocab_upper_bound)
-            logger.info(
-                "Using tokenizer token-ID upper bound %s as valid_vocab_size.",
-                tokenizer_vocab_upper_bound,
-            )
-        elif self.valid_vocab_size > tokenizer_vocab_upper_bound:
-            raise ValueError(
-                "valid_vocab_size "
-                f"({self.valid_vocab_size}) is greater than the tokenizer "
-                f"token-ID upper bound ({tokenizer_vocab_upper_bound})."
-            )
-        else:
-            self._verify_valid_vocab_size()
-
-    def resolve_valid_vocab_size(self, tokenizer: Any | None = None) -> Any | None:
-        """Resolve a padded model vocabulary before worker processes start."""
-        if not self.supports_valid_vocab_size():
-            return tokenizer
-
-        if tokenizer is None and self.valid_vocab_size is None:
-            from vllm.tokenizers import cached_tokenizer_from_config
-
-            tokenizer = cached_tokenizer_from_config(self)
-        if tokenizer is not None:
-            self.set_and_verify_valid_vocab_size(tokenizer)
-        else:
-            self._verify_valid_vocab_size()
-        return tokenizer
 
     def get_hidden_size(self) -> int:
         return self.model_arch_config.hidden_size

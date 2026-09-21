@@ -344,7 +344,7 @@ class ExtractHiddenStatesProposer:
 
         # With num_speculative_tokens == 1, there is exactly one token
         sampled = sampled_token_ids[:, 0]
-        is_valid = (sampled >= 0) & (sampled < gpu_input_batch.valid_vocab_size)
+        is_valid = (sampled >= 0) & (sampled < gpu_input_batch.vocab_size)
         valid_sampled_tokens_count = is_valid.to(torch.int32)
 
         use_sampled = is_valid & ~discard_request_mask[:num_reqs]
