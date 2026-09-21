@@ -811,15 +811,7 @@ impl ServeArgs {
 }
 
 fn effective_engine_reasoning_parser(selection: &ParserSelection, model: &str) -> Option<String> {
-    selection.resolve_reasoning_name(model).map(|name| {
-        // Python's R1 parser gates on think tokens regardless of template kwargs,
-        // matching Step-5's always-thinking prompt. `step5` is a Rust-only alias.
-        match name {
-            "step5" => "deepseek_r1",
-            name => name,
-        }
-        .to_owned()
-    })
+    selection.resolve_reasoning_name(model).map(str::to_owned)
 }
 
 /// Allocate fresh IPC endpoints for one managed frontend instance.

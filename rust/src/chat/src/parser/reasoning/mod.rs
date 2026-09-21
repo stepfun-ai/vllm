@@ -77,7 +77,6 @@ impl ReasoningParserFactory {
             .register_parser::<SeedOssReasoningParser>(names::SEED_OSS)
             .register_parser::<Step3ReasoningParser>(names::STEP3)
             .register_parser::<Step3p5ReasoningParser>(names::STEP3P5)
-            // Step-5 uses bare think tags with no framing whitespace.
             .register_parser::<DeepSeekV3ReasoningParser>(names::STEP5);
 
         factory

@@ -423,26 +423,6 @@ fn serve_args_resolve_auto_reasoning_parser_for_managed_engine() {
 }
 
 #[test]
-fn serve_args_map_step5_reasoning_to_python_engine_parser() {
-    for extra in [vec![], vec!["--reasoning-parser", "step5"]] {
-        let cli = Cli::try_parse_from(
-            ["vllm-rs", "serve", "stepfun-ai/Step-5-Preview"].into_iter().chain(extra),
-        )
-        .unwrap();
-        let Command::Serve(args) = cli.command else {
-            panic!("expected serve args");
-        };
-        expect![[r#"
-            [
-                "--reasoning-parser",
-                "deepseek_r1",
-            ]
-        "#]]
-        .assert_debug_eq(&args.to_managed_engine_config(5555).python_args);
-    }
-}
-
-#[test]
 fn serve_args_resolve_unified_reasoning_parser_for_managed_engine() {
     let cli = Cli::try_parse_from(["vllm-rs", "serve", "moonshotai/Kimi-K3"]).unwrap();
     let Command::Serve(args) = cli.command else {
