@@ -31,18 +31,20 @@ def test_step5_text_loader_skips_multimodal_weights_and_tied_lm_head(
     observed_skip_prefixes = None
 
     class FakeLoader:
-        def __init__(self, _module, *, skip_prefixes):
-            nonlocal observed_skip_prefixes
-            observed_skip_prefixes = skip_prefixes
+        def __init__(self, _module):
+            pass
 
         def load_weights(self, _weights, *, mapper):
-            del mapper
+            nonlocal observed_skip_prefixes
+            observed_skip_prefixes = list(mapper.orig_to_new_prefix)
+            for prefix in observed_skip_prefixes:
+                assert mapper._map_name(prefix + "weight") is None
             return set()
 
     monkeypatch.setattr(step5_model, "AutoWeightsLoader", FakeLoader)
     model = SimpleNamespace(
         config=SimpleNamespace(tie_word_embeddings=tie_word_embeddings),
-        hf_to_vllm_mapper=object(),
+        hf_to_vllm_mapper=step5_model.Step5ForCausalLM.hf_to_vllm_mapper,
         model=nn.Module(),
     )
 

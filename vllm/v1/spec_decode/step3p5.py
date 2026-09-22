@@ -23,7 +23,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.cp_utils import maybe_prepare_dcp_local_seq_lens
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -834,10 +834,8 @@ class Step3p5MTPProposer(EagleProposer):
         )
 
         common_attn_metadata.positions = self.positions[:num_tokens]
-        common_attn_metadata._seq_lens_cpu = None
-        common_attn_metadata._num_computed_tokens_cpu = None
         if common_attn_metadata.dcp_local_seq_lens is not None:
-            prepare_dcp_local_seq_lens(
+            maybe_prepare_dcp_local_seq_lens(
                 common_attn_metadata.dcp_local_seq_lens,
                 common_attn_metadata.seq_lens,
                 num_reqs,
@@ -845,7 +843,6 @@ class Step3p5MTPProposer(EagleProposer):
                 self.dcp_rank,
                 self.cp_kv_cache_interleave_size,
             )
-            common_attn_metadata.dcp_local_seq_lens_cpu = None
         return num_tokens, num_rejected
 
     def _prepare_packed_hidden_states(
@@ -1051,7 +1048,6 @@ class Step3p5MTPProposer(EagleProposer):
 
     def _maybe_share_lm_head(self, target_language_model: torch.nn.Module) -> None:
         """Step3.5 MTP uses the lm_head stored in each MTP layer."""
-
         # The base MTP path shares target lm_head into shared_head.head.
         # Step3.5 checkpoints carry per-MTP-layer shared_head weights.
         return

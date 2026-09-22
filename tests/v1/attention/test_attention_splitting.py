@@ -20,12 +20,12 @@ from vllm.v1.worker.ubatch_utils import (
 
 @pytest.fixture
 def sample_query_start_loc():
-    """Sample query_start_loc tensor for testing"""
+    """Sample query_start_loc tensor for testing."""
     return torch.tensor([0, 5, 12, 20, 35, 50])
 
 
 def test_basic_slice_middle(sample_query_start_loc):
-    """Test slicing from middle of tensor"""
+    """Test slicing from middle of tensor."""
     req_slice = slice(1, 3)  # slice from index 1 to 3
     result = slice_query_start_locs(sample_query_start_loc, req_slice)
 
@@ -34,7 +34,7 @@ def test_basic_slice_middle(sample_query_start_loc):
 
 
 def test_slice_from_beginning(sample_query_start_loc):
-    """Test slicing from the beginning of tensor"""
+    """Test slicing from the beginning of tensor."""
     req_slice = slice(0, 2)  # slice from index 0 to 2
     result = slice_query_start_locs(sample_query_start_loc, req_slice)
 
@@ -43,7 +43,7 @@ def test_slice_from_beginning(sample_query_start_loc):
 
 
 def test_slice_to_end(sample_query_start_loc):
-    """Test slicing to the end of tensor"""
+    """Test slicing to the end of tensor."""
     req_slice = slice(3, 5)  # slice from index 3 to 5 (last index)
     result = slice_query_start_locs(sample_query_start_loc, req_slice)
 
@@ -52,7 +52,7 @@ def test_slice_to_end(sample_query_start_loc):
 
 
 def test_single_element_slice(sample_query_start_loc):
-    """Test slice that results in single element"""
+    """Test slice that results in single element."""
     req_slice = slice(2, 3)  # slice from index 2 to 3
     result = slice_query_start_locs(sample_query_start_loc, req_slice)
 
@@ -61,7 +61,7 @@ def test_single_element_slice(sample_query_start_loc):
 
 
 def test_full_tensor_slice(sample_query_start_loc):
-    """Test slicing the entire tensor"""
+    """Test slicing the entire tensor."""
     req_slice = slice(0, 5)  # slice entire tensor
     result = slice_query_start_locs(sample_query_start_loc, req_slice)
 
@@ -80,7 +80,7 @@ def test_slice_bounds_edge_cases(sample_query_start_loc):
 
 @pytest.fixture
 def small_decode_metadata():
-    """Create metadata for small decode batch"""
+    """Create metadata for small decode batch."""
     batch_spec = BATCH_SPECS["small_decode"]
     device = torch.device("cpu")
     return create_common_attn_metadata(batch_spec, block_size=16, device=device)
@@ -88,7 +88,7 @@ def small_decode_metadata():
 
 @pytest.fixture
 def large_decode_metadata():
-    """Create metadata for small decode batch"""
+    """Create metadata for small decode batch."""
     batch_spec = BATCH_SPECS["large_decode"]
     device = torch.device("cpu")
     return create_common_attn_metadata(batch_spec, block_size=16, device=device)
@@ -96,7 +96,7 @@ def large_decode_metadata():
 
 @pytest.fixture
 def mixed_small_metadata():
-    """Create metadata for mixed small batch"""
+    """Create metadata for mixed small batch."""
     batch_spec = BATCH_SPECS["mixed_small"]
     device = torch.device("cpu")
     return create_common_attn_metadata(batch_spec, block_size=16, device=device)
@@ -152,7 +152,7 @@ def test_unpadded_preserves_prefill_phase(small_decode_metadata):
 
 
 def test_split_attn_metadata_decode_batch(large_decode_metadata):
-    """Test splitting decode batch into two equal parts"""
+    """Test splitting decode batch into two equal parts."""
     num_tokens = large_decode_metadata.num_reqs
     mid_point = num_tokens // 2
     ubatch_slices = [
@@ -334,7 +334,7 @@ def test_split_decodes_and_prefills_uniform_mixed_batch_non_uniform_decodes():
 
 
 def test_split_decodes_and_prefills_uniform_padded_batch_all_same():
-    """uniform batch where all query lengths are identical with 0 length padded reqs."""
+    """Uniform batch where all query lengths are identical with 0 length padded reqs."""
     # All query lengths are 2, with decode_threshold=3 (so 2 <= 3)
     # This triggers the padded uniform path at line 891
     query_lens = [2, 2, 2, 0]
@@ -361,7 +361,7 @@ def test_split_decodes_and_prefills_uniform_padded_batch_all_same():
 def test_prefill_split_across_ubatches(
     seq_lens, query_lens, split_point, expected_first_reqs, expected_second_reqs
 ):
-    """Test splitting a prefill across ubatches"""
+    """Test splitting a prefill across ubatches."""
     import numpy as np
 
     device = torch.device("cpu")
@@ -497,8 +497,8 @@ def test_build_attention_metadata_preserves_async_prefill_phase():
     assert spec_decode_metadata is unpadded_metadata
     captured_is_prefilling = producer_metadata.is_prefilling
     assert isinstance(captured_is_prefilling, torch.Tensor)
-    assert producer_metadata._seq_lens_cpu is None
-    assert unpadded_metadata._seq_lens_cpu is None
+    assert producer_metadata.seq_lens_cpu_upper_bound.tolist() == [100, 200, 300, 0, 0]
+    assert unpadded_metadata.seq_lens_cpu_upper_bound.tolist() == [100, 200, 300]
     assert unpadded_metadata.is_prefilling is not None
     assert unpadded_metadata.is_prefilling.tolist() == [False, True, False]
     assert not captured_is_prefilling[0]  # decode  (50 >= 50)

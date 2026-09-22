@@ -63,6 +63,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .mtp_state_machine import Step5KernelPlan, build_step5_kernel_plan
 from .sparse_summary_cache import (
@@ -1087,7 +1088,8 @@ class Step5DSAMetadataBuilder(FlashAttentionMetadataBuilder):
         step5_metadata.dsa_valid_requests = self._dsa_valid_requests
         step5_metadata.dsa_valid_tokens = self._dsa_valid_tokens
         step5_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        step5_metadata.seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+        # Exact CPU sequence lengths are unavailable with async scheduling.
+        step5_metadata.seq_lens_cpu = None
         step5_metadata.step5_kernel_plan = build_step5_kernel_plan(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold,
@@ -1099,16 +1101,27 @@ class Step5DSAMetadataBuilder(FlashAttentionMetadataBuilder):
         return False
 
 
-# Step5 pins a split K/V layout instead of packing both tensors into the
-# content dimension. See Step5SplitKVFlashAttentionBackend for the layout
-# contract.
+# Main exposes [B, H, N, K+V]. Both SWA and DSA share this allocation;
+# only the sparse kernel boundary converts it to a split, strided view.
 class Step5SplitKVFlashAttentionImpl(FlashAttentionImpl):
-    """FlashAttention over the split (2, num_blocks, ...) KV cache layout."""
+    """FlashAttention using the canonical packed-content KV cache."""
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return kv_cache.unbind(0)
+        return kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+
+
+def _step5_sparse_kv_view(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Expose [2, B, N, H, D] without copying the canonical [B, H, N, 2D].
+
+    LBNHC keeps B/N adjacent in physical memory, so each scheduler block
+    can be split into 16-token kernel pages while preserving physical IDs.
+    K and V retain their actual strides through the CuTe kernel interface.
+    """
+    if kv_cache.ndim != 4 or kv_cache.shape[-1] % 2:
+        raise ValueError("Step5 expects KV cache shape [B, H, N, 2D].")
+    return kv_cache.unflatten(-1, (2, kv_cache.shape[-1] // 2)).permute(3, 0, 2, 1, 4)
 
 
 def _validate_step5_dsa_attention_contract(
@@ -2196,7 +2209,7 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         with torch.profiler.record_function("step5_dsa.sparse_gqa"):
             return self._forward_sparse_gqa_cutedsl(
                 query=query,
-                kv_cache=kv_cache,
+                kv_cache=_step5_sparse_kv_view(kv_cache),
                 attn_metadata=attn_metadata,
                 output=output,
                 summary_cache=summary_cache,
@@ -4250,23 +4263,10 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             )
 
 
-# FlashAttention normally packs K and V into the content dimension. Step5's
-# DSA layers cannot use that layout: every DSA attention call
-# goes to Step5's CuTeDSL sparse-GQA kernels, which take separate key/value
-# caches, re-page them from vLLM's 64-entry blocks to the kernel's 16-entry pages
-# via .view(), and reject anything not dense row-major. Re-paging is only
-# expressible as a view when each half is contiguous, which rules out every
-# blocks-first arrangement.
-#
-# The layout cannot be chosen per layer either. vLLM shares one raw allocation
-# between one layer of each KV cache group (get_kv_cache_config_from_groups), so
-# a block ID must address the same bytes in every layer sharing it; when the
-# groups disagree, GPUModelRunner._update_hybrid_attention_mamba_layout
-# restrides the split view onto blocks-first storage and the halves stop being
-# contiguous. Full-attention and sliding-window groups share allocations, so
-# both kinds must use the same split layout.
+# Both attention types require token-major pages. Layer-major storage lets
+# DSA subdivide a scheduler block into 16-token pages as a zero-copy view.
 class Step5SplitKVFlashAttentionBackend(FlashAttentionBackend):
-    """FlashAttention pinned to the split KV layout Step5 kernels require."""
+    """FlashAttention with token-major KV pages shared by Step5 DSA."""
 
     @staticmethod
     def get_name() -> str:
@@ -4276,25 +4276,9 @@ class Step5SplitKVFlashAttentionBackend(FlashAttentionBackend):
     def get_impl_cls() -> type[FlashAttentionImpl]:
         return Step5SplitKVFlashAttentionImpl
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        # Per AttentionBackend.get_kv_cache_stride_order, raising here makes the
-        # physical layout match the logical shape above.
-        raise NotImplementedError
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC,)
 
 
 class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):

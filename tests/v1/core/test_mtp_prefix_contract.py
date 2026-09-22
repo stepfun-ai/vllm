@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -10,11 +11,11 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
-    _get_scheduler_block_size_for_groups,
     _max_memory_usage_bytes_from_groups,
     _project_kv_cache_groups_to_worker,
     generate_scheduler_kv_cache_config,
     init_none_hash,
+    resolve_dcp_kv_block_size,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -100,6 +101,7 @@ def test_swa_retention_includes_mtp_tail_eagle_proof_and_scheduler_alignment():
         == 10
     )
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         max_in_flight_tokens=5,
         model_config=SimpleNamespace(max_model_len=100),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -153,6 +155,7 @@ def test_swa_startup_sizing_matches_hybrid_runtime_admission_cap():
         KVCacheGroupSpec(["draft-1"], swa_spec),
     ]
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         max_in_flight_tokens=5,
         model_config=SimpleNamespace(max_model_len=100),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -230,6 +233,7 @@ def test_uniform_swa_startup_sizing_matches_scheduler_proof_closure():
         KVCacheGroupSpec(["local"], uniform("local", other_swa_spec)),
     ]
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         max_in_flight_tokens=5,
         model_config=SimpleNamespace(max_model_len=100),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -303,6 +307,7 @@ def test_single_uniform_swa_group_uses_proof_aware_recursive_sizing():
         )
     ]
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         max_in_flight_tokens=5,
         model_config=SimpleNamespace(max_model_len=100),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -391,6 +396,7 @@ def test_uniform_scheduler_block_size_matches_runtime_projection_under_dcp():
         KVCacheGroupSpec(["mamba"], mamba_spec),
     ]
     vllm_config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
         cache_config=SimpleNamespace(
             block_size=16,
@@ -400,9 +406,8 @@ def test_uniform_scheduler_block_size_matches_runtime_projection_under_dcp():
         kv_transfer_config=None,
     )
 
-    startup_block_size = _get_scheduler_block_size_for_groups(
-        vllm_config,
-        groups,
+    startup_block_size = math.lcm(
+        *(resolve_dcp_kv_block_size(group.kv_cache_spec, 2) for group in groups)
     )
     scheduler_config = generate_scheduler_kv_cache_config(
         [

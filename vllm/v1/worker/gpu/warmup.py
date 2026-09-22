@@ -18,7 +18,13 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import CrossAttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    CrossAttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -39,6 +45,11 @@ def _reserved_block_count(
     `KVCacheManager.allocate_slots` reserves: the token range plus
     `num_lookahead_tokens`, where the speculator writes the KV of its drafts.
     """
+    if isinstance(kvcache_spec, UniformTypeKVCacheSpecs):
+        kvcache_spec = kvcache_spec.first_spec
+    if isinstance(kvcache_spec, CircularBufferSpec):
+        # Circular caches keep one physical ring block for the request lifetime.
+        return 1
     if isinstance(kvcache_spec, CrossAttentionSpec):
         # Cross-attention blocks cover the encoder sequence only.
         return cdiv(max_encoder_len, kvcache_spec.block_size)
@@ -99,17 +110,17 @@ def run_mixed_prefill_decode_warmup(
     block_count = _warmup_block_counter(model_runner)
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]
     decode_prefill_block_counts = [
-        block_count(decode_prompt_len, spec) for spec in kv_cache_specs
+        block_count(decode_prompt_len, s) for s in kv_cache_specs
     ]
     decode_block_counts = [
-        block_count(decode_prompt_len + decode_scheduled_tokens, spec)
-        for spec in kv_cache_specs
+        block_count(decode_prompt_len + decode_scheduled_tokens, s)
+        for s in kv_cache_specs
     ]
     decode_block_deltas = [
         decode - prefill
         for decode, prefill in zip(decode_block_counts, decode_prefill_block_counts)
     ]
-    prefill_block_counts = [block_count(prefill_len, spec) for spec in kv_cache_specs]
+    prefill_block_counts = [block_count(prefill_len, s) for s in kv_cache_specs]
     required_blocks = sum(decode_block_counts) + sum(prefill_block_counts)
     if model_runner.kv_cache_config.num_blocks <= required_blocks:
         logger.warning(
@@ -209,6 +220,34 @@ def warmup_kernels(
     We must call the provided worker's execute_model for pipeline parallel
     coordination.
     """
+    # Adaptive costs are calibrated during capture, after this warmup. Exercise
+    # fixed draft counts here, then restore the manager for capture and serving.
+    adaptive_verification = model_runner.adaptive_verification
+    model_runner.adaptive_verification = None
+    rejection_sampler = model_runner.rejection_sampler
+    adaptive_sampling = (
+        rejection_sampler is not None and rejection_sampler.enable_adaptive_verification
+    )
+    if adaptive_sampling:
+        assert rejection_sampler is not None
+        rejection_sampler.enable_adaptive_verification = False
+    try:
+        _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+    finally:
+        model_runner.adaptive_verification = adaptive_verification
+        if adaptive_sampling:
+            assert rejection_sampler is not None
+            rejection_sampler.enable_adaptive_verification = True
+
+
+def _warmup_kernels(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    if model_runner.vllm_config.is_mm_encoder_only:
+        return
+
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query

@@ -74,6 +74,12 @@ def _make_cache(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     shape = (num_blocks, block_size, num_kv_heads, head_dim)
+    if layout == "PACKED_NHD":
+        storage = torch.empty((*shape[:-1], 2 * head_dim), device="cuda", dtype=dtype)
+        key, value = storage.split(head_dim, dim=-1)
+        key.fill_(17)
+        value.fill_(19)
+        return key, value
     if layout == "NHD":
         return (
             torch.full(shape, 17, device="cuda", dtype=dtype),
@@ -100,10 +106,10 @@ def _make_cache(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype_mode", ["input", "float32"])
-@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("layout", ["NHD", "HND", "PACKED_NHD"])
 @pytest.mark.parametrize(
     "head_dim,rotary_pairs",
-    [(64, 16), (128, 16), (128, 32), (192, 48), (192, 96), (256, 64)],
+    [(64, 16), (128, 16), (128, 32), (192, 32), (192, 48), (192, 96), (256, 64)],
 )
 @torch.inference_mode()
 def test_step5_qknorm_rope_cache_matches_reference(

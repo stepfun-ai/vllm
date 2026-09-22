@@ -2575,7 +2575,7 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
                 "Step5 sparse summary cache owner KV cache must be a tensor, "
                 f"got {type(owner_kv_cache)!r}."
             )
-        if owner_kv_cache.ndim < 3:
+        if owner_kv_cache.ndim != 4:
             raise RuntimeError(
                 "Step5 sparse summary cache owner KV cache has invalid shape: "
                 f"{tuple(owner_kv_cache.shape)}."
@@ -2620,14 +2620,14 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
                 "Step5 sparse summary cache backing budget was not initialized."
             )
         backing = torch.zeros(
-            (int(owner_kv_cache.shape[1]), int(allocated_bytes)),
+            (int(owner_kv_cache.shape[0]), int(allocated_bytes)),
             device=owner_kv_cache.device,
             dtype=torch.uint8,
         )
         self._kv_cache = backing
         self._bind_summary_cache(backing, summary_dtype=summary_dtype)
         blocks_per_scheduler_block = 1
-        num_scheduler_blocks = int(owner_kv_cache.shape[1])
+        num_scheduler_blocks = int(owner_kv_cache.shape[0])
         if int(num_scheduler_blocks) > 0 and (
             int(backing.shape[0]) % int(num_scheduler_blocks) == 0
         ):

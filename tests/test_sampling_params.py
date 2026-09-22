@@ -181,18 +181,38 @@ def test_bad_words_use_sparse_tokenizer_upper_bound():
     assert params.bad_words_token_ids == [[1000]]
 
 
-def test_models_without_valid_vocab_preserve_tokenizer_union_behavior():
-    model_config = MockModelConfig(
-        valid_vocab_size=None,
-        vocab_size=1000,
-    )
-    tokenizer = FakeBadWordsTokenizer()
+def test_models_without_valid_vocab_reject_out_of_model_token_ids():
+    model_config = MockModelConfig(valid_vocab_size=None, vocab_size=1000)
+    params = SamplingParams(stop_token_ids=[1000])
+    with pytest.raises(VLLMValidationError, match="out-of-vocab"):
+        params.verify(model_config, None, None, FakeTokenizer())
 
-    SamplingParams(
-        allowed_token_ids=[1000],
-        stop_token_ids=[1000],
-    ).verify(model_config, None, None, FakeTokenizer())
-    SamplingParams(bad_words=["foo"]).update_from_tokenizer(
-        tokenizer,
-        model_config=model_config,
+
+def test_verify_leaves_logits_processors_to_admission():
+    """verify() is runner-agnostic; LP validation lives in the admission
+    layer, so an unimportable FQCN must not fail verify()."""
+    SamplingParams().verify(
+        MockModelConfig(logits_processors=["no.such:Cls"]), None, None, None
     )
+
+
+@pytest.mark.parametrize("value", [-(2**63) - 1, 2**64])
+def test_extra_args_rejects_nested_integer_overflow(value):
+    """Reject extension values before they reach the engine transport."""
+    with pytest.raises(VLLMValidationError, match="extra_args integers"):
+        SamplingParams(extra_args={"ec_transfer_params": {"nested": [{"x": value}]}})
+
+
+@pytest.mark.parametrize("value", [-(2**63), 2**63 - 1, 2**63, 2**64 - 1, True])
+def test_extra_args_accepts_messagepack_integer_boundaries(value):
+    extra_args = {"kv_transfer_params": {"nested": [{"x": value}]}}
+    assert SamplingParams(extra_args=extra_args).extra_args == extra_args
+
+
+def test_extra_args_preserves_custom_objects_and_shared_containers():
+    custom = object()
+    shared = [custom, (None, "value", 1.5)]
+    extra_args = {"first": shared, "second": shared}
+    params = SamplingParams(extra_args=extra_args)
+    assert params.extra_args["first"][0] is custom
+    assert params.extra_args["first"] is params.extra_args["second"]
