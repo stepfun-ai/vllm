@@ -17,7 +17,7 @@ from importlib.metadata import PackageNotFoundError, version
 from types import UnionType
 from typing import Any, Callable, Iterable, Sequence, Tuple, get_args, get_origin
 
-_EXPECTED_CUTLASS_DSL_VERSION = "4.6.0"
+_EXPECTED_CUTLASS_DSL_VERSION = "4.7.1"
 _REQUIRED_TORCH_DTYPES = (
     "uint16",
     "uint32",

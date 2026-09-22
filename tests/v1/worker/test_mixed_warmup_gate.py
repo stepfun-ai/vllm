@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.warmup import (
     _reserved_block_count,
     run_mixed_prefill_decode_warmup,
@@ -78,3 +79,30 @@ def test_reserved_block_count_matches_mamba_policy(cache_mode, expected_blocks):
         )
         == expected_blocks
     )
+
+
+@pytest.mark.parametrize("fail_warmup", [False, True])
+def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_warmup):
+    """Startup must warm fixed drafts before calibration and retain its manager."""
+    manager = SimpleNamespace(cost_tables=None)
+    rejection_sampler = SimpleNamespace(enable_adaptive_verification=True)
+    runner = SimpleNamespace(
+        adaptive_verification=manager,
+        rejection_sampler=rejection_sampler,
+    )
+
+    def run_steps(model_runner, execute, sample):
+        assert model_runner.adaptive_verification is None
+        assert not model_runner.rejection_sampler.enable_adaptive_verification
+        if fail_warmup:
+            raise RuntimeError("warmup failed")
+
+    monkeypatch.setattr(warmup, "_warmup_kernels", run_steps)
+    if fail_warmup:
+        with pytest.raises(RuntimeError, match="warmup failed"):
+            warmup.warmup_kernels(runner, _fail, _fail)
+    else:
+        warmup.warmup_kernels(runner, _fail, _fail)
+    assert runner.adaptive_verification is manager
+    assert manager.cost_tables is None
+    assert rejection_sampler.enable_adaptive_verification

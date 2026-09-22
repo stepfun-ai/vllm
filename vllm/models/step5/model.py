@@ -29,6 +29,9 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.determinism.batch_invariant import (
+    linear_batch_invariant,
+)
 from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import (
@@ -37,9 +40,6 @@ from vllm.model_executor.layers.attention.attention import (
 )
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
-)
-from vllm.model_executor.layers.batch_invariant import (
-    linear_batch_invariant,
 )
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -2931,11 +2931,11 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         skip_prefixes = ["vision_model."]
         if self.config.tie_word_embeddings:
             skip_prefixes.append("lm_head.")
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(
+            orig_to_new_prefix={prefix: None for prefix in skip_prefixes}
         )
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(self)
+        loaded_params = loader.load_weights(weights, mapper=mapper)
         if validate_completeness:
             loaded_params.update(
                 f"model.{name}"

@@ -16,10 +16,18 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
 
-def test_flash_attention_metadata_preserves_legacy_field_order():
+def test_flash_attention_metadata_preserves_main_field_order():
     names = [field.name for field in fields(FlashAttentionMetadata)]
 
-    assert names[21:23] == ["causal", "sliding_window"]
+    # Main owns the layer window on the implementation, not the metadata.
+    assert names[21:26] == [
+        "causal",
+        "mm_prefix_query_range_tensor",
+        "rswa_prefix_lens",
+        "rswa_window",
+        "rswa_window_tensor",
+    ]
+    assert "sliding_window" not in names
     assert names[-5:] == [
         "swa_query_start_loc",
         "swa_seqused_q",
@@ -240,3 +248,82 @@ def test_flash_attn_fa4_rejects_seqused_q():
             seqused_k=seqused_k,
             fa_version=4,
         )
+
+
+@pytest.mark.parametrize("fa_version", [3, 4])
+@pytest.mark.parametrize("window", [(-1, -1), (511, 0)])
+@pytest.mark.parametrize("batch_invariant", [False, True])
+def test_forward_uses_main_metadata_and_layer_window(
+    monkeypatch, fa_version, window, batch_invariant
+):
+    from types import SimpleNamespace
+
+    import vllm.v1.attention.backends.flash_attn as backend
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1" if batch_invariant else "0")
+    impl = object.__new__(backend.FlashAttentionImpl)
+    impl.vllm_flash_attn_version = fa_version
+    impl.attn_type = backend.AttentionType.DECODER
+    impl.head_size = 8
+    impl.num_kv_heads = 1
+    impl.kv_cache_dtype = "auto"
+    impl.sliding_window = window
+    impl.dcp_world_size = 1
+    impl.supports_quant_query_input = False
+    impl.scale = 8**-0.5
+    impl.alibi_slopes = None
+    impl.logits_soft_cap = 0.0
+    impl.fa4_hd256 = False
+    impl.sinks = None
+    query = torch.arange(8, dtype=torch.float32).view(1, 1, 8)
+    kv_cache = torch.zeros(1, 1, 16, 16)
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=1,
+        max_query_len=1,
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        max_seq_len=2,
+        seq_lens=torch.tensor([2], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([1]),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        swa_query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        swa_seqused_q=torch.tensor([2], dtype=torch.int32),
+        swa_query_indices=torch.tensor([1]),
+        swa_num_query_rows=33,
+        swa_max_query_len=32,
+    )
+    calls = []
+
+    def attention(**kwargs):
+        calls.append(kwargs)
+        kwargs["out"].copy_(kwargs["q"])
+
+    monkeypatch.setattr(backend, "_FA4_DENSE_ATTENTION_KERNEL", attention)
+    monkeypatch.setattr(
+        backend,
+        "current_workspace_manager",
+        lambda: SimpleNamespace(
+            get_simultaneous=lambda *specs: tuple(
+                torch.empty(shape, dtype=dtype) for shape, dtype in specs
+            )
+        ),
+    )
+    scale = torch.ones(())
+    layer = SimpleNamespace(_q_scale=scale, _k_scale=scale, _v_scale=scale)
+    output = torch.empty_like(query)
+    result = impl.forward(layer, query, query, query, kv_cache, metadata, output)
+    assert result is output
+    torch.testing.assert_close(result, query, rtol=0, atol=0)
+    assert len(calls) == 1
+    assert calls[0]["window_size"] == list(window)
+    aligned = batch_invariant and fa_version == 3 and window[0] >= 0
+    if aligned:
+        assert calls[0]["seqused_q"] is metadata.swa_seqused_q
+        assert calls[0]["q"].shape[0] == 33
+    else:
+        assert calls[0]["seqused_q"] is None
+        assert calls[0]["q"].shape[0] == 1

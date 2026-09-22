@@ -13,6 +13,11 @@ from vllm.model_executor.models.step5_vl import Step5ForConditionalGeneration
 
 
 class _DummyLanguageModel(nn.Module):
+    supports_pp = True
+
+    def forward(self, input_ids, positions, intermediate_tensors=None):
+        raise AssertionError("not exercised by this constructor test")
+
     def __init__(self) -> None:
         super().__init__()
         self.make_empty_intermediate_tensors = object()
@@ -91,6 +96,7 @@ def test_step3p7_family_initializes_encoder_cudagraph_model_config(
         multimodal_config=SimpleNamespace(mm_encoder_tp_mode="tensor"),
         max_model_len=1024,
     )
+    model_config.get_multimodal_config = lambda: model_config.multimodal_config
     quant_config = object()
     model = model_cls(
         vllm_config=SimpleNamespace(

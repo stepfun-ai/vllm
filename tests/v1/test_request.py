@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
 
@@ -53,3 +54,22 @@ def test_streaming_update_reenters_prefill_before_scheduling():
     assert session.spec_token_ids == []
     assert session.num_computed_tokens < session.num_prompt_tokens
     assert session.status == RequestStatus.WAITING
+
+
+def test_request_copies_session_id_from_engine_core_request():
+    engine_request = EngineCoreRequest(
+        request_id="request-1",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        session_id="session-1",
+    )
+
+    request = Request.from_engine_core_request(engine_request, block_hasher=None)
+
+    assert request.session_id == "session-1"

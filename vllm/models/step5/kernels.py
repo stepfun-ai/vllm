@@ -484,16 +484,9 @@ def _fused_qknorm_rope_cache_forward_impl_op(
             norm_weight_bias,
         )
     else:
-        # With DSA enabled every attention layer uses the split
-        # (2, num_blocks, block_size, heads, dim) layout because
-        # Step5's CuTeDSL sparse-GQA kernels require each half dense row-major
-        # and vLLM shares one raw allocation across KV cache groups (see
-        # Step5SplitKVFlashAttentionBackend). Without DSA, FlashAttention packs
-        # K and V into the content dim as
-        # (num_blocks, heads, block_size, 2 * dim). The
-        # fused cache kernel below reads the cache strides instead of assuming
-        # contiguity, so a transposed split view of the packed layout works
-        # directly.
+        # Main exposes [B, H, N, 2D] for both SWA and DSA. The fused
+        # cache-writing kernel consumes the resulting K/V strides directly.
+        # Accept legacy split views as well for standalone kernel callers.
         if kv_cache.dim() == 5:
             key_cache, value_cache = kv_cache.unbind(0)
         else:

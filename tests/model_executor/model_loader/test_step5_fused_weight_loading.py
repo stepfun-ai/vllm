@@ -622,7 +622,7 @@ def test_step5_full_load_validates_but_weight_transfer_can_be_partial(monkeypatc
 
     model = SimpleNamespace(
         config=SimpleNamespace(tie_word_embeddings=False),
-        hf_to_vllm_mapper=object(),
+        hf_to_vllm_mapper=step5_model.Step5ForCausalLM.hf_to_vllm_mapper,
         model=FakeStep5Model(),
     )
     monkeypatch.setattr(step5_model, "AutoWeightsLoader", FakeLoader)

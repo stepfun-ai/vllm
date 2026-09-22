@@ -48,6 +48,23 @@ def _require_cuda_contiguous_tensor(
     return tensor
 
 
+def _require_cuda_kv_tensor(
+    tensor: torch.Tensor, *, tensor_name: str
+) -> torch.Tensor:
+    # CuTe consumes the tensor's actual strides. Packed K+V allocations have
+    # non-contiguous halves, but still satisfy the kernels' vector alignment.
+    if tensor is None or tensor.device.type != "cuda":
+        raise ValueError(f"{tensor_name} must be a CUDA tensor")
+    if tensor.ndim != 4 or tensor.stride(-1) != 1:
+        raise ValueError(f"{tensor_name} requires rank 4 and contiguous head dim")
+    if tensor.data_ptr() % 16 or any(
+        stride <= 0 or stride * tensor.element_size() % 16
+        for stride in tensor.stride()[:-1]
+    ):
+        raise ValueError(f"{tensor_name} requires 16-byte-aligned positive strides")
+    return tensor
+
+
 def _require_paged_qkv(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -59,8 +76,8 @@ def _require_paged_qkv(
     allow_multi_kv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     q = _require_cuda_contiguous_tensor(q, tensor_name="q")
-    k_cache = _require_cuda_contiguous_tensor(k_cache, tensor_name="k_cache")
-    v_cache = _require_cuda_contiguous_tensor(v_cache, tensor_name="v_cache")
+    k_cache = _require_cuda_kv_tensor(k_cache, tensor_name="k_cache")
+    v_cache = _require_cuda_kv_tensor(v_cache, tensor_name="v_cache")
     if q.ndim != 3:
         raise ValueError(
             f"{tensor_name} expects q shape (Tq, Hq, D), got {tuple(q.shape)}"
