@@ -332,6 +332,19 @@ impl RoundtripCase {
         }
     }
 
+    /// Step-5's bare reasoning tags and adjacent XML tool calls.
+    fn step5() -> Self {
+        Self {
+            model_id: "stepfun-ai/Step-5-Preview",
+            assistant_stop_suffix: "<|im_end|>\n",
+            tool_call_parser: ParserSelection::Auto,
+            reasoning_parser: ParserSelection::Auto,
+            thinking_behavior: ThinkingBehavior::Always { value: true },
+            json_fmt: compact_json_fmt(),
+            sort_json_keys: false,
+        }
+    }
+
     /// Nemotron V3 with `<think>` / `</think>` reasoning tags.
     fn nemotron_v3() -> Self {
         Self {
@@ -405,6 +418,7 @@ roundtrip_tests! {
     glm52 => [reasoning_and_content, tool_call_mix],
     seed_oss => [reasoning_and_content, tool_call_mix],
     step3p5 => [reasoning_and_content],
+    step5 => [reasoning_and_content, tool_call_mix],
     nemotron_v3 => [reasoning_and_content],
     gemma4 => [tool_call_mix], // Gemma4 strips reasoning in history if there's no tool call
     kimi_k25 => [tool_call_mix], // Kimi K2.5 strips reasoning in history
