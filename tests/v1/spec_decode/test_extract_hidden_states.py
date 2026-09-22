@@ -144,7 +144,6 @@ def test_prepare_next_token_ids_padded():
     mock_input_batch.req_ids = req_ids
     mock_input_batch.num_reqs = num_requests
     mock_input_batch.vocab_size = 100
-    mock_input_batch.valid_vocab_size = 100
     mock_input_batch.num_tokens_no_spec = np.array([5] * num_requests)
 
     mock_requests = {}

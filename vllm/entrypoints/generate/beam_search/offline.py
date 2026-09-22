@@ -359,7 +359,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
             structured_outputs._backend = so_config.backend
 
         backend_name = structured_outputs._backend
-        vocab_size = self.model_config.get_valid_vocab_size()
+        vocab_size = self.model_config.get_vocab_size()
 
         backend: StructuredOutputBackend
         if backend_name == "xgrammar":
@@ -422,7 +422,7 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
         Returns None for beams where the grammar has terminated.
         """
-        vocab_size = self.model_config.get_valid_vocab_size()
+        vocab_size = self.model_config.get_vocab_size()
         request_type, grammar_spec = structured_output_key
         result: list[tuple[SamplingParams, list[int]] | None] = []
 

@@ -4,7 +4,6 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
-from pathlib import Path
 from typing import Annotated, Literal
 
 import pytest
@@ -319,21 +318,6 @@ def test_jit_monitor_verbose_arg():
 
     assert args.jit_monitor_verbose
     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
-
-
-def test_valid_vocab_size_arg(tmp_path: Path):
-    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    args = parser.parse_args(
-        [
-            "--model",
-            str(tmp_path),
-            "--valid-vocab-size",
-            "128815",
-        ]
-    )
-
-    assert args.valid_vocab_size == 128815
-    assert EngineArgs.from_cli_args(args).valid_vocab_size == 128815
 
 
 @pytest.mark.parametrize("mode", ["warn", "error"])

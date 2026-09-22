@@ -27,7 +27,7 @@ from vllm.renderers import BaseRenderer, renderer_from_config
 from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import GENERATION_TASKS, POOLING_TASKS, SupportedTask
-from vllm.tokenizers import TokenizerLike, get_tokenizer_vocab_upper_bound
+from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
@@ -399,13 +399,9 @@ class InputProcessor:
             sampling_params.update_from_generation_config(
                 self.generation_config_fields,
                 self.renderer.get_eos_token_id(),
-                model_config=self.model_config,
             )
             if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(
-                    self.tokenizer,
-                    model_config=self.model_config,
-                )
+                sampling_params.update_from_tokenizer(self.tokenizer)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
         else:
@@ -549,24 +545,12 @@ class InputProcessor:
                             f"by setting --limit-mm-per-prompt at startup."
                         )
 
-        has_explicit_valid_vocab = model_config.valid_vocab_size is not None
-        if prompt_ids and (tokenizer is not None or has_explicit_valid_vocab):
-            min_input_id = min(prompt_ids)
-            if min_input_id < 0:
-                raise VLLMValidationError(
-                    f"Token id {min_input_id} is out of vocabulary"
-                )
+        if prompt_ids and tokenizer is not None:
             max_input_id = max(prompt_ids, default=0)
-            valid_vocab_size = model_config.get_valid_vocab_size()
-            model_vocab_size = model_config.get_vocab_size()
-
             min_input_id = min(prompt_ids, default=0)
 
-            # NOTE: the tokenizer and checkpoint can expose different
-            # vocabularies.  ``get_tokenizer_vocab_upper_bound`` returns the
-            # tokenizer's exclusive token-ID bound, while
-            # ``model_config.get_vocab_size()`` is the checkpoint vocabulary
-            # size.
+            # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
+            # self.model_config.get_vocab_size() is the model’s vocab size.
             # For Qwen3 models, the language model has extra tokens that do
             # not exist in the tokenizer, and vice versa for multimodal
             # placeholder tokens in some multimodal models.
@@ -582,18 +566,10 @@ class InputProcessor:
                 raise VLLMValidationError(
                     f"Token id {min_input_id} is out of vocabulary"
                 )
-            # Models with an explicit valid vocabulary use it as a hard input
-            # boundary. Otherwise preserve the existing tokenizer/model union
-            # behavior for multimodal placeholder tokens.
-            if has_explicit_valid_vocab:
-                max_valid_token_id = valid_vocab_size - 1
-            else:
-                assert tokenizer is not None
-                max_valid_token_id = max(
-                    get_tokenizer_vocab_upper_bound(tokenizer) - 1,
-                    model_vocab_size - 1,
-                )
-            if max_input_id > max_valid_token_id:
+            # Here we take the max of the two to determine if a token id is
+            # truly out-of-vocabulary.
+            model_vocab_size = model_config.get_vocab_size()
+            if max_input_id > max(tokenizer.max_token_id, model_vocab_size - 1):
                 raise VLLMValidationError(
                     f"Token id {max_input_id} is out of vocabulary"
                 )

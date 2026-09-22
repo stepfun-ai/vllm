@@ -73,7 +73,6 @@ class LogitsProcessor(PluggableLayer):
         scale: float = 1.0,
         logits_as_input: bool = False,
         soft_cap: float | None = None,
-        valid_vocab_size: int | None = None,
     ) -> None:
         """Args:
         scale: A scaling factor to apply to the logits.
@@ -86,15 +85,6 @@ class LogitsProcessor(PluggableLayer):
         self.logits_as_input = logits_as_input
         # original vocabulary size (without LoRA).
         self.org_vocab_size = org_vocab_size or vocab_size
-        if valid_vocab_size is not None and not (
-            0 < valid_vocab_size <= self.org_vocab_size
-        ):
-            raise ValueError(
-                "valid_vocab_size must be positive and no greater than "
-                f"org_vocab_size ({self.org_vocab_size}), got "
-                f"{valid_vocab_size}."
-            )
-        self.valid_vocab_size = valid_vocab_size
         # Soft cap the logits. Used in Gemma 2.
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
@@ -205,14 +195,7 @@ class LogitsProcessor(PluggableLayer):
 
         # Remove paddings in vocab (if any).
         if logits is not None:
-            logits = logits[
-                ...,
-                : (
-                    self.valid_vocab_size
-                    if self.valid_vocab_size is not None
-                    else self.org_vocab_size
-                ),
-            ]
+            logits = logits[..., : self.org_vocab_size]
         return logits
 
     def get_top_tokens(
@@ -240,28 +223,10 @@ class LogitsProcessor(PluggableLayer):
         if self.scale != 1.0:
             logits = logits * self.scale
 
-        if self.valid_vocab_size is None:
-            # Preserve the standard vLLM padding behavior for models without
-            # an explicit effective-vocabulary boundary.
-            num_pad = lm_head.shard_indices.num_org_vocab_padding
-            if num_pad > 0:
-                logits[..., -num_pad:] = -float("inf")
-        else:
-            # Mask every token beyond valid_vocab_size on this shard. This path
-            # avoids gathering full logits for speculative greedy decoding, so
-            # truncating only in _get_logits would still allow checkpoint
-            # padding to win the local argmax.
-            vocab_start = lm_head.shard_indices.org_vocab_start_index
-            local_valid_size = max(
-                0,
-                min(
-                    self.valid_vocab_size,
-                    lm_head.shard_indices.org_vocab_end_index,
-                )
-                - vocab_start,
-            )
-            if local_valid_size < logits.shape[-1]:
-                logits[..., local_valid_size:] = -float("inf")
+        # Mask out padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
 
         local_max_vals, local_max_indices = logits.max(dim=-1)
 
@@ -335,7 +300,5 @@ class LogitsProcessor(PluggableLayer):
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"
         s += f", org_vocab_size={self.org_vocab_size}"
-        if self.valid_vocab_size is not None:
-            s += f", valid_vocab_size={self.valid_vocab_size}"
         s += f", scale={self.scale}, logits_as_input={self.logits_as_input}"
         return s

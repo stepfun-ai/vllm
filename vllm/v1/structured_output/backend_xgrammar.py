@@ -39,14 +39,6 @@ class XgrammarBackend(StructuredOutputBackend):
         self.disable_any_whitespace = (
             self.vllm_config.structured_outputs_config.disable_any_whitespace
         )
-        has_valid_vocab_boundary = (
-            getattr(
-                self.vllm_config.model_config,
-                "valid_vocab_size",
-                None,
-            )
-            is not None
-        )
 
         if is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
@@ -55,18 +47,7 @@ class XgrammarBackend(StructuredOutputBackend):
 
             # not self.tokenizer.vocab_size as self.tokenizer.vocab
             # collapses all decoded errors into a single token.
-            tokenizer_vocab_size = len(self.tokenizer.vocab)
-            if has_valid_vocab_boundary:
-                if self.vocab_size > tokenizer_vocab_size:
-                    raise ValueError(
-                        "The effective model vocabulary cannot exceed the "
-                        "Mistral tokenizer vocabulary: "
-                        f"{self.vocab_size} > {tokenizer_vocab_size}."
-                    )
-            else:
-                # Preserve the existing tokenizer-union behavior for models
-                # without a hard effective-vocabulary boundary.
-                self.vocab_size = tokenizer_vocab_size
+            self.vocab_size = len(self.tokenizer.vocab)
             tokenizer_info = xgr.TokenizerInfo(  # type: ignore
                 encoded_vocab=self.tokenizer.vocab,
                 # NOTE: https://github.com/mlc-ai/xgrammar/blob/5e141f6ff1ca02bc31f9e512e68b61f2a8ae88e5/tests/python/test_tokenizer_info.py#L43 # noqa: E501

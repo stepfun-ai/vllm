@@ -310,16 +310,6 @@ STEP5_PACKED_MODULES_MAPPING = {
 }
 
 
-def _require_resolved_valid_vocab_size(model_config: ModelConfig) -> int:
-    if model_config.valid_vocab_size is None:
-        raise ValueError(
-            "Step5 requires valid_vocab_size to be resolved from the tokenizer "
-            "before model construction. Call VllmConfig.resolve_valid_vocab_size() "
-            "or pass --valid-vocab-size when tokenizer initialization is skipped."
-        )
-    return model_config.get_valid_vocab_size()
-
-
 def _get_step5_layer_types(config: Any) -> list[str]:
     """Per-layer attention types spanning the dense stack and the MTP layers.
 
@@ -2833,7 +2823,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         super().__init__()
         self.vllm_config = vllm_config
         model_config = vllm_config.model_config
-        valid_vocab_size = _require_resolved_valid_vocab_size(model_config)
         config = model_config.hf_config
         self.config = config
         self.fp32_residual_connection = config.fp32_residual_connection
@@ -2857,10 +2846,7 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
             )
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
-            self.logits_processor = LogitsProcessor(
-                config.vocab_size,
-                valid_vocab_size=valid_vocab_size,
-            )
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
 

@@ -18,7 +18,7 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, SpeculativeConfig, StructuredOutputsConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike, get_tokenizer_vocab_upper_bound
+from vllm.tokenizers import TokenizerLike
 from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.v1.serial_utils import PydanticMsgspecMixin
 
@@ -30,11 +30,6 @@ _MAX_TEMP = 1e-2
 MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
-
-
-def _get_valid_vocab_size(model_config: ModelConfig) -> int:
-    getter = getattr(model_config, "get_valid_vocab_size", None)
-    return getter() if getter is not None else model_config.get_vocab_size()
 
 
 def _verify_num_sequences(value: int, parameter_name: str) -> None:
@@ -692,8 +687,6 @@ class SamplingParams(
         self,
         generation_config: dict[str, Any],
         eos_token_id: int | None = None,
-        *,
-        model_config: ModelConfig | None = None,
     ) -> None:
         """Update if there are non-default values from generation_config."""
         if not self.ignore_eos:
@@ -719,15 +712,8 @@ class SamplingParams(
                     assert self.stop_token_ids is not None
                     eos_ids.update(self.stop_token_ids)
                     self.stop_token_ids = list(eos_ids)
-        if model_config is not None:
-            self._validate_stop_token_ids(model_config)
 
-    def update_from_tokenizer(
-        self,
-        tokenizer: TokenizerLike,
-        *,
-        model_config: ModelConfig | None = None,
-    ) -> None:
+    def update_from_tokenizer(self, tokenizer: TokenizerLike) -> None:
         if not self.bad_words:
             return
         self._bad_words_token_ids = []
@@ -771,32 +757,19 @@ class SamplingParams(
                             value=self.bad_words,
                         )
 
-        tokenizer_vocab_upper_bound = get_tokenizer_vocab_upper_bound(tokenizer)
-        configured_valid_vocab_size = (
-            getattr(model_config, "valid_vocab_size", None)
-            if model_config is not None
-            else None
-        )
-        if configured_valid_vocab_size is not None:
-            tokenizer_vocab_upper_bound = min(
-                tokenizer_vocab_upper_bound,
-                configured_valid_vocab_size,
-            )
-
         invalid_token_ids = [
             token_id
             for bad_words_token_ids in self._bad_words_token_ids
             for token_id in bad_words_token_ids
-            if token_id < 0 or token_id >= tokenizer_vocab_upper_bound
+            if token_id < 0 or token_id > tokenizer.max_token_id
         ]
         if len(invalid_token_ids) > 0:
-            max_token_id = tokenizer_vocab_upper_bound - 1
             raise VLLMValidationError(
-                f"The model vocabulary size is {tokenizer_vocab_upper_bound},"
+                f"The model vocabulary size is {tokenizer.max_token_id + 1},"
                 f" but the following tokens"
                 f" were specified as bad: {invalid_token_ids}."
                 f" All token id values should be integers satisfying:"
-                f" 0 <= token_id <= {max_token_id}.",
+                f" 0 <= token_id <= {tokenizer.max_token_id}.",
                 parameter="bad_words",
                 value=self.bad_words,
             )
@@ -858,17 +831,14 @@ class SamplingParams(
         )
 
     def _validate_logprobs(self, model_config: ModelConfig) -> None:
-        valid_vocab_size = _get_valid_vocab_size(model_config)
         max_logprobs = model_config.max_logprobs
         if max_logprobs == -1:
-            max_logprobs = valid_vocab_size
-        elif getattr(model_config, "valid_vocab_size", None) is not None:
-            max_logprobs = min(max_logprobs, valid_vocab_size)
+            max_logprobs = model_config.get_vocab_size()
 
         # Validate sample logprobs.
         if num_logprobs := self.logprobs:
             if num_logprobs == -1:
-                num_logprobs = valid_vocab_size
+                num_logprobs = model_config.get_vocab_size()
             if num_logprobs > max_logprobs:
                 raise VLLMValidationError(
                     f"Requested sample logprobs of {num_logprobs}, "
@@ -887,7 +857,7 @@ class SamplingParams(
                     parameter="logprob_token_ids",
                     value=n,
                 )
-            vocab_size = _get_valid_vocab_size(model_config)
+            vocab_size = model_config.get_vocab_size()
             invalid_token_ids = [
                 token_id
                 for token_id in self.logprob_token_ids
@@ -913,7 +883,7 @@ class SamplingParams(
         # Validate prompt logprobs.
         if num_prompt_logprobs := self.prompt_logprobs:
             if num_prompt_logprobs == -1:
-                num_prompt_logprobs = valid_vocab_size
+                num_prompt_logprobs = model_config.get_vocab_size()
             if num_prompt_logprobs > max_logprobs:
                 raise VLLMValidationError(
                     f"Requested prompt logprobs of {num_prompt_logprobs}, "
@@ -932,7 +902,7 @@ class SamplingParams(
         # config.vocab_size, InputBatch.vocab_size comes from
         # model_config.get_vocab_size()), so use the same bound here — like
         # _validate_logit_bias, which indexes the same tensor.
-        vocab_size = _get_valid_vocab_size(model_config)
+        vocab_size = model_config.get_vocab_size()
         invalid_token_ids = [
             token_id
             for token_id in self.stop_token_ids
@@ -952,7 +922,7 @@ class SamplingParams(
         if not self.logit_bias:
             return
 
-        vocab_size = _get_valid_vocab_size(model_config)
+        vocab_size = model_config.get_vocab_size()
         invalid_token_ids = [
             token_id
             for token_id in self.logit_bias
@@ -1008,7 +978,7 @@ class SamplingParams(
         if self.bad_words:
             raise ValueError("trace_decode_token_ids is not supported with bad_words.")
 
-        vocab_size = _get_valid_vocab_size(model_config)
+        vocab_size = model_config.get_vocab_size()
         invalid_token_ids = [
             token_id
             for token_id in self.trace_decode_token_ids
@@ -1036,11 +1006,11 @@ class SamplingParams(
 
         # allowed_token_ids are client-supplied ids used as column indices
         # into the logits tensor (the mask in InputBatch is sized by
-        # _get_valid_vocab_size(model_config), and the ids are written as
+        # model_config.get_vocab_size(), and the ids are written as
         # mask[req_index][allowed_token_ids]), so use the same bound here —
         # like _validate_stop_token_ids and _validate_logit_bias, which
         # index the same tensor.
-        vocab_size = _get_valid_vocab_size(model_config)
+        vocab_size = model_config.get_vocab_size()
         invalid_token_ids = [
             token_id
             for token_id in allowed_token_ids

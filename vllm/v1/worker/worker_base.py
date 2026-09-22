@@ -201,8 +201,8 @@ class WorkerBase:
 
     @property
     def vocab_size(self) -> int:
-        """Get the effective output vocabulary size."""
-        return self.model_config.get_valid_vocab_size()
+        """Get vocabulary size from model configuration."""
+        return self.model_config.get_vocab_size()
 
     def shutdown(self) -> None:
         """Clean up resources held by the worker."""

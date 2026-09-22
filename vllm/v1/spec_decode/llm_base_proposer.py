@@ -1089,13 +1089,13 @@ class SpecDecodeBaseProposer:
             sampled_token_ids,
             discard_request_mask,
             backup_tokens_gpu,
-            gpu_input_batch.valid_vocab_size,
+            gpu_input_batch.vocab_size,
         )
 
     def warmup_prepare_next_token_ids_padded(
         self,
         num_reqs: int,
-        valid_vocab_size: int,
+        vocab_size: int,
     ) -> None:
         """Warm the initial-token and full speculative-output variants."""
         device = self.input_ids.device
@@ -1120,7 +1120,7 @@ class SpecDecodeBaseProposer:
                 sampled_token_ids,
                 discard_request_mask,
                 backup_tokens_gpu,
-                valid_vocab_size,
+                vocab_size,
             )
 
         num_draft_tokens = max(self.num_speculative_tokens, 1)
@@ -1148,7 +1148,7 @@ class SpecDecodeBaseProposer:
         sampled_token_ids: torch.Tensor,
         discard_request_mask: torch.Tensor,
         backup_tokens_gpu: torch.Tensor,
-        valid_vocab_size: int,
+        vocab_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_tokens = sampled_token_ids.shape
         device = sampled_token_ids.device
@@ -1169,7 +1169,7 @@ class SpecDecodeBaseProposer:
             backup_tokens_gpu,
             next_token_ids,
             valid_sampled_tokens_count,
-            valid_vocab_size,
+            vocab_size,
             num_tokens,
             batch_size,
             sampled_token_ids.stride(0),

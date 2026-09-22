@@ -2,13 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
 from concurrent.futures import Future
-from types import SimpleNamespace
 
 import pytest
-import torch
 from transformers import AutoTokenizer
 
-import vllm.v1.structured_output.backend_guidance as backend_guidance_module
 from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -29,90 +26,6 @@ def mistral_tokenizer():
         tokenizer_name="mistralai/Mistral-Small-3.2-24B-Instruct-2506",
         tokenizer_mode="mistral",
     )
-
-
-def test_backend_guidance_respects_valid_vocab_boundary(monkeypatch):
-    class _Tokenizer:
-        def __len__(self):
-            return 8
-
-    tokenizer = _Tokenizer()
-    ll_tokenizer = SimpleNamespace(vocab_size=5)
-    calls = []
-
-    def from_tokenizer(tokenizer, vocab_size):
-        calls.append((tokenizer, vocab_size))
-        return ll_tokenizer
-
-    monkeypatch.setattr(
-        backend_guidance_module,
-        "llguidance_hf",
-        SimpleNamespace(from_tokenizer=from_tokenizer),
-    )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(valid_vocab_size=5),
-        structured_outputs_config=SimpleNamespace(
-            disable_any_whitespace=False,
-            disable_additional_properties=False,
-        ),
-    )
-
-    backend = GuidanceBackend(
-        vllm_config,
-        tokenizer=tokenizer,
-        vocab_size=5,
-    )
-
-    assert backend.ll_tokenizer is ll_tokenizer
-    assert calls == [(tokenizer, 5)]
-
-
-@pytest.mark.parametrize(
-    ("valid_vocab_size", "expected_mask_vocab_size"),
-    [
-        pytest.param(5, 5, id="explicit-valid-boundary"),
-        pytest.param(None, 8, id="legacy-tokenizer-vocab"),
-    ],
-)
-def test_backend_guidance_mistral_mask_respects_valid_vocab_boundary(
-    monkeypatch,
-    valid_vocab_size,
-    expected_mask_vocab_size,
-):
-    tokenizer = SimpleNamespace(llg_tokenizer=SimpleNamespace(vocab_size=8))
-    calls = []
-
-    def allocate_token_bitmask(batch_size, vocab_size):
-        calls.append((batch_size, vocab_size))
-        return torch.empty((batch_size, (vocab_size + 31) // 32), dtype=torch.int32)
-
-    monkeypatch.setattr(
-        backend_guidance_module,
-        "is_mistral_tokenizer",
-        lambda _tokenizer: True,
-    )
-    monkeypatch.setattr(
-        backend_guidance_module,
-        "llguidance_torch",
-        SimpleNamespace(allocate_token_bitmask=allocate_token_bitmask),
-    )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(valid_vocab_size=valid_vocab_size),
-        structured_outputs_config=SimpleNamespace(
-            disable_any_whitespace=False,
-            disable_additional_properties=False,
-        ),
-    )
-    backend = GuidanceBackend(
-        vllm_config,
-        tokenizer=tokenizer,
-        vocab_size=5,
-    )
-
-    bitmask = backend.allocate_token_bitmask(2)
-
-    assert bitmask.shape == (2, 1)
-    assert calls == [(2, expected_mask_vocab_size)]
 
 
 def test_backend_guidance_rollback_terminated():

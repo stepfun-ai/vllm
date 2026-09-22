@@ -440,7 +440,7 @@ class NgramProposerGPU:
 
         # Mask valid tokens within each request.
         valid_mask = (valid_sampled_token_ids_gpu != -1) & (
-            valid_sampled_token_ids_gpu < gpu_input_batch.valid_vocab_size
+            valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size
         )
 
         # Count valid tokens per request.

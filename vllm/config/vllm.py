@@ -612,41 +612,6 @@ class VllmConfig:
                 return 2
         return pp_size
 
-    def resolve_valid_vocab_size(self, tokenizer: Any | None = None) -> Any | None:
-        """Resolve target and speculative draft vocabularies before launch."""
-        tokenizer = self.model_config.resolve_valid_vocab_size(tokenizer)
-
-        speculative_config = self.speculative_config
-        if (
-            speculative_config is not None
-            and speculative_config.draft_model_config is not None
-            and speculative_config.draft_model_config is not self.model_config
-        ):
-            draft_model_config = speculative_config.draft_model_config
-            use_heterogeneous_vocab = getattr(
-                speculative_config,
-                "use_heterogeneous_vocab",
-                False,
-            )
-            if (
-                not use_heterogeneous_vocab
-                and self.model_config.valid_vocab_size is not None
-                and draft_model_config.supports_valid_vocab_size()
-            ):
-                draft_model_config.set_valid_vocab_size(
-                    self.model_config.valid_vocab_size
-                )
-            draft_model_config.resolve_valid_vocab_size(
-                None if use_heterogeneous_vocab else tokenizer
-            )
-        if speculative_config is not None and not getattr(
-            speculative_config,
-            "use_heterogeneous_vocab",
-            False,
-        ):
-            SpeculativeConfig.verify_equal_vocab_size_if_draft_model(speculative_config)
-        return tokenizer
-
     @property
     def max_in_flight_tokens(self) -> int:
         # Upper bound on tokens that are scheduled but not yet settled (freed):

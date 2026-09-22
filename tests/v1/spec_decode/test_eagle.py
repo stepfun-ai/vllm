@@ -133,7 +133,6 @@ def test_prepare_next_token_ids():
     mock_input_batch.req_ids = req_ids
     mock_input_batch.num_reqs = num_requests
     mock_input_batch.vocab_size = 100
-    mock_input_batch.valid_vocab_size = 100
     mock_input_batch.num_tokens_no_spec = np.array(
         [num_speculative_tokens + 1] * num_requests
     )
@@ -217,7 +216,7 @@ def test_padded_next_tokens_use_dummy_backup_for_zero_token_row():
         num_reqs=2,
         req_ids=["live", "load-only"],
         num_tokens_no_spec=np.array([3, 0], dtype=np.int32),
-        valid_vocab_size=128,
+        vocab_size=128,
     )
     proposer._launch_prepare_next_token_ids_padded = (
         lambda _sampled, _discard, backup, _vocab_size: (

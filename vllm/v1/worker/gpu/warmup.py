@@ -361,7 +361,7 @@ def _warmup_kernels(
         if model_runner.is_last_pp_rank:
             # Build a GrammarOutput to exercise the structured output bitmask
             # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_valid_vocab_size()
+            vocab_size = model_runner.model_config.get_vocab_size()
             bitmask_width = (vocab_size + 31) // 32
             grammar_bitmask = np.full(
                 (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32

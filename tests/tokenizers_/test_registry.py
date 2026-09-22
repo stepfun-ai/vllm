@@ -170,31 +170,15 @@ def test_customized_tokenizer():
     assert tokenizer.pad_token_id == 2
 
 
-@pytest.mark.parametrize(
-    ("config", "model_type_hint"),
-    [
-        (SimpleNamespace(model_type="step5"), None),
-        (
-            SimpleNamespace(
-                model_type="composite_wrapper",
-                text_config=SimpleNamespace(model_type="step5"),
-            ),
-            None,
-        ),
-        (None, "step5"),
-        (SimpleNamespace(model_type="step5"), "unrelated_owner"),
-        (SimpleNamespace(model_type="step5_mtp"), None),
-        (None, "step5_mtp"),
-    ],
-)
-def test_step5_uses_generic_fast_tokenizer_backend(config, model_type_hint):
+@pytest.mark.parametrize("model_type", ["step5", "step5_vl", "step5_mtp"])
+def test_step5_uses_generic_fast_tokenizer_backend(model_type):
     tokenizer = SimpleNamespace(is_fast=True)
 
     with (
         patch(
             "vllm.tokenizers.registry.get_config",
-            return_value=config,
-        ) as get_config_mock,
+            return_value=SimpleNamespace(model_type=model_type),
+        ),
         patch(
             "vllm.tokenizers.hf.CachedHfTokenizer.from_pretrained",
             side_effect=AssertionError("incorrect hub tokenizer_class was used"),
@@ -213,7 +197,6 @@ def test_step5_uses_generic_fast_tokenizer_backend(config, model_type_hint):
             get_tokenizer(
                 "step5-test-model",
                 tokenizer_mode="hf",
-                model_type_hint=model_type_hint,
             )
             is tokenizer
         )
@@ -221,45 +204,6 @@ def test_step5_uses_generic_fast_tokenizer_backend(config, model_type_hint):
     assert from_pretrained.call_args.args == ("step5-test-model",)
     assert from_pretrained.call_args.kwargs["truncation_side"] == "left"
     assert "config" not in from_pretrained.call_args.kwargs
-    if model_type_hint in {"step5", "step5_mtp"}:
-        get_config_mock.assert_not_called()
-    else:
-        get_config_mock.assert_called_once()
-
-
-@pytest.mark.parametrize(
-    ("top_level_model_type", "text_model_type", "expected_hint"),
-    [
-        ("step5", "step5", "step5"),
-        ("composite_wrapper", "step5", "step5"),
-        ("step3_vl", "step5", "step3_vl"),
-        ("qwen3_vl", "qwen3", "qwen3_vl"),
-    ],
-)
-def test_cached_tokenizer_uses_effective_model_type_hint(
-    top_level_model_type,
-    text_model_type,
-    expected_hint,
-):
-    tokenizer = SimpleNamespace(is_fast=True)
-    model_config = SimpleNamespace(
-        skip_tokenizer_init=False,
-        tokenizer="separate-tokenizer-directory",
-        runner_type="generate",
-        tokenizer_mode="hf",
-        tokenizer_revision=None,
-        trust_remote_code=False,
-        hf_config=SimpleNamespace(model_type=top_level_model_type),
-        hf_text_config=SimpleNamespace(model_type=text_model_type),
-    )
-
-    with patch(
-        "vllm.tokenizers.registry.cached_get_tokenizer",
-        return_value=tokenizer,
-    ) as get_tokenizer_mock:
-        assert cached_tokenizer_from_config(model_config) is tokenizer
-
-    assert get_tokenizer_mock.call_args.kwargs["model_type_hint"] == expected_hint
 
 
 def test_cached_tokenizer_from_config_registers_local_config(tmp_path: Path):

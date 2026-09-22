@@ -771,7 +771,6 @@ class GPUModelRunner(
             max_num_batched_tokens=self.max_num_tokens,
             device=self.device,
             vocab_size=self.model_config.get_vocab_size(),
-            valid_vocab_size=self.model_config.get_valid_vocab_size(),
             block_sizes=[placeholder_block_size],
             kernel_block_sizes=[placeholder_block_size],
             max_num_blocks_per_req=[placeholder_max_num_blocks],
@@ -1407,7 +1406,7 @@ class GPUModelRunner(
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
-                    self.input_batch.valid_vocab_size
+                    self.input_batch.vocab_size
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
@@ -3881,7 +3880,7 @@ class GPUModelRunner(
                     valid_sampled_token_ids, logprobs_lists = (
                         RejectionSampler.parse_output(
                             sampled_token_ids,
-                            self.input_batch.valid_vocab_size,
+                            self.input_batch.vocab_size,
                             discard_sampled_tokens_req_indices,
                             logprobs_tensors=logprobs_tensors,
                         )
@@ -4967,7 +4966,7 @@ class GPUModelRunner(
                 logprobs_tensors=sampler_output.logprobs_tensors,
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self._get_or_create_async_output_copy_stream(),
-                vocab_size=self.input_batch.valid_vocab_size,
+                vocab_size=self.input_batch.vocab_size,
                 routed_experts=routed_experts_snapshot,
                 check_ep_fault=self.check_ep_fault,
                 num_nans=num_nans_device,
@@ -5965,7 +5964,7 @@ class GPUModelRunner(
                 return torch.randint_like(
                     self.input_ids.gpu,
                     low=0,
-                    high=self.model_config.get_valid_vocab_size(),
+                    high=self.model_config.get_vocab_size(),
                 )
 
             logger.debug_once("Randomizing dummy input_ids for DP Rank")
@@ -6576,7 +6575,7 @@ class GPUModelRunner(
             ):
                 warmup_prepare_next_token_ids(
                     num_reqs,
-                    self.input_batch.valid_vocab_size,
+                    self.input_batch.vocab_size,
                 )
 
             warmup_eagle_step = getattr(
@@ -7527,7 +7526,6 @@ class GPUModelRunner(
                     max_num_batched_tokens=self.max_num_tokens,
                     device=self.device,
                     vocab_size=self.model_config.get_vocab_size(),
-                    valid_vocab_size=self.model_config.get_valid_vocab_size(),
                     block_sizes=block_sizes,
                     kernel_block_sizes=kernel_block_sizes,
                     max_num_blocks_per_req=max_num_blocks,

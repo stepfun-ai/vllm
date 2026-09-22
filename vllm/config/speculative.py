@@ -1884,28 +1884,15 @@ class SpeculativeConfig:
             and self.target_model_config is not None
             and self.draft_model_config is not None
         ):
-            if any(
-                model_config.requires_valid_vocab_size_resolution()
-                for model_config in (
-                    self.target_model_config,
-                    self.draft_model_config,
-                )
-            ):
-                # The effective vocabulary is resolved from the tokenizer after
-                # SpeculativeConfig validation. VllmConfig re-runs this check
-                # once both model configs have been resolved.
-                return
-            target_vocab_size = self.target_model_config.get_valid_vocab_size()
-            draft_vocab_size = self.draft_model_config.get_valid_vocab_size()
+            target_vocab_size = self.target_model_config.get_vocab_size()
+            draft_vocab_size = self.draft_model_config.get_vocab_size()
             if target_vocab_size != draft_vocab_size:
                 raise ValueError(
-                    "Target and draft model should have the same effective "
-                    f"vocabulary size. Target model vocab_size={target_vocab_size}. "
+                    f"Target and draft model should have the same vocabulary size. "
+                    f"Target model vocab_size={target_vocab_size}. "
                     f"Draft model vocab_size={draft_vocab_size}. "
-                    "Using models with different tokenizers can cause out-of-bounds "
-                    "errors during speculative decoding. For greedy draft-model "
-                    "sampling, set use_heterogeneous_vocab=True to enable token "
-                    "mapping."
+                    f"Using models with different tokenizers can cause out-of-bounds "
+                    f"errors during speculative decoding."
                 )
 
     @property

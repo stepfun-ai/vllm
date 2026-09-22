@@ -106,7 +106,6 @@ class InputBatch:
         reasoning_config: ReasoningConfig | None = None,
         use_replayssm: bool = False,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
-        valid_vocab_size: int | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
             reasoning_config,
@@ -122,15 +121,6 @@ class InputBatch:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
         self.vocab_size = vocab_size
-        self.valid_vocab_size = (
-            vocab_size if valid_vocab_size is None else valid_vocab_size
-        )
-        if not 0 < self.valid_vocab_size <= self.vocab_size:
-            raise ValueError(
-                "valid_vocab_size must be positive and no greater than "
-                f"vocab_size ({self.vocab_size}), got "
-                f"{self.valid_vocab_size}."
-            )
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -433,10 +423,10 @@ class InputBatch:
             if sampling_params.top_p < 1:
                 self.top_p_reqs.add(req_id)
             top_k = sampling_params.top_k
-            if 0 < top_k < self.valid_vocab_size:
+            if 0 < top_k < self.vocab_size:
                 self.top_k_reqs.add(req_id)
             else:
-                top_k = self.valid_vocab_size
+                top_k = self.vocab_size
             self.top_k_cpu[req_index] = top_k
             self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
             if sampling_params.frequency_penalty != 0.0:
@@ -457,7 +447,7 @@ class InputBatch:
 
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = (
-                    self.valid_vocab_size
+                    self.vocab_size
                     if sampling_params.logprobs == -1
                     else sampling_params.logprobs
                 )
@@ -473,13 +463,13 @@ class InputBatch:
                     # False means we don't fill with -inf.
                     self.allowed_token_ids_mask = torch.zeros(
                         self.max_num_reqs,
-                        self.valid_vocab_size,
+                        self.vocab_size,
                         dtype=torch.bool,
                         device=self.device,
                     )
                     self.allowed_token_ids_mask_cpu_tensor = torch.zeros(
                         self.max_num_reqs,
-                        self.valid_vocab_size,
+                        self.vocab_size,
                         dtype=torch.bool,
                         device="cpu",
                     )
@@ -1032,10 +1022,10 @@ class InputBatch:
         )
         prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
         prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
-        # Use the value of valid_vocab_size as a pad since we don't have a
+        # Use the value of vocab_size as a pad since we don't have a
         # token_id of this value.
         for i in range(num_reqs):
-            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.valid_vocab_size
+            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
         return prompt_token_ids_cpu_tensor
 
     def make_lora_inputs(

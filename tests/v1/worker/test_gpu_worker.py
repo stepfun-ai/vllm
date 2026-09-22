@@ -62,40 +62,6 @@ def test_startup_plan_fingerprint_sensitivity(plan_env):
         assert base != fp(_plan_worker().vllm_config, 0, 1)
 
 
-def test_startup_plan_fingerprint_includes_valid_vocab_size(plan_env):
-    """Sampler buffer sizing must not reuse a plan across vocab contracts."""
-    fp = startup_plan.compute_plan_fingerprint
-    config_a = SimpleNamespace(
-        compute_hash=lambda: "same-model-graph",
-        model_config=SimpleNamespace(valid_vocab_size=128815),
-        speculative_config=None,
-    )
-    config_b = SimpleNamespace(
-        compute_hash=lambda: "same-model-graph",
-        model_config=SimpleNamespace(valid_vocab_size=129024),
-        speculative_config=None,
-    )
-    assert fp(config_a, 0, 1) != fp(config_b, 0, 1)
-
-
-def test_startup_plan_fingerprint_includes_draft_valid_vocab_size(plan_env):
-    """Probabilistic draft logits are sized from the draft vocabulary."""
-    fp = startup_plan.compute_plan_fingerprint
-
-    def config(draft_valid_vocab_size):
-        return SimpleNamespace(
-            compute_hash=lambda: "same-model-graph",
-            model_config=SimpleNamespace(valid_vocab_size=128815),
-            speculative_config=SimpleNamespace(
-                draft_model_config=SimpleNamespace(
-                    valid_vocab_size=draft_valid_vocab_size
-                )
-            ),
-        )
-
-    assert fp(config(64000), 0, 1) != fp(config(65000), 0, 1)
-
-
 def test_startup_plan_apply_gate(plan_env):
     """Only a fingerprint-matching, memory-safe plan is ever applied."""
     maybe_save_startup_plan(_plan_worker(), 50 * GiB_bytes)

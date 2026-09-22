@@ -210,8 +210,6 @@ class LogitsProcessorWithLoRA(BaseLayerWithLoRA):
 
         # Remove paddings in vocab (if any).
         logits = logits[:, : self.base_layer.vocab_size]
-        if self.base_layer.valid_vocab_size is not None:
-            logits = logits[:, : self.base_layer.valid_vocab_size]
         return logits
 
     def forward(self, *args, **kwargs):
