@@ -611,7 +611,7 @@ _MULTIMODAL_MODELS = {
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),
     "Step3p7ForConditionalGeneration": ("step3p7", "Step3p7ForConditionalGeneration"),
     "Step5ForConditionalGeneration": (
-        "step5_vl",
+        "vllm.models.step5",
         "Step5ForConditionalGeneration",
     ),
     "UltravoxModel": ("ultravox", "UltravoxModel"),

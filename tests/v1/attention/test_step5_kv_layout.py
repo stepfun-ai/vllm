@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B300 adapter integration: chunked prefill, decode, and causal selection."""
+"""B300 DSA integration through MRV2 metadata: prefill and graph replay."""
 
 import math
 from types import SimpleNamespace
@@ -8,9 +8,76 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.step5.flashinfer_sparse import Step5FlashInferSparse
-from vllm.models.step5.sparse_attention import Step5DSAAttentionImpl
-from vllm.models.step5.sparse_summary_cache import Step5SparseSummaryCache
+from vllm.models.step5.nvidia.flashinfer_sparse import Step5FlashInferSparse
+from vllm.models.step5.nvidia.sparse_attention import (
+    Step5DSAAttentionBackend,
+    Step5DSAAttentionImpl,
+    Step5DSAMetadataBuilder,
+)
+from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCache
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
+from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.utils import AttentionGroup
+
+
+@pytest.fixture
+def mrv2_metadata(default_vllm_config):
+    """Use the runner's real metadata path instead of hand-built DSA metadata."""
+    config = default_vllm_config
+    config.model_config = SimpleNamespace(
+        get_num_attention_heads=lambda _: 8,
+        uses_alibi=False,
+        rswa_window=None,
+        is_mm_prefix_lm=False,
+        hf_config=SimpleNamespace(model_type="step5"),
+    )
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=192, dtype=torch.bfloat16
+    )
+    group = AttentionGroup(Step5DSAAttentionBackend, ["step5"], spec, 0)
+    group.metadata_builders = [
+        Step5DSAMetadataBuilder(spec, ["step5"], config, torch.device("cuda"))
+    ]
+    cache_config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["step5"], spec)],
+    )
+
+    def build(
+        *,
+        num_actual_tokens,
+        num_actual_reqs,
+        max_query_len,
+        seq_lens,
+        slot_mapping,
+        block_table,
+        query_start_loc_cpu=None,
+        for_capture=False,
+    ):
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = torch.arange(num_actual_reqs + 1)
+        starts = query_start_loc_cpu.to(torch.int32)
+        return build_attn_metadata(
+            attn_groups=[[group]],
+            num_reqs=num_actual_reqs,
+            num_tokens=num_actual_tokens,
+            query_start_loc_gpu=starts.to(seq_lens.device),
+            query_start_loc_cpu=starts,
+            max_query_len=max_query_len,
+            seq_lens=seq_lens,
+            max_seq_len=block_table.shape[1] * 16,
+            block_tables=[block_table],
+            slot_mappings=slot_mapping.unsqueeze(0),
+            kv_cache_config=cache_config,
+            for_cudagraph_capture=for_capture,
+        )["step5"]
+
+    return build
 
 
 @pytest.mark.skipif(
@@ -18,7 +85,7 @@ from vllm.models.step5.sparse_summary_cache import Step5SparseSummaryCache
     reason="B300 integration",
 )
 @pytest.mark.parametrize("n,topk", [(41, 2), (4105, 512)])
-def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk):
+def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk, mrv2_metadata):
     torch.manual_seed(7)
     device = torch.device("cuda")
     dim, heads = 192, 8
@@ -49,7 +116,7 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk):
         start = 0
         for count in chunks:
             end = start + count
-            metadata = SimpleNamespace(
+            metadata = mrv2_metadata(
                 num_actual_tokens=count,
                 max_query_len=count,
                 num_actual_reqs=1,
@@ -57,7 +124,6 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk):
                 seq_lens=torch.tensor([end], device=device),
                 slot_mapping=slots[start:end],
                 block_table=table,
-                step5_runtime=None,
             )
             impl.forward(
                 None,
@@ -96,7 +162,7 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk):
     reason="B300 integration",
 )
 @pytest.mark.parametrize("n,topk", [(43, 2), (4107, 512)])
-def test_full_decode_graph_replay_matches_eager_with_padding(n, topk):
+def test_full_decode_graph_replay_matches_eager_with_padding(n, topk, mrv2_metadata):
     """Replay updates CSA across regions/pages and selects fresh KV each step."""
     torch.manual_seed(17)
     device = torch.device("cuda")
@@ -125,7 +191,8 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk):
             state.update(ik[req, :prefix], z[req, :prefix], slots)
     inputs = [t[:, 0].clone() for t in (q, iq, ik, weights, z)]
     output = torch.empty_like(inputs[0])
-    metadata = SimpleNamespace(
+    metadata = mrv2_metadata(
+        for_capture=True,
         num_actual_tokens=batch,
         num_actual_reqs=batch,
         max_query_len=1,
@@ -172,7 +239,7 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk):
             if not active[req]:
                 continue
             # Force the independently planned, variable-length eager path.
-            ref_metadata = SimpleNamespace(
+            ref_metadata = mrv2_metadata(
                 num_actual_tokens=1,
                 num_actual_reqs=1,
                 max_query_len=2,
@@ -180,7 +247,6 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk):
                 seq_lens=metadata.seq_lens[req : req + 1],
                 slot_mapping=metadata.slot_mapping[req : req + 1],
                 block_table=table[req : req + 1],
-                step5_runtime=None,
             )
             impl.summary_cache = reference
             impl.forward(

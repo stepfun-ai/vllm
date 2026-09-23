@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm.models.step5.sparse_summary_cache import Step5SparseSummaryCache
+from vllm.models.step5.nvidia.sparse_summary_cache import Step5SparseSummaryCache
 
 
 @pytest.mark.parametrize("chunk", [1, 3, 8, 13])

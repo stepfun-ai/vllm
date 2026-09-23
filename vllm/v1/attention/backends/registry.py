@@ -140,9 +140,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     # STEP5_FLASH_ATTN is plain FlashAttention on the split KV layout the DSA
     # layers pin; the sliding-window layers use it so the shared KV allocation
     # has a single layout.
-    STEP5_DSA = "vllm.models.step5.sparse_attention.Step5DSAAttentionBackend"
+    STEP5_DSA = "vllm.models.step5.nvidia.sparse_attention.Step5DSAAttentionBackend"
     STEP5_FLASH_ATTN = (
-        "vllm.models.step5.sparse_attention.Step5SplitKVFlashAttentionBackend"
+        "vllm.models.step5.nvidia.sparse_attention.Step5SplitKVFlashAttentionBackend"
     )
     NO_ATTENTION = "vllm.v1.attention.backends.no_attention.NoAttentionBackend"
     FLEX_ATTENTION = "vllm.v1.attention.backends.flex_attention.FlexAttentionBackend"

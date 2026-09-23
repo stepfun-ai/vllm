@@ -2930,14 +2930,11 @@ class VllmConfig:
         if self.parallel_config.enable_elastic_ep:
             unsupported.append("elastic expert parallelism")
 
-        if self.model_config is not None and self.model_config.architecture in {
-            "Step5ForCausalLM",
-            "Step5ForConditionalGeneration",
-            "Step5MTP",
-        }:
-            # Keep Step5 fail-closed until its DSA, side-storage, and MTP
-            # paths have dedicated V2 runner coverage.
-            unsupported.append("Step5 models")
+        if (
+            self.model_config is not None
+            and self.model_config.architecture == "Step5MTP"
+        ):
+            unsupported.append("Step5 MTP")
 
         if self.cache_config.mamba_cache_mode == "all":
             unsupported.append("mamba cache mode 'all'")

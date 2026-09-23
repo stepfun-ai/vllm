@@ -10,7 +10,7 @@ import torch.nn as nn
 from vllm.model_executor.model_loader.mtp_validation import (
     disable_mtp_completeness_check,
 )
-from vllm.models.step5 import model as step5_model
+from vllm.models.step5.nvidia import model as step5_model
 
 
 @pytest.mark.parametrize(

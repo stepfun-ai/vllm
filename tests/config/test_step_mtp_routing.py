@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 import vllm.config.speculative as speculative_module
+from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.compilation import CompilationMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import VllmConfig
@@ -16,8 +18,8 @@ from vllm.transformers_utils.configs.step5 import Step5VLConfig
 def test_step_mtp_models_use_step_proposer(model_type):
     speculative_config = object.__new__(SpeculativeConfig)
     speculative_config.method = "mtp"
-    speculative_config.draft_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type=model_type)
+    speculative_config.draft_model_config = cast(
+        ModelConfig, SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
     )
 
     assert speculative_config.use_step_mtp()
@@ -26,8 +28,9 @@ def test_step_mtp_models_use_step_proposer(model_type):
 def test_non_step_mtp_model_does_not_use_step_proposer():
     speculative_config = object.__new__(SpeculativeConfig)
     speculative_config.method = "mtp"
-    speculative_config.draft_model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="qwen3_mtp")
+    speculative_config.draft_model_config = cast(
+        ModelConfig,
+        SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_mtp")),
     )
 
     assert not speculative_config.use_step_mtp()
@@ -127,8 +130,8 @@ def test_draft_config_source_inheritance(
             num_speculative_tokens=3,
             revision=draft_revision,
             code_revision=draft_code_revision,
-            target_model_config=target_model_config,
-            target_parallel_config=SimpleNamespace(),
+            target_model_config=cast(ModelConfig, target_model_config),
+            target_parallel_config=cast(ParallelConfig, SimpleNamespace()),
         )
 
     assert captured["hf_config_path"] == expected_hf_config_path
@@ -172,8 +175,8 @@ def test_heterogeneous_draft_uses_draft_tokenizer_revision(monkeypatch):
             num_speculative_tokens=3,
             revision="draft-revision",
             use_heterogeneous_vocab=True,
-            target_model_config=target_model_config,
-            target_parallel_config=SimpleNamespace(),
+            target_model_config=cast(ModelConfig, target_model_config),
+            target_parallel_config=cast(ParallelConfig, SimpleNamespace()),
         )
 
     assert captured["tokenizer"] == "independent-draft"
@@ -184,7 +187,7 @@ def test_heterogeneous_draft_uses_draft_tokenizer_revision(monkeypatch):
     "architecture",
     ["Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"],
 )
-def test_step5_models_are_rejected_by_v2_model_runner(architecture):
+def test_step5_v2_model_runner_support_excludes_mtp(architecture):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             architecture=architecture,
@@ -204,7 +207,7 @@ def test_step5_models_are_rejected_by_v2_model_runner(architecture):
             enable_elastic_ep=False,
         ),
         compilation_config=SimpleNamespace(
-            mode=CompilationMode.VLLM_COMPILE,
+            mode=CompilationMode.NONE,
             pass_config=SimpleNamespace(enable_sp=False),
         ),
         cache_config=SimpleNamespace(
@@ -213,6 +216,8 @@ def test_step5_models_are_rejected_by_v2_model_runner(architecture):
         ec_transfer_config=None,
     )
 
-    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
+    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(
+        cast(VllmConfig, config)
+    )
 
-    assert "Step5 models" in unsupported
+    assert unsupported == (["Step5 MTP"] if architecture == "Step5MTP" else [])

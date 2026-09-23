@@ -11,9 +11,9 @@ from vllm.model_executor.model_loader.mtp_validation import (
     disable_mtp_completeness_check,
 )
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
-from vllm.models.step5 import model as step5_model
-from vllm.models.step5 import mtp as step5_mtp
-from vllm.models.step5.config import (
+from vllm.models.step5.nvidia import model as step5_model
+from vllm.models.step5.nvidia import mtp as step5_mtp
+from vllm.models.step5.nvidia.config import (
     checkpoint_has_step5_sparse_config,
     get_step5_sparse_config,
 )
@@ -305,14 +305,50 @@ def test_step5_router_ties_choose_lowest_expert_ids(renormalize):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="B300 router integration",
+)
+@pytest.mark.parametrize("rows", [1, 8, 129])
+def test_step5_gate_linear_preserves_fp32_routing(monkeypatch, rows):
+    """The shared gate must preserve FP32 weights, logits and expert choices."""
+    for module in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(f"{module}.get_tensor_model_parallel_world_size", lambda: 1)
+    torch.manual_seed(23)
+    gate = step5_model.GateLinear(
+        4096, 352, params_dtype=torch.float32, out_dtype=torch.float32
+    ).cuda()
+    weights = torch.randn_like(gate.weight) * 0.02
+    gate.weight.weight_loader(gate.weight, weights)
+    inputs = torch.randn(rows, 4096, device="cuda", dtype=torch.bfloat16)
+    actual, _ = gate(inputs)
+    expected = torch.nn.functional.linear(inputs.float(), weights)
+    assert gate.weight.dtype == actual.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+    bias = torch.randn(352, device="cuda") * 0.01
+    routing_args = dict(
+        topk=8, renormalize=True, router_bias=bias, routed_scaling_factor=3.0
+    )
+    actual_weights, actual_ids = step5_model.router_bias_func(
+        inputs, actual, **routing_args
+    )
+    expected_weights, expected_ids = step5_model.router_bias_func(
+        inputs, expected, **routing_args
+    )
+    torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-5)
+
+
 def test_step5_moe_passes_fp32_gate_logits_to_runner():
     """Keep external FP32 routing and separate shared/routed outputs."""
     hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
     logits = torch.tensor([[1.001, 1.002], [2.001, 2.002]], dtype=torch.float32)
 
     class Runner(nn.Module):
-        moe_config = SimpleNamespace(is_sequence_parallel=False)
-
         def forward(self, hidden_states, router_logits):
             assert router_logits is logits
             assert router_logits.dtype == torch.float32

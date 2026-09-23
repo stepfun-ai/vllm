@@ -9,7 +9,7 @@ from torch import nn
 
 import vllm.model_executor.models.step3p7 as step3p7_module
 from vllm.model_executor.models.step3p7 import Step3p7ForConditionalGeneration
-from vllm.model_executor.models.step5_vl import Step5ForConditionalGeneration
+from vllm.models.step5 import Step5ForConditionalGeneration
 
 
 class _DummyLanguageModel(nn.Module):

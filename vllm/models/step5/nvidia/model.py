@@ -24,7 +24,6 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
@@ -40,11 +39,11 @@ from vllm.model_executor.layers.attention.attention import (
 from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
@@ -65,7 +64,6 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    sequence_parallel_chunk,
     skip_spec_layers,
 )
 from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
@@ -392,17 +390,6 @@ def _is_step5_full_attention_layer(
         )
         return layer_type in apply_to
     return layer_type == "full_attention"
-
-
-class Step5FP32RouterLinear(ReplicatedLinear):
-    """Step5 router projection with FP32 accumulation."""
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        assert self.params_dtype == torch.float32
-        return super().forward(x.to(torch.float32))
 
 
 class Step5FusedQKVIndexerLinear(QKVParallelLinear):
@@ -791,7 +778,6 @@ class Step5MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
-        is_sequence_parallel: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -800,7 +786,6 @@ class Step5MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -809,7 +794,6 @@ class Step5MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
 
@@ -1537,11 +1521,11 @@ class Step5MoE(nn.Module):
                 f"the number of experts {config.moe_num_experts}."
             )
 
-        self.gate = Step5FP32RouterLinear(
+        self.gate = GateLinear(
             config.hidden_size,
             config.moe_num_experts,
             bias=False,
-            quant_config=None,
+            out_dtype=torch.float32,
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
@@ -1590,9 +1574,6 @@ class Step5MoE(nn.Module):
             self.tp_size,
             get_dp_group().world_size,
         )
-        effective_sequence_parallel = (
-            vllm_config.compilation_config.pass_config.enable_sp and self.tp_size > 1
-        )
 
         self.share_expert = Step5MLP(
             config=config,
@@ -1600,7 +1581,6 @@ class Step5MoE(nn.Module):
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
             reduce_results=reduce_results,
-            is_sequence_parallel=effective_sequence_parallel,
             quant_config=quant_config,
             prefix=f"{prefix}.share_expert",
         )
@@ -1628,7 +1608,6 @@ class Step5MoE(nn.Module):
             routed_scaling_factor=config.moe_router_scaling_factor,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=effective_sequence_parallel,
             router_logits_dtype=torch.float32,
             custom_routing_function=custom_routing_function,
         )
@@ -1639,9 +1618,6 @@ class Step5MoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-        # Sequence-parallel state is carried by the runner's FusedMoEConfig.
-        if self.experts.moe_config.is_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
 
         shared_output = self.share_expert(hidden_states)
 
@@ -1825,13 +1801,6 @@ class Step5DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.use_moe:
             shared_output, moe_output = self.moe(hidden_states)
-            if self.moe.experts.moe_config.is_sequence_parallel:
-                ffn_output = tensor_model_parallel_all_gather(
-                    self._cast_for_residual(moe_output)
-                    + self._cast_for_residual(shared_output),
-                    dim=0,
-                )
-                return ffn_output[: hidden_states.shape[0]]
             # Combine shared and routed expert outputs
             combined = self._cast_for_residual(moe_output) + self._cast_for_residual(
                 shared_output

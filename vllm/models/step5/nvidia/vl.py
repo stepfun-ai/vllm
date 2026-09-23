@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Step5 vision-language model."""
 
-from .step3p7 import Step3p7ForConditionalGeneration
+from vllm.model_executor.models.step3p7 import Step3p7ForConditionalGeneration
 
 
 class Step5ForConditionalGeneration(Step3p7ForConditionalGeneration):
