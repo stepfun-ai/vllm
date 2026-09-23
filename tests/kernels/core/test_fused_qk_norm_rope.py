@@ -146,3 +146,162 @@ def test_fused_qk_norm_rope_matches_reference(
         atol=ATOL,
         rtol=RTOL,
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only cache fusion")
+@pytest.mark.parametrize(
+    "head_dim,rotary_dim",
+    [(64, 32), (128, 64), (192, 0), (192, 64), (192, 192), (256, 128)],
+)
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["NHD", "HND", "PACKED"])
+@pytest.mark.parametrize("num_tokens", [1, 129])
+@torch.inference_mode()
+def test_qknorm_rope_cache_preserves_norm_precision_and_slots(
+    default_vllm_config, head_dim, rotary_dim, weight_dtype, layout, num_tokens
+):
+    """Cover Step-5 heads, strided projections and padded KV writes."""
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(17)
+    nq, nkv, block_size = 8, 2, 16
+    width = (nq + 2 * nkv) * head_dim
+    qkvg = torch.randn(num_tokens, width + nq, device="cuda", dtype=torch.bfloat16)
+    qkv = qkvg[:, :width]
+    weights = [
+        torch.randn(head_dim, device="cuda", dtype=weight_dtype) * 0.1 for _ in range(2)
+    ]
+    # Keep a real table even in NoPE mode; the kernel must not read it.
+    cache_dim = rotary_dim or 64
+    rope = RotaryEmbedding(
+        head_dim, cache_dim, 2048, 10000.0, True, torch.bfloat16
+    ).cuda()
+    positions = torch.randint(2048, (num_tokens,), device="cuda")
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    if layout == "PACKED":
+        storage = torch.full(
+            (num_blocks, nkv, block_size, 2 * head_dim),
+            17,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        key_cache, value_cache = storage.transpose(1, 2).split(head_dim, dim=-1)
+    else:
+        shape = (num_blocks, block_size, nkv, head_dim)
+        if layout == "HND":
+            shape = (num_blocks, nkv, block_size, head_dim)
+        key_cache, value_cache = [
+            torch.full(shape, 17, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+        ]
+        if layout == "HND":
+            key_cache, value_cache = [
+                x.transpose(1, 2) for x in (key_cache, value_cache)
+            ]
+    # Nonsequential slots, a negative slot, and a shorter mapping than QKV.
+    slots = torch.arange(num_tokens, device="cuda", dtype=torch.long).flip(0)
+    if num_tokens > 1:
+        slots[1] = -1
+        slots = slots[:-1]
+    q_in, k_in, v_in = qkv.split([nq * head_dim, nkv * head_dim, nkv * head_dim], -1)
+    ref = []
+    for x, w in zip((q_in, k_in), weights):
+        xf = x.reshape(num_tokens, -1, head_dim).float()
+        normalized = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-5)
+        ref.append((normalized * (w.float() + 1)).to(x.dtype).reshape(x.shape))
+    q_ref, k_ref = ref
+    if rotary_dim:
+        q_ref, k_ref = rope(positions, q_ref, k_ref)
+    expected_k, expected_v = key_cache.clone(), value_cache.clone()
+    valid = slots >= 0
+    expected_k[slots[valid] // block_size, slots[valid] % block_size] = k_ref[
+        : slots.numel()
+    ][valid].reshape(-1, nkv, head_dim)
+    expected_v[slots[valid] // block_size, slots[valid] % block_size] = v_in[
+        : slots.numel()
+    ][valid].reshape(-1, nkv, head_dim)
+    q, k, v = ops.fused_qknorm_rope_cache(
+        qkv,
+        weights[0],
+        weights[1],
+        rope.cos_sin_cache,
+        positions,
+        slots,
+        key_cache,
+        value_cache,
+        nq,
+        nkv,
+        head_dim,
+        rotary_dim,
+        1e-5,
+        norm_weight_bias=1.0,
+    )
+    torch.testing.assert_close(q, q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k, k_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(v, v_in, rtol=0, atol=0)
+    torch.testing.assert_close(key_cache, expected_k, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(value_cache, expected_v, rtol=0, atol=0)
+    # Inserted keys must match the materialized K output exactly.
+    torch.testing.assert_close(
+        key_cache[slots[valid] // block_size, slots[valid] % block_size],
+        k[: slots.numel()][valid].reshape(-1, nkv, head_dim),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only cache fusion")
+@pytest.mark.parametrize("rotary_dim", [0, 64, 192])
+@torch.inference_mode()
+def test_qknorm_rope_cache_cuda_graph_updates_positions_and_slots(
+    default_vllm_config, rotary_dim
+):
+    """Replay must read new positions/slots and update the intended cache pages."""
+    from vllm import _custom_ops as ops
+
+    head_dim, nq, nkv = 192, 8, 1
+    qkv = torch.randn(2, (nq + 2 * nkv) * head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = [torch.randn(head_dim, device="cuda") * 0.1 for _ in range(2)]
+    positions = torch.tensor([1, 3], device="cuda")
+    slots = torch.tensor([0, -1], device="cuda")
+    rope = RotaryEmbedding(
+        head_dim, rotary_dim or 64, 128, 10000.0, True, torch.bfloat16
+    ).cuda()
+    caches = [
+        torch.zeros(2, 16, nkv, head_dim, device="cuda", dtype=qkv.dtype)
+        for _ in range(2)
+    ]
+    args = (
+        qkv,
+        weights[0],
+        weights[1],
+        rope.cos_sin_cache,
+        positions,
+        slots,
+        *caches,
+        nq,
+        nkv,
+        head_dim,
+        rotary_dim,
+        1e-5,
+        1.0,
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ops.fused_qknorm_rope_cache(*args)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = ops.fused_qknorm_rope_cache(*args)
+    qkv.add_(0.125)
+    positions.copy_(torch.tensor([7, 19], device="cuda"))
+    slots.copy_(torch.tensor([18, 4], device="cuda"))
+    for cache in caches:
+        cache.zero_()
+    graph.replay()
+    graph_cache = [x.clone() for x in caches]
+    for cache in caches:
+        cache.zero_()
+    eager = ops.fused_qknorm_rope_cache(*args)
+    for actual, expected in zip(captured + tuple(graph_cache), eager + tuple(caches)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

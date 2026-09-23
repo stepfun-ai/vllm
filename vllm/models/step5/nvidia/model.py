@@ -3,7 +3,6 @@
 """Inference-only Step5 model."""
 
 import copy
-import functools
 import typing
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -15,6 +14,7 @@ from torch.nn.parameter import Parameter
 from typing_extensions import TypeIs
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -81,7 +81,6 @@ from .layernorm import (
     get_step5_norm_dtype,
     make_step5_rms_norm,
 )
-from .routing import router_bias_func
 
 logger = init_logger(__name__)
 
@@ -1282,24 +1281,57 @@ class Step5Attention(nn.Module):
             qkzg = None
             extra_dims = None
 
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm inline similar to Qwen3 MOE attention
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head.contiguous())
-        q = q_by_head.view(q.shape)
+        _, _, kv_cache, slot_mapping = get_attention_context(self.attn.layer_name)
+        kv_cache_dummy_dep = None
+        if slot_mapping is not None and kv_cache.numel() > 0:
+            key_cache, value_cache = typing.cast(Any, self.attn.impl)._split_kv_cache(
+                kv_cache
+            )
+            q, k, v = ops.fused_qknorm_rope_cache(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                slot_mapping,
+                key_cache,
+                value_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_dim if self.use_rope else 0,
+                self.q_norm.variance_epsilon,
+                float(self.zero_centered),
+            )
+            kv_cache_dummy_dep = q.new_empty(0)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Add qk-norm inline similar to Qwen3 MOE attention
+            q_by_head = q.view(
+                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+            )
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head.contiguous())
-        k = k_by_head.view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
-
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
         if self.sparse_attn is not None:
             attn_output, extra_dims = self.sparse_attn.forward(
-                positions, hidden_states, q, k, v, qkzg=qkzg
+                positions,
+                hidden_states,
+                q,
+                k,
+                v,
+                qkzg=qkzg,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
         else:
-            attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
@@ -1333,6 +1365,7 @@ class Step5SparseAttention:
         key: torch.Tensor,
         value: torch.Tensor,
         qkzg: torch.Tensor,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         dsa_proxy_query, dsa_proxy_key, dsa_proxy_weights, dsa_proxy_z, extra_dims = (
             self._project_sparse_indexer(positions, hidden_states, qkzg)
@@ -1345,6 +1378,7 @@ class Step5SparseAttention:
             dsa_proxy_key=dsa_proxy_key,
             dsa_proxy_weights=dsa_proxy_weights,
             dsa_proxy_z=dsa_proxy_z,
+            kv_cache_dummy_dep=kv_cache_dummy_dep,
         )
         return attn_output, extra_dims
 
@@ -1358,6 +1392,7 @@ class Step5SparseAttention:
         dsa_proxy_key: torch.Tensor,
         dsa_proxy_weights: torch.Tensor,
         dsa_proxy_z: torch.Tensor,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn = self.owner.attn
         hidden_size = attn.num_heads * attn.head_size_v
@@ -1373,7 +1408,8 @@ class Step5SparseAttention:
         value = value.view(-1, attn.num_kv_heads, attn.head_size_v)
 
         if (
-            not attn.attn_backend.forward_includes_kv_cache_update
+            kv_cache_dummy_dep is None
+            and not attn.attn_backend.forward_includes_kv_cache_update
             and attn.kv_sharing_target_layer_name is None
         ):
             unified_kv_cache_update(key, value, attn.layer_name)
@@ -1588,11 +1624,6 @@ class Step5MoE(nn.Module):
         # shared and routed outputs in FP32 before the final all-reduce.
         # Step5 selects experts with a correction bias but computes routed
         # weights from the unbiased sigmoid scores.
-        custom_routing_function = functools.partial(
-            router_bias_func,
-            router_bias=self.router_bias,
-            routed_scaling_factor=config.moe_router_scaling_factor,
-        )
         self.experts = FusedMoEFactory(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
@@ -1609,7 +1640,6 @@ class Step5MoE(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             router_logits_dtype=torch.float32,
-            custom_routing_function=custom_routing_function,
         )
 
     def forward(

@@ -78,7 +78,7 @@ class Step5Config(PretrainedConfig):
         norm_expert_weight: bool = True,
         bos_token_id: list[int] | int | None = None,
         eos_token_id: list[int] | int | None = None,
-        moe_router_activation: str = "softmax",
+        moe_router_activation: str = "sigmoid",
         moe_router_scaling_factor: float = 1.0,
         att_impl_type: str = "GQA",
         use_head_wise_attn_gate: bool = False,

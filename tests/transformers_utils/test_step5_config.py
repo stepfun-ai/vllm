@@ -129,6 +129,7 @@ def test_step5_vl_config_uses_native_nested_configs():
     assert config.quantization_config == {"quant_method": "fp8"}
     assert config.architectures == ["Step5ForConditionalGeneration"]
     assert config.hidden_size == 4096
+    assert config.text_config.moe_router_activation == "sigmoid"
 
     restored = Step5VLConfig(**config.to_dict())
     assert isinstance(restored.vision_config, PerceptionEncoderConfig)

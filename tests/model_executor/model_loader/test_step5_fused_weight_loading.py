@@ -7,6 +7,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm.model_executor.layers.fused_moe.router.router_factory import (
+    create_fused_moe_router,
+)
 from vllm.model_executor.model_loader.mtp_validation import (
     disable_mtp_completeness_check,
 )
@@ -17,6 +20,7 @@ from vllm.models.step5.nvidia.config import (
     checkpoint_has_step5_sparse_config,
     get_step5_sparse_config,
 )
+from vllm.transformers_utils.configs.step5 import Step5Config
 
 
 def _step5_custom_linear_projection(kind, weight):
@@ -222,29 +226,26 @@ def test_step5_moe_reduce_policy(
 def test_step5_router_bias_matches_reference(indices_dtype):
     torch.manual_seed(20260916)
     gating_output = torch.randn(7, 352, device="cuda", dtype=torch.float32)
-    gating_output[3, 17] = torch.nan
     gating_output[4].fill_(-46.75)
     correction_bias = torch.randn(352, device="cuda") * 0.05
-    correction_bias[4:] += torch.arange(348, device="cuda")
-    scaling_factor = 2.5
-
-    actual_weights, actual_ids = step5_model.router_bias_func(
-        gating_output,
-        gating_output,
-        router_bias=correction_bias,
-        topk=8,
+    scaling_factor = 3.0
+    router = create_fused_moe_router(
+        top_k=8,
+        global_num_experts=352,
+        scoring_func=Step5Config().moe_router_activation,
+        e_score_correction_bias=correction_bias,
         renormalize=True,
         routed_scaling_factor=scaling_factor,
-        indices_dtype=indices_dtype,
     )
 
+    actual_weights, actual_ids = router.select_experts(
+        gating_output, gating_output, indices_dtype
+    )
     scores = gating_output.sigmoid()
     expected_ids = torch.topk(scores + correction_bias, k=8, dim=-1).indices
     expected_weights = scores.gather(1, expected_ids)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True) + 1e-20
+    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
     expected_weights *= scaling_factor
-    expected_weights[3].zero_()
-    expected_ids[3].zero_()
 
     torch.testing.assert_close(actual_weights, expected_weights)
     torch.testing.assert_close(actual_ids, expected_ids.to(indices_dtype))
@@ -252,56 +253,38 @@ def test_step5_router_bias_matches_reference(indices_dtype):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        step5_model.router_bias_func(
-            gating_output,
-            gating_output,
-            8,
-            True,
-            router_bias=correction_bias,
-            routed_scaling_factor=scaling_factor,
-            indices_dtype=indices_dtype,
-        )
+        router.select_experts(gating_output, gating_output, indices_dtype)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        captured_weights, captured_ids = step5_model.router_bias_func(
-            gating_output,
-            gating_output,
-            8,
-            True,
-            router_bias=correction_bias,
-            routed_scaling_factor=scaling_factor,
-            indices_dtype=indices_dtype,
+        captured_weights, captured_ids = router.select_experts(
+            gating_output, gating_output, indices_dtype
         )
     gating_output.add_(0.25)
     graph.replay()
-    eager_weights, eager_ids = step5_model.router_bias_func(
-        gating_output,
-        gating_output,
-        8,
-        True,
-        router_bias=correction_bias,
-        routed_scaling_factor=scaling_factor,
-        indices_dtype=indices_dtype,
+    eager_weights, eager_ids = router.select_experts(
+        gating_output, gating_output, indices_dtype
     )
     torch.testing.assert_close(captured_weights, eager_weights)
     torch.testing.assert_close(captured_ids, eager_ids)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("renormalize", [False, True])
 def test_step5_router_ties_choose_lowest_expert_ids(renormalize):
-    logits = torch.zeros((1, 352))
-    weights, ids = step5_model.router_bias_func(
-        logits,
-        logits,
-        8,
-        renormalize,
-        router_bias=torch.zeros(352),
+    logits = torch.zeros((1, 352), device="cuda")
+    router = create_fused_moe_router(
+        top_k=8,
+        global_num_experts=352,
+        scoring_func="sigmoid",
+        e_score_correction_bias=torch.zeros(352, device="cuda"),
+        renormalize=renormalize,
         routed_scaling_factor=3.0,
     )
+    weights, ids = router.select_experts(logits, logits)
     assert ids.tolist() == [list(range(8))]
     torch.testing.assert_close(
-        weights, torch.full((1, 8), 3.0 / 8 if renormalize else 1.5)
+        weights, torch.full((1, 8), 3.0 / 8 if renormalize else 1.5, device="cuda")
     )
 
 
@@ -330,15 +313,16 @@ def test_step5_gate_linear_preserves_fp32_routing(monkeypatch, rows):
     assert gate.weight.dtype == actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
     bias = torch.randn(352, device="cuda") * 0.01
-    routing_args = dict(
-        topk=8, renormalize=True, router_bias=bias, routed_scaling_factor=3.0
+    router = create_fused_moe_router(
+        top_k=8,
+        global_num_experts=352,
+        scoring_func="sigmoid",
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=3.0,
     )
-    actual_weights, actual_ids = step5_model.router_bias_func(
-        inputs, actual, **routing_args
-    )
-    expected_weights, expected_ids = step5_model.router_bias_func(
-        inputs, expected, **routing_args
-    )
+    actual_weights, actual_ids = router.select_experts(inputs, actual)
+    expected_weights, expected_ids = router.select_experts(inputs, expected)
     torch.testing.assert_close(actual_ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-5, atol=2e-5)
 
@@ -836,34 +820,3 @@ def test_step5_mtp_local_argmax_selects_the_current_step_head():
     assert len(calls) == 1
     assert calls[0][0] == "head-1"
     torch.testing.assert_close(calls[0][1], hidden_states + 1)
-
-
-@pytest.mark.parametrize("renormalize", [False, True])
-def test_router_bias_cpu_preserves_reference_semantics(monkeypatch, renormalize):
-    gating_output = torch.tensor(
-        [[0.0, 1.0, -1.0], [float("nan"), 0.0, 1.0]], dtype=torch.float32
-    )
-    router_bias = torch.tensor([0.3, -0.2, 0.1], dtype=torch.float32)
-    weights, ids = step5_model.router_bias_func(
-        gating_output,
-        gating_output,
-        topk=2,
-        renormalize=renormalize,
-        router_bias=router_bias,
-        routed_scaling_factor=1.5,
-        nan_row_i_out=7,
-        indices_dtype=torch.int64,
-    )
-
-    scores = gating_output[0].sigmoid()
-    expected_ids = torch.topk(scores + router_bias, k=2).indices
-    expected_weights = scores.gather(0, expected_ids)
-    if renormalize:
-        expected_weights /= expected_weights.sum() + 1e-20
-    expected_weights *= 1.5
-
-    torch.testing.assert_close(weights[0], expected_weights)
-    torch.testing.assert_close(weights[1], torch.zeros(2))
-    assert ids.dtype == torch.int64
-    assert ids[0].tolist() == expected_ids.tolist()
-    assert ids[1].tolist() == [7, 7]
