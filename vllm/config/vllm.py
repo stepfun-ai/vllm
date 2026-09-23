@@ -100,6 +100,8 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "Qwen4ExpMTP",
+        "Step5ForCausalLM",
+        "Step5ForConditionalGeneration",
     }
 )
 
@@ -200,20 +202,6 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
-def enable_optimus_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable the Step5 residual-add/RMSNorm fusion at CC level 1+."""
-    from vllm.platforms import current_platform
-
-    model_config = cfg.model_config
-    return (
-        model_config is not None
-        and model_config.architecture
-        in {"Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"}
-        and current_platform.is_cuda()
-        and envs.VLLM_STEP_CC_LEVEL >= 1
-    )
-
-
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
@@ -267,7 +255,6 @@ OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": False,
-            "fuse_optimus_rms": False,
             "fuse_act_quant": False,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
@@ -291,7 +278,6 @@ OPTIMIZATION_LEVEL_01 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
-            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
@@ -315,7 +301,6 @@ OPTIMIZATION_LEVEL_02 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
-            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
@@ -339,7 +324,6 @@ OPTIMIZATION_LEVEL_03 = {
     "compilation_config": {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
-            "fuse_optimus_rms": enable_optimus_rms_fusion,
             "fuse_act_quant": enable_act_fusion,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,

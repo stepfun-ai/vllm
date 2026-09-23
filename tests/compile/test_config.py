@@ -116,13 +116,6 @@ def test_reject_contradictory_custom_ops(custom_ops, config_kwargs, match):
         CompilationConfig(custom_ops=custom_ops, **config_kwargs)
 
 
-def test_optimus_fusion_is_disabled_without_cuda():
-    with patch.object(current_platform, "is_cuda", return_value=False):
-        pass_config = PassConfig(fuse_optimus_rms=True)
-
-    assert pass_config.fuse_optimus_rms is False
-
-
 # forked needed to workaround https://github.com/vllm-project/vllm/issues/21073
 @pytest.mark.forked
 # NB: We don't test VLLM_DISABLE_COMPILE_CACHE=0 because that depends

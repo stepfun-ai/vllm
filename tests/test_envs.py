@@ -42,44 +42,6 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
-def test_step5_environment_controls_are_registered():
-    step5_envs = {
-        "VLLM_STEP_CC_LEVEL",
-        "VLLM_STEP5_DSA_FORCE_STABLE_TOPK",
-        "VLLM_STEP5_DSA_INDEX_TP_SIZE",
-        "VLLM_STEP5_ENABLE_QKVG_PROJ",
-        "VLLM_STEP5_FUSE_INDEXER_NORM",
-        "VLLM_STEP5_O_PROJ_REDUCE_SCATTER",
-        "VLLM_STEP5_SPARSE",
-        "VLLM_STEP5_SPARSE_ATTENTION_IMPL",
-        "VLLM_STEP5_SPARSE_DECODE_SPLIT_MAX",
-        "VLLM_STEP5_SPARSE_INDEXER_ROPE_DIM",
-        "VLLM_STEP5_SPARSE_PROXY_DIM",
-        "VLLM_STEP5_SPARSE_REGION_BLOCK_SIZE",
-        "VLLM_STEP5_SPARSE_TOPK",
-        "VLLM_STEP5_JIT_CACHE_DIR",
-        "VLLM_DSA_OCC_EVERY",
-        "VLLM_DSA_TSL_REDZONE",
-    }
-
-    assert step5_envs <= environment_variables.keys()
-    compile_factors = envs.compile_factors()
-    assert step5_envs - {"VLLM_STEP5_JIT_CACHE_DIR"} <= compile_factors.keys()
-    assert "VLLM_STEP5_JIT_CACHE_DIR" not in compile_factors
-
-
-def test_step5_stable_topk_is_the_correctness_default(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    read_stable_topk = environment_variables["VLLM_STEP5_DSA_FORCE_STABLE_TOPK"]
-
-    monkeypatch.delenv("VLLM_STEP5_DSA_FORCE_STABLE_TOPK", raising=False)
-    assert read_stable_topk() is True
-
-    monkeypatch.setenv("VLLM_STEP5_DSA_FORCE_STABLE_TOPK", "0")
-    assert read_stable_topk() is False
-
-
 def test_api_key_is_not_compile_factor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_API_KEY", "sk-super-secret")
 

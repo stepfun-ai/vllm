@@ -127,8 +127,6 @@ class PassConfig:
     # New flags
     fuse_norm_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom RMSNorm + quant ops."""
-    fuse_optimus_rms: bool = None  # type: ignore[assignment]
-    """Fuse Step5 residual add + zero-centered RMSNorm."""
     fuse_act_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom SiluMul + quant ops."""
     fuse_attn_quant: bool = None  # type: ignore[assignment]
@@ -231,7 +229,6 @@ class PassConfig:
 
     @field_validator(
         "fuse_norm_quant",
-        "fuse_optimus_rms",
         "fuse_act_quant",
         "fuse_attn_quant",
         "enable_sp",
@@ -284,11 +281,6 @@ class PassConfig:
                 "CUDA, ROCm or XPU. The fusion will be disabled."
             )
             self.enable_qk_norm_rope_fusion = False
-        if self.fuse_optimus_rms and not current_platform.is_cuda():
-            logger.warning_once(
-                "Step5 RMSNorm fusion requires CUDA. The fusion will be disabled."
-            )
-            self.fuse_optimus_rms = False
         if self.fuse_act_padding and not current_platform.is_rocm():
             logger.warning_once(
                 "Padding fusion enabled but the current platform is not ROCm. "
@@ -787,10 +779,6 @@ class CompilationConfig:
         "vllm::rocm_aiter_sparse_attn_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
-        # Step5 DSA consumes request-scoped Python metadata and updates a
-        # persistent summary/MTP sidecar. It must run eagerly between PIECEWISE
-        # graph segments; mutates_args alone cannot encode those replay semantics.
-        "vllm::step5_dsa_attention_with_output",
     ]
 
     def compute_hash(self) -> str:

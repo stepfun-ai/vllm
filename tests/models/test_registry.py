@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import sys
 import warnings
 
 import pytest
@@ -41,14 +40,6 @@ def test_step5_registry_import_is_cuda_safe(model_arch):
 
     assert model_cls is not None
     assert not torch.cuda.is_initialized()
-    assert not any(
-        module.startswith("vllm.models.step5.nvidia.ops.cute_dsl")
-        for module in sys.modules
-    )
-    assert not any(
-        module.startswith("vllm.models.step5.nvidia.ops.triton")
-        for module in sys.modules
-    )
 
 
 @pytest.mark.parametrize("model_arch", ModelRegistry.get_supported_archs())

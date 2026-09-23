@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Step5 normalization layers and custom-op registrations."""
+"""Step5 normalization layers."""
 
 from typing import Any
 
@@ -8,11 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import vllm.kernels  # noqa: F401
-from vllm import envs
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.platforms import current_platform
-from vllm.utils.torch_utils import direct_register_custom_op
 
 _NORM_DTYPE_TO_TORCH_DTYPE = {
     "bf16": torch.bfloat16,
@@ -30,19 +26,7 @@ def get_step5_norm_dtype(config: Any) -> torch.dtype:
     raise ValueError(f"Unknown norm_dtype: {norm_dtype!r}")
 
 
-def _has_step5_legacy_rms_norm_op() -> bool:
-    return hasattr(torch.ops, "Optimus") and hasattr(
-        torch.ops.Optimus, "RMSNorm_forward"
-    )
-
-
-def _has_step5_fused_add_rms_norm_op() -> bool:
-    return hasattr(torch.ops, "_C") and hasattr(
-        torch.ops._C, "optimus_fused_add_rms_norm"
-    )
-
-
-def _step5_rms_norm_fallback(
+def _step5_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
@@ -57,17 +41,6 @@ def _step5_rms_norm_fallback(
     return (compute * scale).to(x.dtype)
 
 
-def apply_step5_rms_norm_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-    out: torch.Tensor | None = None,
-    zero_centered: bool = False,
-) -> torch.Tensor:
-    del weight, variance_epsilon, zero_centered
-    return torch.empty_like(x) if out is None else out
-
-
 def apply_step5_rms_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -75,22 +48,7 @@ def apply_step5_rms_norm(
     out: torch.Tensor | None = None,
     zero_centered: bool = False,
 ) -> torch.Tensor:
-    use_legacy_op = (
-        envs.VLLM_STEP_CC_LEVEL < 1
-        and current_platform.is_cuda()
-        and x.is_cuda
-        and weight.is_cuda
-        and _has_step5_legacy_rms_norm_op()
-    )
-    if use_legacy_op:
-        result, _ = torch.ops.Optimus.RMSNorm_forward(
-            x,
-            weight,
-            variance_epsilon,
-            zero_centered=zero_centered,
-        )
-    else:
-        result = _step5_rms_norm_fallback(x, weight, variance_epsilon, zero_centered)
+    result = _step5_rms_norm(x, weight, variance_epsilon, zero_centered)
     if out is None:
         return result
     if out.shape != result.shape or out.dtype != result.dtype:
@@ -103,91 +61,26 @@ def apply_step5_rms_norm(
     return out
 
 
-direct_register_custom_op(
-    op_name="optimus_rms_norm",
-    op_func=apply_step5_rms_norm,
-    mutates_args=["out"],
-    fake_impl=apply_step5_rms_norm_fake,
-)
-
-
-def apply_step5_fused_add_rms_norm_fake(
+def apply_step5_add_rms_norm(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
     zero_centered: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del weight, variance_epsilon, zero_centered
-    return torch.empty_like(x), torch.empty_like(residual)
-
-
-def apply_step5_fused_add_rms_norm(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-    zero_centered: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    use_legacy_op = (
-        envs.VLLM_STEP_CC_LEVEL < 1
-        and current_platform.is_cuda()
-        and x.is_cuda
-        and residual.is_cuda
-        and weight.is_cuda
-        and _has_step5_legacy_rms_norm_op()
-    )
-    if use_legacy_op:
-        output, _, residual_out = torch.ops.Optimus.RMSNorm_forward(
-            x,
-            weight,
-            variance_epsilon,
-            residual,
-            zero_centered=zero_centered,
-        )
-        return output, residual_out
-
-    if (
-        current_platform.is_cuda()
-        and x.is_cuda
-        and residual.is_cuda
-        and weight.is_cuda
-        and _has_step5_fused_add_rms_norm_op()
-    ):
-        output = torch.empty_like(x)
-        residual_out = torch.empty_like(residual)
-        torch.ops._C.optimus_fused_add_rms_norm(
-            output,
-            residual_out,
-            x,
-            residual,
-            weight,
-            variance_epsilon,
-            zero_centered,
-        )
-        return output, residual_out
-
     orig_dtype = x.dtype
     residual_out = (
         (x.float() + residual.float()).to(residual.dtype)
         if orig_dtype == torch.float16
         else x + residual
     )
-    output = _step5_rms_norm_fallback(
+    output = _step5_rms_norm(
         residual_out,
         weight,
         variance_epsilon,
         zero_centered,
     ).to(orig_dtype)
     return output, residual_out
-
-
-direct_register_custom_op(
-    op_name="optimus_fused_add_rms_norm",
-    op_func=apply_step5_fused_add_rms_norm,
-    mutates_args=[],
-    fake_impl=apply_step5_fused_add_rms_norm_fake,
-)
 
 
 class Step5RMSNorm(nn.Module):
@@ -215,28 +108,17 @@ class Step5RMSNorm(nn.Module):
                 raise ValueError(
                     "Residual Step5RMSNorm does not support output buffers or fp16_out."
                 )
-            if self.zero_centered:
-                return torch.ops.vllm.optimus_fused_add_rms_norm(
-                    x,
-                    residual,
-                    self.weight,
-                    self.variance_epsilon,
-                    zero_centered=True,
-                )
-
-            from vllm import _custom_ops as ops
-
-            ops.fused_add_rms_norm(
+            return apply_step5_add_rms_norm(
                 x,
                 residual,
-                self.weight.data,
+                self.weight,
                 self.variance_epsilon,
+                zero_centered=self.zero_centered,
             )
-            return x, residual
 
         if fp16_out:
             raise ValueError("Step5RMSNorm does not support fp16_out.")
-        return torch.ops.vllm.optimus_rms_norm(
+        return apply_step5_rms_norm(
             x,
             self.weight,
             self.variance_epsilon,

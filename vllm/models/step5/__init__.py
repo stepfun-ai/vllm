@@ -4,8 +4,8 @@
 
 The DSA attention backends live in this package too (``sparse_attention``,
 ``sparse_summary_cache``) because they are Step5-specific and are selected by
-the model rather than by platform detection. There is no per-platform split:
-the CuTeDSL sparse kernels are SM90-only.
+the model rather than by platform detection. The current implementation uses
+PyTorch and FlashInfer on B300 in eager mode, without speculative decoding.
 """
 
 from typing import TYPE_CHECKING

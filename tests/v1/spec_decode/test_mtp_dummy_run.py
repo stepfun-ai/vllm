@@ -458,7 +458,7 @@ def test_step3p5_recomputes_dcp_local_lens_after_reprefill(
     )
     monkeypatch.setattr(
         step3p5_module,
-        "prepare_dcp_local_seq_lens",
+        "maybe_prepare_dcp_local_seq_lens",
         fake_prepare_dcp_local_seq_lens,
     )
 
@@ -481,10 +481,7 @@ def test_step3p5_recomputes_dcp_local_lens_after_reprefill(
         batch_size=lambda: 2,
         seq_lens=torch.tensor([41, 60], dtype=torch.int32),
         query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([41, 60], dtype=torch.int32),
-        _num_computed_tokens_cpu=torch.tensor([37, 56], dtype=torch.int32),
         dcp_local_seq_lens=torch.zeros(2, dtype=torch.int32),
-        dcp_local_seq_lens_cpu=torch.zeros(2, dtype=torch.int32),
     )
 
     proposer._prepare_packed_inputs(
@@ -504,9 +501,6 @@ def test_step3p5_recomputes_dcp_local_lens_after_reprefill(
     assert torch.equal(seq_lens, torch.tensor([40, 58], dtype=torch.int32))
     assert (num_reqs, dcp_size, dcp_rank, cp_interleave) == (2, 2, 1, 2)
     assert common_attn_metadata.dcp_local_seq_lens.tolist() == [20, 29]
-    assert common_attn_metadata._seq_lens_cpu is None
-    assert common_attn_metadata._num_computed_tokens_cpu is None
-    assert common_attn_metadata.dcp_local_seq_lens_cpu is None
 
 
 @pytest.mark.cpu_test
@@ -788,7 +782,9 @@ def test_idle_dp_dummy_masks_proposer_owned_slot_mappings(monkeypatch):
     proposer.input_ids = torch.zeros(8, dtype=torch.int32)
     proposer.inputs_embeds = torch.zeros((8, 4), dtype=torch.float32)
     proposer._get_positions = lambda num_tokens: torch.arange(num_tokens)
-    proposer._get_slot_mapping = lambda _num_tokens: {"draft": private_slot_mapping}
+    proposer._get_slot_mapping = lambda _num_tokens, _mapping: {
+        "draft": private_slot_mapping
+    }
     proposer._determine_batch_execution_and_padding = (
         lambda num_tokens, use_cudagraphs=True: (
             CUDAGraphMode.PIECEWISE,
@@ -866,13 +862,13 @@ def test_padded_next_token_warmup_covers_each_block_size(monkeypatch):
 
     monkeypatch.setattr(
         proposer_module,
-        "eagle_prepare_next_token_padded_kernel",
-        FakeNextTokenKernel(),
+        "_eagle_prepare_next_token_padded",
+        lambda *args, **kw: FakeNextTokenKernel()[(args[7],)](*args, **kw),
     )
     monkeypatch.setattr(
         proposer_module,
-        "eagle_prepare_inputs_padded_kernel",
-        FakePrepareInputKernel(),
+        "_eagle_prepare_inputs_padded",
+        lambda *args, **kw: FakePrepareInputKernel()[(args[5],)](*args, **kw),
     )
 
     proposer = object.__new__(SpecDecodeBaseProposer)

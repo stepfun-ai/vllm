@@ -405,7 +405,7 @@ def _support_torch_compile(
         # Handled by monkeypatching `TorchCompileWithNoGuardsWrapper` into base class
         TorchCompileWithNoGuardsWrapper.__init__(
             self,
-            compile_prefix=prefix or (cls.__name__ if is_encoder else ""),
+            compile_prefix=cls.__name__ if is_encoder else "",
             is_encoder=is_encoder,
         )
 
@@ -539,9 +539,6 @@ def _support_torch_compile(
             factors: list[str] = aot_compile_hash_factors(self.vllm_config)
 
             factors.append(_model_hash_key(self.forward))
-            # Independently compiled instances can embed different constants,
-            # such as the attention cache name of each Step5 MTP layer.
-            factors.append(self._compile_prefix)
             hash_key = hashlib.sha256(str(factors).encode()).hexdigest()
             cache_dir = os.path.join(
                 envs.VLLM_CACHE_ROOT,

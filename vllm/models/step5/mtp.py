@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.utils import replace
 from vllm.logger import init_logger
@@ -81,7 +80,6 @@ class Step5MTPSharedHead(nn.Module):
         return self.norm(hidden_states)
 
 
-@support_torch_compile
 class Step5MultiTokenPredictorLayer(nn.Module):
     def __init__(
         self,

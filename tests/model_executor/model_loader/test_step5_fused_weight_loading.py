@@ -11,14 +11,11 @@ from vllm.model_executor.model_loader.mtp_validation import (
     disable_mtp_completeness_check,
 )
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
-from vllm.models.step5 import kernels as step5_kernels
-from vllm.models.step5 import layernorm as step5_layernorm
 from vllm.models.step5 import model as step5_model
 from vllm.models.step5 import mtp as step5_mtp
-from vllm.models.step5.kernels import (
+from vllm.models.step5.config import (
     checkpoint_has_step5_sparse_config,
     get_step5_sparse_config,
-    is_supported_step5_qknorm_cache_rotary,
 )
 
 
@@ -65,120 +62,13 @@ def test_step5_custom_linear_dispatch(monkeypatch, kind, invariant, cuda_alike):
 
 
 @pytest.mark.parametrize(
-    ("use_rope", "is_cuda", "expected"),
-    [
-        (False, False, False),
-        (False, True, False),
-        (True, False, False),
-        (True, True, True),
-    ],
+    "gate,block_size,fused",
+    [(False, None, False), (True, None, True), (True, [128, 128], False)],
 )
-def test_step5_fused_qknorm_requires_cuda(
-    monkeypatch,
-    use_rope,
-    is_cuda,
-    expected,
+def test_step5_attention_quantizes_projections_but_not_kv_cache(
+    monkeypatch, gate, block_size, fused
 ):
-    monkeypatch.setattr(step5_model.current_platform, "is_cuda", lambda: is_cuda)
-
-    assert step5_model._can_use_step5_fused_qknorm(use_rope) is expected
-
-
-@pytest.mark.parametrize(
-    ("enabled", "num_tokens", "expected"),
-    [
-        (False, 1, False),
-        (True, 1, True),
-        (True, 256, True),
-        (True, 257, False),
-        (True, 16384, False),
-    ],
-)
-def test_step5_qknorm_cache_fusion_is_limited_to_small_workloads(
-    enabled,
-    num_tokens,
-    expected,
-):
-    assert step5_model._use_step5_qknorm_cache_fusion(enabled, num_tokens) is expected
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_path", "expected_kv_dependency"),
-    [
-        (256, "cache", "cache-write"),
-        (257, "separate", None),
-    ],
-)
-def test_step5_attention_dispatches_qknorm_at_cache_fusion_boundary(
-    monkeypatch,
-    num_tokens,
-    expected_path,
-    expected_kv_dependency,
-):
-    calls = []
-    kv_dependencies = []
-    qkv = torch.arange(num_tokens * 3, dtype=torch.float32).view(num_tokens, 3)
-
-    def cache_fusion(*args, **kwargs):
-        calls.append("cache")
-        return qkv[:, :1], qkv[:, 1:2], qkv[:, 2:], "cache-write"
-
-    def separate_fusion(*args, **kwargs):
-        calls.append("separate")
-        return qkv[:, :1], qkv[:, 1:2], qkv[:, 2:]
-
-    class FakeAttention:
-        layer_name = "layers.0.self_attn.attn"
-
-        def __call__(self, q, k, v, *, kv_cache_dummy_dep):
-            kv_dependencies.append(kv_cache_dummy_dep)
-            return q + k + v
-
-    monkeypatch.setattr(
-        step5_model,
-        "fused_qknorm_rope_cache_forward_impl",
-        cache_fusion,
-    )
-    monkeypatch.setattr(
-        step5_model,
-        "fused_qknorm_rope_forward_impl",
-        separate_fusion,
-    )
-
-    attention = SimpleNamespace(
-        use_dsa_backend=False,
-        fuse_qkv_gate=False,
-        qkv_proj=lambda hidden_states: (qkv, None),
-        use_step5_fused_qknorm_cache=True,
-        use_step5_fused_qknorm=True,
-        q_norm=SimpleNamespace(variance_epsilon=1e-5, weight=torch.ones(1)),
-        k_norm=SimpleNamespace(weight=torch.ones(1)),
-        rope_cos=torch.ones(1),
-        rope_sin=torch.zeros(1),
-        head_dim=1,
-        num_heads=1,
-        num_kv_heads=1,
-        rotary_dim=2,
-        zero_centered=False,
-        attn=FakeAttention(),
-        sparse_attn=None,
-        use_head_wise_attn_gate=False,
-        o_proj=lambda output: (output, None),
-    )
-
-    output = step5_model.Step5Attention.forward(
-        attention,
-        torch.arange(num_tokens),
-        torch.empty(num_tokens, 1),
-    )
-
-    assert calls == [expected_path]
-    assert kv_dependencies == [expected_kv_dependency]
-    torch.testing.assert_close(output, qkv.sum(dim=-1, keepdim=True))
-
-
-def test_step5_attention_quantizes_projections_but_not_kv_cache(monkeypatch):
-    quant_config = object()
+    quant_config = SimpleNamespace(weight_block_size=block_size)
     projection_quant_configs = []
     attention_quant_configs = []
 
@@ -202,6 +92,8 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(monkeypatch):
     monkeypatch.setattr(step5_model, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(step5_model, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(step5_model, "QKVParallelLinear", FakeProjection)
+    monkeypatch.setattr(step5_model, "MergedColumnParallelLinear", FakeProjection)
+    monkeypatch.setattr(step5_model, "ColumnParallelLinear", FakeProjection)
     monkeypatch.setattr(step5_model, "RowParallelLinear", FakeProjection)
     monkeypatch.setattr(step5_model, "Attention", FakeAttention)
     monkeypatch.setattr(
@@ -211,8 +103,9 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(monkeypatch):
         step5_model, "make_step5_rms_norm", lambda *_args, **_kwargs: nn.Identity()
     )
 
-    step5_model.Step5Attention(
+    attention = step5_model.Step5Attention(
         hidden_size=8,
+        use_head_wise_attn_gate=gate,
         num_heads=2,
         num_kv_heads=1,
         max_position=16,
@@ -224,7 +117,8 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(monkeypatch):
         zero_centered=False,
     )
 
-    assert projection_quant_configs == [quant_config, quant_config]
+    assert attention.fuse_qkv_gate is fused
+    assert projection_quant_configs == [quant_config] * (3 if gate and not fused else 2)
     assert attention_quant_configs == [None]
 
 
@@ -325,11 +219,7 @@ def test_step5_moe_reduce_policy(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
-def test_step5_router_bias_kernel_matches_reference(indices_dtype):
-    from vllm.models.step5.nvidia.ops.triton.router_bias import (
-        router_bias_triton_func,
-    )
-
+def test_step5_router_bias_matches_reference(indices_dtype):
     torch.manual_seed(20260916)
     gating_output = torch.randn(7, 352, device="cuda", dtype=torch.float32)
     gating_output[3, 17] = torch.nan
@@ -338,9 +228,10 @@ def test_step5_router_bias_kernel_matches_reference(indices_dtype):
     correction_bias[4:] += torch.arange(348, device="cuda")
     scaling_factor = 2.5
 
-    actual_weights, actual_ids = router_bias_triton_func(
+    actual_weights, actual_ids = step5_model.router_bias_func(
         gating_output,
-        correction_bias,
+        gating_output,
+        router_bias=correction_bias,
         topk=8,
         renormalize=True,
         routed_scaling_factor=scaling_factor,
@@ -357,6 +248,86 @@ def test_step5_router_bias_kernel_matches_reference(indices_dtype):
 
     torch.testing.assert_close(actual_weights, expected_weights)
     torch.testing.assert_close(actual_ids, expected_ids.to(indices_dtype))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step5_model.router_bias_func(
+            gating_output,
+            gating_output,
+            8,
+            True,
+            router_bias=correction_bias,
+            routed_scaling_factor=scaling_factor,
+            indices_dtype=indices_dtype,
+        )
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured_weights, captured_ids = step5_model.router_bias_func(
+            gating_output,
+            gating_output,
+            8,
+            True,
+            router_bias=correction_bias,
+            routed_scaling_factor=scaling_factor,
+            indices_dtype=indices_dtype,
+        )
+    gating_output.add_(0.25)
+    graph.replay()
+    eager_weights, eager_ids = step5_model.router_bias_func(
+        gating_output,
+        gating_output,
+        8,
+        True,
+        router_bias=correction_bias,
+        routed_scaling_factor=scaling_factor,
+        indices_dtype=indices_dtype,
+    )
+    torch.testing.assert_close(captured_weights, eager_weights)
+    torch.testing.assert_close(captured_ids, eager_ids)
+
+
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_step5_router_ties_choose_lowest_expert_ids(renormalize):
+    logits = torch.zeros((1, 352))
+    weights, ids = step5_model.router_bias_func(
+        logits,
+        logits,
+        8,
+        renormalize,
+        router_bias=torch.zeros(352),
+        routed_scaling_factor=3.0,
+    )
+    assert ids.tolist() == [list(range(8))]
+    torch.testing.assert_close(
+        weights, torch.full((1, 8), 3.0 / 8 if renormalize else 1.5)
+    )
+
+
+def test_step5_moe_passes_fp32_gate_logits_to_runner():
+    """Keep external FP32 routing and separate shared/routed outputs."""
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    logits = torch.tensor([[1.001, 1.002], [2.001, 2.002]], dtype=torch.float32)
+
+    class Runner(nn.Module):
+        moe_config = SimpleNamespace(is_sequence_parallel=False)
+
+        def forward(self, hidden_states, router_logits):
+            assert router_logits is logits
+            assert router_logits.dtype == torch.float32
+            return hidden_states * 3
+
+    moe = step5_model.Step5MoE.__new__(step5_model.Step5MoE)
+    nn.Module.__init__(moe)
+    moe.experts = Runner()
+    moe.gate = lambda inputs: (logits, None)
+    moe.share_expert = nn.Identity()
+
+    shared, routed = moe(hidden_states)
+
+    torch.testing.assert_close(shared, hidden_states)
+    torch.testing.assert_close(routed, hidden_states * 3)
 
 
 class _FakeMoeRunner(nn.Module):
@@ -720,7 +691,7 @@ def test_step5_sparse_config_prefers_native_section_and_keeps_legacy_alias():
     [
         (SimpleNamespace(step5_sparse_config={"enabled": True}), True),
         (SimpleNamespace(step5_sparse_config={}), True),
-        # ``enabled`` is a runtime DSA switch; section presence still
+        # ``enabled`` controls sparse execution; section presence still
         # advertises the split-KV/replay contract required by the checkpoint.
         (SimpleNamespace(step5_sparse_config={"enabled": False}), True),
         (SimpleNamespace(), False),
@@ -730,34 +701,31 @@ def test_step5_sparse_checkpoint_capability_tracks_declared_layout(config, expec
     assert checkpoint_has_step5_sparse_config(config) is expected
 
 
-def test_step5_sparse_checkpoint_capability_honors_force_enable_for_declared_section(
-    monkeypatch,
-):
-    monkeypatch.setattr(step5_kernels.envs, "is_set", lambda _name: True)
-    monkeypatch.setattr(
-        step5_kernels.envs,
-        "VLLM_STEP5_SPARSE",
-        True,
-        raising=False,
+@pytest.mark.parametrize("enabled", [False, "false", 0])
+def test_step5_sparse_config_respects_checkpoint_disable(enabled):
+    config = SimpleNamespace(sparse_config={"enabled": enabled})
+    assert get_step5_sparse_config(config) is None
+    assert checkpoint_has_step5_sparse_config(config)
+
+
+def test_step5_sparse_config_requires_checkpoint_section():
+    assert get_step5_sparse_config(SimpleNamespace()) is None
+
+
+def test_step5_sparse_config_reads_checkpoint_geometry():
+    config = SimpleNamespace(
+        sparse_config={
+            "num_provider_groups": 8,
+            "topk": 256,
+            "sparse_indexer_rope_dim": 64,
+        }
     )
-
-    assert checkpoint_has_step5_sparse_config(
-        SimpleNamespace(step5_sparse_config={"enabled": False})
-    )
-    assert not checkpoint_has_step5_sparse_config(SimpleNamespace())
-
-
-def test_step5_sparse_force_enable_rejects_native_dense_checkpoint(monkeypatch):
-    monkeypatch.setattr(step5_kernels.envs, "is_set", lambda _name: True)
-    monkeypatch.setattr(
-        step5_kernels.envs,
-        "VLLM_STEP5_SPARSE",
-        True,
-        raising=False,
-    )
-
-    with pytest.raises(ValueError, match="requires a checkpoint-declared"):
-        get_step5_sparse_config(SimpleNamespace())
+    sparse = get_step5_sparse_config(config)
+    assert sparse is not None
+    assert sparse.enabled
+    assert sparse.index_tp_size == 8
+    assert sparse.topk == 256
+    assert sparse.sparse_indexer_rope_dim == 64
 
 
 def test_step5_sparse_config_retains_ssmax_compatibility_metadata():
@@ -772,18 +740,6 @@ def test_step5_sparse_config_retains_ssmax_compatibility_metadata():
 
     assert sparse_config is not None
     assert sparse_config.sparse_indexer_softmax_variant == "ssmax"
-
-
-def test_step5_sparse_config_rejects_stable_topk_above_selector_limit():
-    config = SimpleNamespace(
-        step5_sparse_config={
-            "enabled": True,
-            "topk": 513,
-        }
-    )
-
-    with pytest.raises(ValueError, match=r"stable top-k currently requires topk"):
-        get_step5_sparse_config(config)
 
 
 def test_step5_packed_mapping_exposes_dsa_partitions():
@@ -846,348 +802,13 @@ def test_step5_mtp_local_argmax_selects_the_current_step_head():
     torch.testing.assert_close(calls[0][1], hidden_states + 1)
 
 
-def test_step5_rms_norm_falls_back_without_optional_op(monkeypatch):
-    monkeypatch.setenv("VLLM_STEP_CC_LEVEL", "0")
-    monkeypatch.setattr(step5_layernorm, "_has_step5_legacy_rms_norm_op", lambda: False)
-    x = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    weight = torch.tensor([0.25, -0.5], dtype=torch.float32)
-
-    actual = step5_layernorm.apply_step5_rms_norm(
-        x,
-        weight,
-        1e-6,
-        zero_centered=True,
-    )
-    expected = step5_layernorm._step5_rms_norm_fallback(
-        x,
-        weight,
-        1e-6,
-        True,
-    )
-
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("platform_is_cuda", [False, True])
-def test_step5_rms_norm_optional_op_requires_cuda_tensor_and_platform(
-    monkeypatch,
-    platform_is_cuda,
-):
-    monkeypatch.setenv("VLLM_STEP_CC_LEVEL", "0")
-    monkeypatch.setattr(
-        step5_layernorm.current_platform,
-        "is_cuda",
-        lambda: platform_is_cuda,
-    )
-    monkeypatch.setattr(step5_layernorm, "_has_step5_legacy_rms_norm_op", lambda: True)
-    x = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    weight = torch.tensor([0.25, -0.5], dtype=torch.float32)
-
-    actual = step5_layernorm.apply_step5_rms_norm(
-        x,
-        weight,
-        1e-6,
-        zero_centered=True,
-    )
-    expected = step5_layernorm._step5_rms_norm_fallback(
-        x,
-        weight,
-        1e-6,
-        True,
-    )
-
-    torch.testing.assert_close(actual, expected)
-
-
-def test_step5_fused_rms_norm_falls_back_without_custom_ops(monkeypatch):
-    monkeypatch.setenv("VLLM_STEP_CC_LEVEL", "0")
-    monkeypatch.setattr(step5_layernorm, "_has_step5_legacy_rms_norm_op", lambda: False)
-    monkeypatch.setattr(
-        step5_layernorm,
-        "_has_step5_fused_add_rms_norm_op",
-        lambda: False,
-    )
-    x = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    residual = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
-    weight = torch.tensor([0.25, -0.5], dtype=torch.float32)
-
-    actual, residual_out = step5_layernorm.apply_step5_fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        1e-6,
-        zero_centered=True,
-    )
-    expected_residual = x + residual
-    expected = step5_layernorm._step5_rms_norm_fallback(
-        expected_residual,
-        weight,
-        1e-6,
-        True,
-    )
-
-    torch.testing.assert_close(residual_out, expected_residual)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("platform_is_cuda", [False, True])
-def test_step5_fused_rms_norm_optional_ops_require_cuda_tensor_and_platform(
-    monkeypatch,
-    platform_is_cuda,
-):
-    monkeypatch.setenv("VLLM_STEP_CC_LEVEL", "0")
-    monkeypatch.setattr(
-        step5_layernorm.current_platform,
-        "is_cuda",
-        lambda: platform_is_cuda,
-    )
-    monkeypatch.setattr(step5_layernorm, "_has_step5_legacy_rms_norm_op", lambda: True)
-    monkeypatch.setattr(
-        step5_layernorm,
-        "_has_step5_fused_add_rms_norm_op",
-        lambda: True,
-    )
-    x = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    residual = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
-    weight = torch.tensor([0.25, -0.5], dtype=torch.float32)
-
-    actual, residual_out = step5_layernorm.apply_step5_fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        1e-6,
-        zero_centered=True,
-    )
-    expected_residual = x + residual
-    expected = step5_layernorm._step5_rms_norm_fallback(
-        expected_residual,
-        weight,
-        1e-6,
-        True,
-    )
-
-    torch.testing.assert_close(residual_out, expected_residual)
-    torch.testing.assert_close(actual, expected)
-
-
-def test_step5_fused_rms_norm_fp16_fallback_preserves_residual_dtype(monkeypatch):
-    monkeypatch.setenv("VLLM_STEP_CC_LEVEL", "0")
-    monkeypatch.setattr(step5_layernorm, "_has_step5_legacy_rms_norm_op", lambda: False)
-    monkeypatch.setattr(
-        step5_layernorm,
-        "_has_step5_fused_add_rms_norm_op",
-        lambda: False,
-    )
-    x = torch.tensor([[1.0, 2.0]], dtype=torch.float16)
-    residual = torch.tensor([[3.0, 4.0]], dtype=torch.float16)
-    weight = torch.tensor([0.25, -0.5], dtype=torch.float32)
-
-    actual, residual_out = step5_layernorm.apply_step5_fused_add_rms_norm(
-        x,
-        residual,
-        weight,
-        1e-6,
-        zero_centered=True,
-    )
-    expected_residual = (x.float() + residual.float()).to(torch.float16)
-    expected = step5_layernorm._step5_rms_norm_fallback(
-        expected_residual,
-        weight,
-        1e-6,
-        True,
-    )
-
-    assert residual_out.dtype == torch.float16
-    assert actual.dtype == torch.float16
-    torch.testing.assert_close(residual_out, expected_residual)
-    torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_qknorm_cache_falls_back_when_native_extension_op_is_missing(monkeypatch):
-    device = torch.device("cuda")
-    qkv = torch.zeros((1, 6), dtype=torch.bfloat16, device=device)
-    q = torch.full((1, 2), 1, dtype=qkv.dtype, device=device)
-    k = torch.full((1, 2), 2, dtype=qkv.dtype, device=device)
-    v = torch.full((1, 2), 3, dtype=qkv.dtype, device=device)
-    kv_cache = torch.zeros((2, 1, 4, 1, 2), dtype=qkv.dtype, device=device)
-    slot_mapping = torch.zeros((1,), dtype=torch.int64, device=device)
-    updates: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    class FakeImpl:
-        @staticmethod
-        def do_kv_cache_update(
-            _layer,
-            key,
-            value,
-            _kv_cache,
-            _slot_mapping,
-        ):
-            updates.append((key, value))
-
-    attn_layer = SimpleNamespace(impl=FakeImpl())
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.attention.attention.get_attention_context",
-        lambda _layer_name: (None, attn_layer, kv_cache, slot_mapping),
-    )
-    monkeypatch.setattr(
-        step5_kernels,
-        "_get_step5_qknorm_cache_op",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        step5_kernels,
-        "_fused_qknorm_rope_forward_impl",
-        lambda *_args, **_kwargs: (q, k, v),
-    )
-
-    actual_q, actual_k, actual_v, _ = (
-        step5_kernels._fused_qknorm_rope_cache_forward_impl_op(
-            qkv,
-            torch.ones(2, dtype=torch.float32, device=device),
-            torch.ones(2, dtype=torch.float32, device=device),
-            torch.ones((4, 1), dtype=qkv.dtype, device=device),
-            torch.zeros((4, 1), dtype=qkv.dtype, device=device),
-            torch.zeros((1,), dtype=torch.int64, device=device),
-            head_dim=2,
-            num_q_head=1,
-            num_kv_head=1,
-            rotary_dim=0,
-            layer_name="layers.0.self_attn",
-        )
-    )
-
-    assert actual_q is q
-    assert actual_k is k
-    assert actual_v is v
-    assert len(updates) == 1
-    torch.testing.assert_close(updates[0][0], k.view(1, 1, 2))
-    torch.testing.assert_close(updates[0][1], v.view(1, 1, 2))
-
-
-@pytest.mark.parametrize(
-    ("cc_level", "op_name"),
-    [
-        (0, "optimus_fused_qknorm_rope_cache_bitwise"),
-        (3, "optimus_fused_qknorm_rope_cache"),
-    ],
-)
-def test_qknorm_cache_selects_step5_op_for_cc_level(
-    monkeypatch,
-    cc_level,
-    op_name,
-):
-    selected_op = object()
-    namespace = SimpleNamespace(**{op_name: selected_op})
-    monkeypatch.setattr(
-        step5_kernels,
-        "torch",
-        SimpleNamespace(ops=SimpleNamespace(_C=namespace)),
-    )
-    monkeypatch.setattr(
-        step5_kernels,
-        "envs",
-        SimpleNamespace(VLLM_STEP_CC_LEVEL=cc_level),
-    )
-
-    assert step5_kernels._get_step5_qknorm_cache_op() is selected_op
-
-
-@pytest.mark.parametrize("cc_level", [0, 3])
-def test_qknorm_cache_selector_returns_none_when_extension_op_is_missing(
-    monkeypatch,
-    cc_level,
-):
-    monkeypatch.setattr(
-        step5_kernels,
-        "torch",
-        SimpleNamespace(ops=SimpleNamespace(_C=SimpleNamespace())),
-    )
-    monkeypatch.setattr(
-        step5_kernels,
-        "envs",
-        SimpleNamespace(VLLM_STEP_CC_LEVEL=cc_level),
-    )
-
-    assert step5_kernels._get_step5_qknorm_cache_op() is None
-
-
-@pytest.mark.parametrize(
-    ("head_dim", "rotary_pairs", "supported"),
-    [
-        (64, 32, True),
-        (128, 64, True),
-        (192, 64, True),
-        (192, 96, True),
-        (256, 128, True),
-        (80, 40, False),
-    ],
-)
-def test_qknorm_cache_rotary_layout_support(
-    head_dim,
-    rotary_pairs,
-    supported,
-):
-    assert is_supported_step5_qknorm_cache_rotary(head_dim, rotary_pairs) is supported
-
-
-def test_router_bias_lazy_imports_model_scoped_kernel(monkeypatch):
-    calls = []
-    imported_modules = []
-    expected = (object(), object())
-
-    def router(*args, **kwargs):
-        calls.append((args, kwargs))
-        return expected
-
-    def import_module(name):
-        imported_modules.append(name)
-        assert name == "vllm.models.step5.nvidia.ops.triton.router_bias"
-        return SimpleNamespace(router_bias_triton_func=router)
-
-    monkeypatch.setattr(step5_kernels.importlib, "import_module", import_module)
-
-    gating_output = SimpleNamespace(is_cuda=True)
-    router_bias = object()
-    actual = step5_kernels.router_bias_func(
-        object(),
-        gating_output,
-        topk=2,
-        renormalize=True,
-        router_bias=router_bias,
-        routed_scaling_factor=3.0,
-        indices_dtype=torch.int64,
-    )
-
-    assert actual is expected
-    assert imported_modules == ["vllm.models.step5.nvidia.ops.triton.router_bias"]
-    assert calls == [
-        (
-            (gating_output, router_bias, 2),
-            {
-                "renormalize": True,
-                "routed_scaling_factor": 3.0,
-                "nan_row_i_out": 0,
-                "indices_dtype": torch.int64,
-            },
-        )
-    ]
-
-
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_router_bias_cpu_fallback_preserves_reference_semantics(
-    monkeypatch, renormalize
-):
-    def unexpected_import(_name):
-        raise AssertionError("CPU fallback must not import the CUDA Triton kernel")
-
-    monkeypatch.setattr(step5_kernels.importlib, "import_module", unexpected_import)
-
+def test_router_bias_cpu_preserves_reference_semantics(monkeypatch, renormalize):
     gating_output = torch.tensor(
         [[0.0, 1.0, -1.0], [float("nan"), 0.0, 1.0]], dtype=torch.float32
     )
     router_bias = torch.tensor([0.3, -0.2, 0.1], dtype=torch.float32)
-    weights, ids = step5_kernels.router_bias_func(
+    weights, ids = step5_model.router_bias_func(
         gating_output,
         gating_output,
         topk=2,

@@ -6,9 +6,6 @@ include requirements/cpu.txt
 include CMakeLists.txt
 include rust-toolchain.toml
 include tools/build_rust.py
-include THIRD_PARTY_NOTICES.md
-include THIRD_PARTY_LICENSES/flash-attention-BSD-3-Clause.txt
-include THIRD_PARTY_LICENSES/flash-attention-AUTHORS
 
 recursive-include cmake *
 recursive-include csrc *
@@ -17,4 +14,3 @@ include rust/.gitattributes
 include rust/.gitignore
 recursive-include rust/.config *
 prune rust/target
-recursive-include vllm/models/step5/nvidia/ops/triton *.cpp

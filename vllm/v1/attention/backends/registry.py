@@ -144,9 +144,6 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     STEP5_FLASH_ATTN = (
         "vllm.models.step5.sparse_attention.Step5SplitKVFlashAttentionBackend"
     )
-    STEP5_SPARSE_SUMMARY = (
-        "vllm.models.step5.sparse_summary_cache.Step5SparseSummaryCacheBackend"
-    )
     NO_ATTENTION = "vllm.v1.attention.backends.no_attention.NoAttentionBackend"
     FLEX_ATTENTION = "vllm.v1.attention.backends.flex_attention.FlexAttentionBackend"
     # HPC Attention Backend:

@@ -17,12 +17,7 @@ build-backend = "setuptools.build_meta"
 name = "vllm"
 authors = [{name = "vLLM Team"}]
 license = "Apache-2.0"
-license-files = [
-    "LICENSE",
-    "THIRD_PARTY_LICENSES/flash-attention-BSD-3-Clause.txt",
-    "THIRD_PARTY_LICENSES/flash-attention-AUTHORS",
-    "THIRD_PARTY_NOTICES.md",
-]
+license-files = ["LICENSE"]
 readme = "README.md"
 description = "A high-throughput and memory-efficient inference and serving engine for LLMs"
 classifiers = [
@@ -61,20 +56,11 @@ include = ["vllm*"]
 
 [tool.ruff]
 # The Step5 NVIDIA inference kernels are model-scoped. In particular,
-# CuTeDSL staged kernels are source-inspected during JIT
-# compilation, so formatting them can change preprocessing semantics.
-extend-exclude = [
-    "vllm/models/step5/nvidia/ops/cute_dsl",
-    "vllm/models/step5/nvidia/ops/triton",
-]
 
 [tool.ruff.lint.per-file-ignores]
 # `vllm` is the only installed package; everything else is standalone scripts
 "!vllm/**" = ["INP"]
 "vllm/third_party/**" = ["ALL"]
-# Model-scoped Step5 NVIDIA inference kernels.
-"vllm/models/step5/nvidia/ops/cute_dsl/**" = ["ALL"]
-"vllm/models/step5/nvidia/ops/triton/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 # test args are mostly pytest fixtures, which don't benefit from descriptions

@@ -16,7 +16,6 @@ from typing_extensions import TypeIs
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_dp_group,
@@ -72,43 +71,21 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 
-from .kernels import (
+from .config import (
     Step5SparseConfig,
     checkpoint_has_step5_sparse_config,
-    fused_indexer_norm_rope_forward_impl,
-    fused_qknorm_rope_cache_forward_impl,
-    fused_qknorm_rope_forward_impl,
     get_step5_sparse_config,
-    is_supported_step5_qknorm_cache_rotary,
-    router_bias_func,
 )
 from .layernorm import (
     Step5IndexerLayerNorm,
     get_step5_norm_dtype,
     make_step5_rms_norm,
 )
+from .routing import router_bias_func
 
 logger = init_logger(__name__)
-
-_STEP5_QKNORM_CACHE_FUSION_MAX_TOKENS = 256
-
-
-def step5_materialize_gate_input(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.clone()
-
-
-def step5_materialize_gate_input_fake(tensor: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(tensor)
-
-
-direct_register_custom_op(
-    op_name="step5_materialize_gate_input",
-    op_func=step5_materialize_gate_input,
-    fake_impl=step5_materialize_gate_input_fake,
-)
 
 
 @eager_break_during_capture
@@ -123,78 +100,7 @@ def step5_dsa_attention_with_output(
     dsa_proxy_key: torch.Tensor,
     dsa_proxy_weights: torch.Tensor,
     dsa_proxy_z: torch.Tensor | None = None,
-    dsa_summary_cache_sum: torch.Tensor | None = None,
-    dsa_summary_cache_count: torch.Tensor | None = None,
-    dsa_csa_active_region_ids: torch.Tensor | None = None,
-    dsa_csa_active_slot_by_region: torch.Tensor | None = None,
-    dsa_csa_numerator: torch.Tensor | None = None,
-    dsa_csa_denominator: torch.Tensor | None = None,
-    dsa_csa_max: torch.Tensor | None = None,
-    kv_cache_dummy_dep: torch.Tensor | None = None,
-    dsa_summary_cache_mean: torch.Tensor | None = None,
-    dsa_csa_active_token_k: torch.Tensor | None = None,
-    dsa_csa_active_token_z: torch.Tensor | None = None,
-    dsa_csa_active_token_valid: torch.Tensor | None = None,
-    dsa_mtp_source_to_transaction: torch.Tensor | None = None,
-    dsa_mtp_row_source: torch.Tensor | None = None,
-    dsa_mtp_row_regions: torch.Tensor | None = None,
-    dsa_mtp_row_positions: torch.Tensor | None = None,
-    dsa_mtp_row_owner_block: torch.Tensor | None = None,
-    dsa_mtp_row_owner_block_index: torch.Tensor | None = None,
-    dsa_mtp_correction_action: torch.Tensor | None = None,
-    dsa_mtp_state_numerator: torch.Tensor | None = None,
-    dsa_mtp_state_denominator: torch.Tensor | None = None,
-    dsa_mtp_state_max_logits: torch.Tensor | None = None,
-    dsa_mtp_state_pre_numerator: torch.Tensor | None = None,
-    dsa_mtp_state_pre_denominator: torch.Tensor | None = None,
-    dsa_mtp_state_pre_max_logits: torch.Tensor | None = None,
-    dsa_mtp_correction_free_slots: torch.Tensor | None = None,
-    dsa_mtp_correction_free_count: torch.Tensor | None = None,
-    dsa_mtp_correction_allocation_cursor: torch.Tensor | None = None,
-    dsa_order_token: torch.Tensor | None = None,
 ) -> None:
-    # kv_cache_dummy_dep orders the split KV update before DSA attention.  The
-    # summary tensors are explicit mutated args so torch.compile/CUDA graph see
-    # the side effects performed through the Step5-local summary sidecar.
-    # dsa_order_token is a model-wide dependency token: each DSA layer has
-    # private CSA state tensors, while its metadata/scratch pool is shared.
-    # Mutating this token forces compiled calls to remain in layer order.
-    if dsa_order_token is not None:
-        # Use a non-idempotent write rather than zero_(): it makes the
-        # dependency visible even to aggressive compiler dead-write
-        # elimination, while the token is reset at capture/wake boundaries.
-        dsa_order_token.add_(1)
-    del (
-        kv_cache_dummy_dep,
-        dsa_summary_cache_sum,
-        dsa_summary_cache_count,
-        dsa_csa_active_region_ids,
-        dsa_csa_active_slot_by_region,
-        dsa_csa_numerator,
-        dsa_csa_denominator,
-        dsa_csa_max,
-        dsa_summary_cache_mean,
-        dsa_csa_active_token_k,
-        dsa_csa_active_token_z,
-        dsa_csa_active_token_valid,
-        dsa_mtp_source_to_transaction,
-        dsa_mtp_row_source,
-        dsa_mtp_row_regions,
-        dsa_mtp_row_positions,
-        dsa_mtp_row_owner_block,
-        dsa_mtp_row_owner_block_index,
-        dsa_mtp_correction_action,
-        dsa_mtp_state_numerator,
-        dsa_mtp_state_denominator,
-        dsa_mtp_state_max_logits,
-        dsa_mtp_state_pre_numerator,
-        dsa_mtp_state_pre_denominator,
-        dsa_mtp_state_pre_max_logits,
-        dsa_mtp_correction_free_slots,
-        dsa_mtp_correction_free_count,
-        dsa_mtp_correction_allocation_cursor,
-        dsa_order_token,
-    )
     with torch.profiler.record_function("step5_dsa.op.get_attention_context"):
         attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
     with torch.profiler.record_function("step5_dsa.op.impl_forward"):
@@ -211,87 +117,6 @@ def step5_dsa_attention_with_output(
             dsa_proxy_weights=dsa_proxy_weights,
             dsa_proxy_z=dsa_proxy_z,
         )
-
-
-def step5_dsa_attention_with_output_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: str,
-    dsa_proxy_query: torch.Tensor,
-    dsa_proxy_key: torch.Tensor,
-    dsa_proxy_weights: torch.Tensor,
-    dsa_proxy_z: torch.Tensor | None = None,
-    dsa_summary_cache_sum: torch.Tensor | None = None,
-    dsa_summary_cache_count: torch.Tensor | None = None,
-    dsa_csa_active_region_ids: torch.Tensor | None = None,
-    dsa_csa_active_slot_by_region: torch.Tensor | None = None,
-    dsa_csa_numerator: torch.Tensor | None = None,
-    dsa_csa_denominator: torch.Tensor | None = None,
-    dsa_csa_max: torch.Tensor | None = None,
-    kv_cache_dummy_dep: torch.Tensor | None = None,
-    dsa_summary_cache_mean: torch.Tensor | None = None,
-    dsa_csa_active_token_k: torch.Tensor | None = None,
-    dsa_csa_active_token_z: torch.Tensor | None = None,
-    dsa_csa_active_token_valid: torch.Tensor | None = None,
-    dsa_mtp_source_to_transaction: torch.Tensor | None = None,
-    dsa_mtp_row_source: torch.Tensor | None = None,
-    dsa_mtp_row_regions: torch.Tensor | None = None,
-    dsa_mtp_row_positions: torch.Tensor | None = None,
-    dsa_mtp_row_owner_block: torch.Tensor | None = None,
-    dsa_mtp_row_owner_block_index: torch.Tensor | None = None,
-    dsa_mtp_correction_action: torch.Tensor | None = None,
-    dsa_mtp_state_numerator: torch.Tensor | None = None,
-    dsa_mtp_state_denominator: torch.Tensor | None = None,
-    dsa_mtp_state_max_logits: torch.Tensor | None = None,
-    dsa_mtp_state_pre_numerator: torch.Tensor | None = None,
-    dsa_mtp_state_pre_denominator: torch.Tensor | None = None,
-    dsa_mtp_state_pre_max_logits: torch.Tensor | None = None,
-    dsa_mtp_correction_free_slots: torch.Tensor | None = None,
-    dsa_mtp_correction_free_count: torch.Tensor | None = None,
-    dsa_mtp_correction_allocation_cursor: torch.Tensor | None = None,
-    dsa_order_token: torch.Tensor | None = None,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="step5_dsa_attention_with_output",
-    op_func=step5_dsa_attention_with_output,
-    mutates_args=[
-        "output",
-        "dsa_summary_cache_sum",
-        "dsa_summary_cache_count",
-        "dsa_csa_active_region_ids",
-        "dsa_csa_active_slot_by_region",
-        "dsa_csa_numerator",
-        "dsa_csa_denominator",
-        "dsa_csa_max",
-        "dsa_summary_cache_mean",
-        "dsa_csa_active_token_k",
-        "dsa_csa_active_token_z",
-        "dsa_csa_active_token_valid",
-        "dsa_mtp_source_to_transaction",
-        "dsa_mtp_row_source",
-        "dsa_mtp_row_regions",
-        "dsa_mtp_row_positions",
-        "dsa_mtp_row_owner_block",
-        "dsa_mtp_row_owner_block_index",
-        "dsa_mtp_correction_action",
-        "dsa_mtp_state_numerator",
-        "dsa_mtp_state_denominator",
-        "dsa_mtp_state_max_logits",
-        "dsa_mtp_state_pre_numerator",
-        "dsa_mtp_state_pre_denominator",
-        "dsa_mtp_state_pre_max_logits",
-        "dsa_mtp_correction_free_slots",
-        "dsa_mtp_correction_free_count",
-        "dsa_mtp_correction_allocation_cursor",
-        "dsa_order_token",
-    ],
-    fake_impl=step5_dsa_attention_with_output_fake,
-)
 
 
 STEP5_PACKED_MODULES_MAPPING = {
@@ -859,10 +684,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Both halves are column slices, so fused-kernel consumers see a dim-0
-        # stride wider than the slice. That is supported: those kernels compile
-        # dim-0 stride as a symbolic value, dim 1 stays contiguous, and the base
-        # pointer alignment is inferred from the tensor rather than assumed.
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             combined = linear_batch_invariant(hidden_states, self.weight)
         else:
@@ -1009,7 +830,7 @@ class Step5MLP(nn.Module):
         )
         if swiglu_limit not in (None, 0):
             self.limit = swiglu_limit
-            self.act_fn = SwigluStepAndMul(limit=self.limit, compile_native=True)
+            self.act_fn = SwigluStepAndMul(limit=self.limit)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(hidden_states)
@@ -1022,16 +843,6 @@ def _step5_moe_reduce_policy(tp_size: int, dp_size: int) -> tuple[bool, bool]:
     """Return combined-reduce and per-path-reduce settings for Step5 MoE."""
     fuse_all_reduce = tp_size > 1 and dp_size == 1
     return fuse_all_reduce, not fuse_all_reduce
-
-
-def _can_use_step5_fused_qknorm(use_rope: bool) -> bool:
-    """Return whether the CUDA-only fused QKNorm and RoPE path is available."""
-    return use_rope and current_platform.is_cuda()
-
-
-def _use_step5_qknorm_cache_fusion(enabled: bool, num_tokens: int) -> bool:
-    """Prefer the native cache-writing fusion for decode-sized batches."""
-    return enabled and num_tokens <= _STEP5_QKNORM_CACHE_FUSION_MAX_TOKENS
 
 
 class Step5Attention(nn.Module):
@@ -1172,28 +983,36 @@ class Step5Attention(nn.Module):
         self.rope_theta = rope_theta
 
         # Q/K/V and the per-head attention gate consume the same normalized
-        # hidden states.  When explicitly enabled, pack them into one
+        # hidden states. Pack them into one
         # column-parallel GEMM if KV heads are partitioned (rather than
         # replicated) across TP ranks.  The local output layout is
         # [Q, K, V, gate].
+        weight_block_size = getattr(quant_config, "weight_block_size", None)
+        qkvg_widths = (self.q_size, self.kv_size, self.kv_size, self.num_heads)
         self.fuse_qkv_gate = (
-            envs.VLLM_STEP5_ENABLE_QKVG_PROJ
-            and use_head_wise_attn_gate
+            use_head_wise_attn_gate
             and self.total_num_kv_heads >= tp_size
+            and (
+                weight_block_size is None
+                or all(width % weight_block_size[0] == 0 for width in qkvg_widths)
+            )
         )
         self.sparse_config = sparse_config
         self.use_dsa_backend = sparse_config is not None and sliding_window is None
         attn_backend: type[AttentionBackend] | None
         self.sparse_summary_cache: Any = None
         if self.use_dsa_backend:
+            from .sparse_attention import Step5DSAAttentionBackend
+
             if vllm_config is None:
                 raise ValueError("Step5 DSA requires a complete VllmConfig.")
             _verify_step5_dsa_kv_transfer_compatibility(vllm_config)
-            if not current_platform.is_device_capability((9, 0)):
+            capability = current_platform.get_device_capability()
+            if capability is None or not (
+                Step5DSAAttentionBackend.supports_compute_capability(capability)
+            ):
                 raise NotImplementedError(
-                    "Step5 DSA currently requires an NVIDIA Hopper GPU with "
-                    "compute capability 9.0; got "
-                    f"{current_platform.get_device_capability()}."
+                    f"Step5 DSA requires B300 SM103; got {capability}."
                 )
             if self.num_kv_heads != 1:
                 raise ValueError(
@@ -1322,9 +1141,6 @@ class Step5Attention(nn.Module):
             head_size=self.head_dim,
             max_position=max_position,
             rope_parameters=rope_parameters,
-            # This path passes the cache directly to the fused kernel instead of calling
-            # RotaryEmbedding.forward(), so it must request the activation
-            # dtype up front rather than relying on the forward-time cast.
             dtype=self.params_dtype,
         )
 
@@ -1367,8 +1183,6 @@ class Step5Attention(nn.Module):
         # Non-DSA layers use the same KV layout as DSA layers because vLLM
         # shares one raw allocation across KV cache groups.
         if self.use_dsa_backend:
-            from .sparse_attention import Step5DSAAttentionBackend
-
             attn_backend = Step5DSAAttentionBackend
         elif model_has_dsa_layers:
             from .sparse_attention import Step5SplitKVFlashAttentionBackend
@@ -1441,11 +1255,9 @@ class Step5Attention(nn.Module):
                 eps=rms_norm_eps,
             )
             self.attn.kv_cache_requires_zeroing = True
-            typing.cast(Any, self.attn.impl).summary_cache_num_proxy_kv_heads = 1
             self.sparse_summary_cache = Step5SparseSummaryCacheLayer(
                 prefix=f"{prefix}.attn.sparse_summary_cache",
                 target_impl=self.attn.impl,
-                sparse_config=sparse_config,
                 main_layer_name=f"{prefix}.attn",
                 static_forward_context=(
                     typing.cast(
@@ -1466,36 +1278,11 @@ class Step5Attention(nn.Module):
             else None
         )
 
-        self.rotary_cache = self.rotary_emb.cos_sin_cache
-        self.rope_cos, self.rope_sin = self.rotary_cache.chunk(2, dim=-1)
-        self.use_step5_fused_qknorm = _can_use_step5_fused_qknorm(self.use_rope)
-        self.use_step5_fused_qknorm_cache = (
-            self.use_rope
-            and envs.VLLM_STEP_CC_LEVEL >= 1
-            and current_platform.is_cuda()
-            # STEP5_FLASH_ATTN is FlashAttention on the split KV layout, so the
-            # fused cache kernel applies to it as well.
-            and self.attn.attn_backend.get_name() in ("FLASH_ATTN", "STEP5_FLASH_ATTN")
-            and not self.attn.attn_backend.forward_includes_kv_cache_update
-            and self.attn.kv_sharing_target_layer_name is None
-            and self.attn.attn_type == AttentionType.DECODER
-            and self.attn.head_size_v == self.head_dim
-            and self.attn.kv_cache_torch_dtype == self.attn.dtype
-            and self.head_dim in (64, 128, 192, 256)
-            and is_supported_step5_qknorm_cache_rotary(
-                self.head_dim,
-                self.rotary_dim // 2,
-            )
-        )
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        reduce_scatter_output: bool = False,
     ) -> torch.Tensor:
-        # kv_cache_dummy_dep preserves ordering when the fused QKNorm path
-        # writes KV before attention executes.
         if self.use_dsa_backend:
             qkv, qkzg = self.qkv_indexer_proj(hidden_states)
             extra_dims = None
@@ -1504,10 +1291,6 @@ class Step5Attention(nn.Module):
             qkv, extra_dims = qkvg.split(
                 [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
             )
-            # The fused projection may have a padded physical row stride.
-            # Materialize both views before they cross compilation boundaries:
-            # The fused QKNorm path requires contiguous QKV rows, and the gate must
-            # not retain a logical stride that differs from the GEMM output.
             qkv = qkv.contiguous()
             extra_dims = extra_dims.contiguous()
         else:
@@ -1515,76 +1298,26 @@ class Step5Attention(nn.Module):
             qkzg = None
             extra_dims = None
 
-        kv_cache_dummy_dep = None
-        # The native cache-writing kernel is optimized for decode-sized batches.
-        # Large prefills are faster with CuTeDSL QKNorm and the backend cache update.
-        if _use_step5_qknorm_cache_fusion(
-            self.use_step5_fused_qknorm_cache, qkv.shape[0]
-        ):
-            eps = self.q_norm.variance_epsilon
-            q, k, v, kv_cache_dummy_dep = fused_qknorm_rope_cache_forward_impl(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rope_cos,
-                self.rope_sin,
-                positions,
-                self.head_dim,
-                self.num_heads,
-                self.num_kv_heads,
-                self.rotary_dim // 2,
-                self.attn.layer_name,
-                eps,
-                norm_weight_bias=1.0 if self.zero_centered else 0.0,
-            )
-        elif self.use_step5_fused_qknorm:
-            eps = self.q_norm.variance_epsilon
-            q, k, v = fused_qknorm_rope_forward_impl(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rope_cos,
-                self.rope_sin,
-                positions,
-                self.head_dim,
-                self.num_heads,
-                self.num_kv_heads,
-                self.rotary_dim // 2,
-                eps,
-                norm_weight_bias=1.0 if self.zero_centered else 0.0,
-            )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Add qk-norm inline similar to Qwen3 MOE attention
-            q_by_head = q.view(
-                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
-            )
-            q_by_head = self.q_norm(q_by_head.contiguous())
-            q = q_by_head.view(q.shape)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Add qk-norm inline similar to Qwen3 MOE attention
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        q_by_head = self.q_norm(q_by_head.contiguous())
+        q = q_by_head.view(q.shape)
 
-            k_by_head = k.view(
-                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
-            )
-            k_by_head = self.k_norm(k_by_head.contiguous())
-            k = k_by_head.view(k.shape)
-            if self.use_rope:
-                q, k = self.rotary_emb(positions, q, k)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        k_by_head = self.k_norm(k_by_head.contiguous())
+        k = k_by_head.view(k.shape)
+        if self.use_rope:
+            q, k = self.rotary_emb(positions, q, k)
 
         if self.sparse_attn is not None:
             attn_output, extra_dims = self.sparse_attn.forward(
                 positions, hidden_states, q, k, v, qkzg=qkzg
             )
         else:
-            attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
+            attn_output = self.attn(q, k, v)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
-
-        if extra_dims is not None:
-            # Inductor can miscompile the fused head-wise gate -> o_proj path
-            # for Step5 sparse models. Use an opaque materialization op so
-            # the broadcasted gate multiply consumes stable BF16 buffers.
-            attn_output = torch.ops.vllm.step5_materialize_gate_input(attn_output)
-            extra_dims = torch.ops.vllm.step5_materialize_gate_input(extra_dims)
 
         if self.use_head_wise_attn_gate:
             assert extra_dims is not None
@@ -1593,12 +1326,7 @@ class Step5Attention(nn.Module):
                 * extra_dims.unsqueeze(-1).sigmoid()
             )
             attn_output = output.view(*attn_output.shape)
-        if reduce_scatter_output:
-            output, _ = self.o_proj(
-                attn_output, reduce_scatter_results=True, reduce_scatter_dim=0
-            )
-        else:
-            output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -1612,30 +1340,6 @@ class Step5SparseAttention:
         self.sparse_config = sparse_config
         self.sparse_rotary_emb = self._build_sparse_rotary_emb()
         owner.add_module("sparse_indexer_rotary_emb", self.sparse_rotary_emb)
-        # cos/sin for the fused indexer norm+RoPE kernel are precomputed here
-        # (outside forward) so the chunk/contiguous is not re-traced into the
-        # compiled decode graph every step — mirroring how main attention builds
-        # self.rope_cos/self.rope_sin in __init__.
-        self._fused_indexer_ok: bool | None = None
-        cos, sin = self.sparse_rotary_emb.cos_sin_cache.chunk(2, dim=-1)
-        weight_dtype = owner.params_dtype
-        self._sparse_rope_cos = cos.to(weight_dtype).contiguous()
-        self._sparse_rope_sin = sin.to(weight_dtype).contiguous()
-
-    def _get_dsa_order_token(self, device: torch.device) -> torch.Tensor | None:
-        """Return the backend-owned ordering token when available.
-
-        The model wrapper owns the DSA projection path, while the actual
-        summary/CSA implementation (``attn.impl``) owns the shared scratch
-        workspace.  Keep the lookup at this seam so eager and compiled paths
-        use the same per-virtual-engine token without assuming every test
-        backend provides Step5 scratch state.
-        """
-        impl = getattr(self.owner.attn, "impl", None)
-        getter = getattr(impl, "_get_dsa_order_token", None)
-        if getter is None:
-            return None
-        return getter(device)
 
     def forward(
         self,
@@ -1672,8 +1376,6 @@ class Step5SparseAttention:
         dsa_proxy_z: torch.Tensor,
     ) -> torch.Tensor:
         attn = self.owner.attn
-        if attn.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(query, key, value, attn.layer_name)
         hidden_size = attn.num_heads * attn.head_size_v
         output = torch.empty(
             (query.shape[0], hidden_size),
@@ -1686,165 +1388,23 @@ class Step5SparseAttention:
         key = key.view(-1, attn.num_kv_heads, attn.head_size)
         value = value.view(-1, attn.num_kv_heads, attn.head_size_v)
 
-        kv_cache_dummy_dep = None
-        (
-            dsa_summary_cache_sum,
-            dsa_summary_cache_count,
-            dsa_summary_cache_mean,
-            dsa_csa_active_region_ids,
-            dsa_csa_active_slot_by_region,
-            dsa_csa_numerator,
-            dsa_csa_denominator,
-            dsa_csa_max,
-            dsa_csa_active_token_k,
-            dsa_csa_active_token_z,
-            dsa_csa_active_token_valid,
-            dsa_mtp_source_to_transaction,
-            dsa_mtp_row_source,
-            dsa_mtp_row_regions,
-            dsa_mtp_row_positions,
-            dsa_mtp_row_owner_block,
-            dsa_mtp_row_owner_block_index,
-            dsa_mtp_correction_action,
-            dsa_mtp_state_numerator,
-            dsa_mtp_state_denominator,
-            dsa_mtp_state_max_logits,
-            dsa_mtp_state_pre_numerator,
-            dsa_mtp_state_pre_denominator,
-            dsa_mtp_state_pre_max_logits,
-            dsa_mtp_correction_free_slots,
-            dsa_mtp_correction_free_count,
-            dsa_mtp_correction_allocation_cursor,
-            dsa_order_token,
-        ) = self._dsa_summary_cache_side_effect_tensors()
-        dsa_side_effect_tensors = (
-            dsa_summary_cache_mean,
-            dsa_csa_active_token_k,
-            dsa_csa_active_token_z,
-            dsa_csa_active_token_valid,
-            dsa_mtp_source_to_transaction,
-            dsa_mtp_row_source,
-            dsa_mtp_row_regions,
-            dsa_mtp_row_positions,
-            dsa_mtp_row_owner_block,
-            dsa_mtp_row_owner_block_index,
-            dsa_mtp_correction_action,
-            dsa_mtp_state_numerator,
-            dsa_mtp_state_denominator,
-            dsa_mtp_state_max_logits,
-            dsa_mtp_state_pre_numerator,
-            dsa_mtp_state_pre_denominator,
-            dsa_mtp_state_pre_max_logits,
-            dsa_mtp_correction_free_slots,
-            dsa_mtp_correction_free_count,
-            dsa_mtp_correction_allocation_cursor,
-            dsa_order_token,
+        if (
+            not attn.attn_backend.forward_includes_kv_cache_update
+            and attn.kv_sharing_target_layer_name is None
+        ):
+            unified_kv_cache_update(key, value, attn.layer_name)
+        step5_dsa_attention_with_output(
+            query,
+            key,
+            value,
+            output,
+            attn.layer_name,
+            dsa_proxy_query,
+            dsa_proxy_key,
+            dsa_proxy_weights,
+            dsa_proxy_z,
         )
-        if attn.use_direct_call:
-            if (
-                not attn.attn_backend.forward_includes_kv_cache_update
-                and attn.kv_sharing_target_layer_name is None
-            ):
-                kv_cache_dummy_dep = unified_kv_cache_update(
-                    key, value, attn.layer_name
-                )
-            step5_dsa_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                attn.layer_name,
-                dsa_proxy_query,
-                dsa_proxy_key,
-                dsa_proxy_weights,
-                dsa_proxy_z,
-                dsa_summary_cache_sum,
-                dsa_summary_cache_count,
-                dsa_csa_active_region_ids,
-                dsa_csa_active_slot_by_region,
-                dsa_csa_numerator,
-                dsa_csa_denominator,
-                dsa_csa_max,
-                kv_cache_dummy_dep,
-                *dsa_side_effect_tensors,
-            )
-        else:
-            if (
-                not attn.attn_backend.forward_includes_kv_cache_update
-                and attn.kv_sharing_target_layer_name is None
-            ):
-                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
-                    key, value, attn.layer_name
-                )
-            torch.ops.vllm.step5_dsa_attention_with_output(
-                query,
-                key,
-                value,
-                output,
-                attn.layer_name,
-                dsa_proxy_query,
-                dsa_proxy_key,
-                dsa_proxy_weights,
-                dsa_proxy_z,
-                dsa_summary_cache_sum,
-                dsa_summary_cache_count,
-                dsa_csa_active_region_ids,
-                dsa_csa_active_slot_by_region,
-                dsa_csa_numerator,
-                dsa_csa_denominator,
-                dsa_csa_max,
-                kv_cache_dummy_dep,
-                *dsa_side_effect_tensors,
-            )
         return output.view(-1, hidden_size)
-
-    def _dsa_summary_cache_side_effect_tensors(
-        self,
-    ) -> tuple[
-        torch.Tensor | None,
-        ...,
-    ]:
-        summary_cache = getattr(self.owner.attn.impl, "_summary_cache", None)
-        if summary_cache is None:
-            return (None,) * 28
-        (
-            csa_active_region_ids,
-            csa_active_slot_by_region,
-            csa_numerator,
-            csa_denominator,
-            csa_max,
-        ) = typing.cast(Any, self.owner.attn.impl)._csa_summary_state(summary_cache)
-        transaction = getattr(summary_cache, "_step5_mtp_transaction", None)
-        return (
-            summary_cache.sum_cache,
-            summary_cache.count_cache,
-            summary_cache.mean_cache,
-            csa_active_region_ids,
-            csa_active_slot_by_region,
-            csa_numerator,
-            csa_denominator,
-            csa_max,
-            getattr(summary_cache, "_step5_csa_active_token_k", None),
-            getattr(summary_cache, "_step5_csa_active_token_z", None),
-            getattr(summary_cache, "_step5_csa_active_token_valid", None),
-            getattr(transaction, "source_to_transaction", None),
-            getattr(transaction, "row_source", None),
-            getattr(transaction, "row_regions", None),
-            getattr(transaction, "row_positions", None),
-            getattr(transaction, "row_owner_block", None),
-            getattr(transaction, "row_owner_block_index", None),
-            getattr(transaction, "correction_action", None),
-            getattr(transaction, "state_numerator", None),
-            getattr(transaction, "state_denominator", None),
-            getattr(transaction, "state_max_logits", None),
-            getattr(transaction, "state_pre_numerator", None),
-            getattr(transaction, "state_pre_denominator", None),
-            getattr(transaction, "state_pre_max_logits", None),
-            getattr(transaction, "correction_free_slots", None),
-            getattr(transaction, "correction_free_count", None),
-            getattr(transaction, "correction_allocation_cursor", None),
-            self._get_dsa_order_token(summary_cache.sum_cache.device),
-        )
 
     def _sparse_indexer_rope_parameters(
         self,
@@ -1889,67 +1449,6 @@ class Step5SparseAttention:
         k = typing.cast(torch.Tensor, k)
         return q.reshape(q_shape), k.reshape(k_shape)
 
-    def _resolve_fused_indexer_support(self, proxy_dim: int) -> bool:
-        """Resolve (once) whether the fused indexer norm+RoPE kernel applies.
-
-        The kernel does per-head RMSNorm(q) + LayerNorm(k) + NeoX partial RoPE
-        in a single launch, matching the eager sparse_indexer_q_norm (RMSNorm),
-        sparse_indexer_k_norm (LayerNorm) and _apply_sparse_indexer_rope path.
-        """
-        cached = self._fused_indexer_ok
-        if cached is not None:
-            return cached
-        if not envs.VLLM_STEP5_FUSE_INDEXER_NORM:
-            # A/B switch: force the eager indexer norm+RoPE path.
-            self._fused_indexer_ok = False
-            return False
-        rope_dim = int(self.sparse_config.sparse_indexer_rope_dim)
-        interleaved = getattr(self.sparse_rotary_emb, "is_neox_style", True) is False
-        ok = (
-            not interleaved
-            and rope_dim > 0
-            and rope_dim % 8 == 0
-            and rope_dim <= proxy_dim
-            and proxy_dim % 8 == 0
-        )
-        self._fused_indexer_ok = ok
-        return ok
-
-    def _try_fused_indexer_norm_rope(
-        self,
-        positions: torch.Tensor,
-        index_q: torch.Tensor,
-        index_k: torch.Tensor,
-        index_z: torch.Tensor,
-        proxy_dim: int,
-        num_q_heads: int,
-        num_k_heads: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        # z is a pure passthrough (no norm/rope); q/k/z are strided column-slices
-        # of the fused qkv+indexer GEMM output.
-        if not self._resolve_fused_indexer_support(proxy_dim):
-            return None
-        q_norm = self.owner.sparse_indexer_q_norm
-        k_norm = self.owner.sparse_indexer_k_norm
-        rope_dim = int(self.sparse_config.sparse_indexer_rope_dim)
-        return fused_indexer_norm_rope_forward_impl(
-            index_q,
-            index_k,
-            index_z,
-            q_norm.weight,
-            k_norm.weight,
-            k_norm.bias,
-            self._sparse_rope_cos,
-            self._sparse_rope_sin,
-            positions.reshape(-1),
-            proxy_dim,
-            num_q_heads,
-            num_k_heads,
-            rope_dim // 2,
-            float(q_norm.variance_epsilon),
-            1.0 if getattr(q_norm, "zero_centered", False) else 0.0,
-        )
-
     def _project_sparse_indexer(
         self,
         positions: torch.Tensor,
@@ -1976,32 +1475,17 @@ class Step5SparseAttention:
         num_local_kv_heads = int(self.owner.num_kv_heads)
         q_heads_per_kv = num_q_heads // num_local_kv_heads
 
-        fused = self._try_fused_indexer_norm_rope(
-            positions, index_q, index_k, index_z, proxy_dim, num_q_heads, num_k_heads
-        )
-        if fused is not None:
-            # z is a contiguous passthrough emitted by the kernel; q/k are
-            # normed+roped. This avoids the eager split/contiguous + rope ops.
-            index_q, index_k, index_z = fused
-            index_q = index_q.view(
-                num_tokens, num_local_kv_heads, q_heads_per_kv, proxy_dim
-            )
-            index_k = index_k.view(num_tokens, num_k_heads, proxy_dim)
-            index_z = index_z.view(num_tokens, num_k_heads, proxy_dim)
-        else:
-            index_k = self.owner.sparse_indexer_k_norm(index_k.contiguous())
-            index_q = index_q.view(
-                num_tokens,
-                num_local_kv_heads,
-                q_heads_per_kv,
-                proxy_dim,
-            ).contiguous()
-            index_q = self.owner.sparse_indexer_q_norm(index_q)
-            index_k = index_k.view(num_tokens, num_k_heads, proxy_dim).contiguous()
-            index_q, index_k = self._apply_sparse_indexer_rope(
-                positions, index_q, index_k
-            )
-            index_z = index_z.view(num_tokens, num_k_heads, proxy_dim).contiguous()
+        index_k = self.owner.sparse_indexer_k_norm(index_k.contiguous())
+        index_q = index_q.view(
+            num_tokens,
+            num_local_kv_heads,
+            q_heads_per_kv,
+            proxy_dim,
+        ).contiguous()
+        index_q = self.owner.sparse_indexer_q_norm(index_q)
+        index_k = index_k.view(num_tokens, num_k_heads, proxy_dim).contiguous()
+        index_q, index_k = self._apply_sparse_indexer_rope(positions, index_q, index_k)
+        index_z = index_z.view(num_tokens, num_k_heads, proxy_dim).contiguous()
 
         weights = weights.view(
             num_tokens,
@@ -2152,29 +1636,19 @@ class Step5MoE(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        input_is_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Sequence-parallel state is carried by the runner's FusedMoEConfig.
-        if (
-            self.experts.moe_config.is_sequence_parallel
-            and not input_is_sequence_parallel
-        ):
+        if self.experts.moe_config.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         shared_output = self.share_expert(hidden_states)
 
-        if self.experts.is_internal_router:
-            routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=hidden_states
-            )
-        else:
-            # TODO(bnell): this gate could be moved into the MoERunner?
-            router_logits, _ = self.gate(hidden_states)
-            routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=router_logits
-            )
+        router_logits, _ = self.gate(hidden_states)
+        routed_output = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
 
         # Kept separate so _forward_ffn can combine in fp32 and all-reduce after.
         return shared_output, routed_output
@@ -2326,14 +1800,6 @@ class Step5DecoderLayer(nn.Module):
             dtype=norm_dtype,
         )
         self.prefix = prefix
-        self.use_attention_o_proj_reduce_scatter = (
-            envs.VLLM_STEP5_O_PROJ_REDUCE_SCATTER
-            and self.use_moe
-            and self.moe.experts.moe_config.is_sequence_parallel
-            and self.tp_group.world_size > 1
-        )
-        if self.use_attention_o_proj_reduce_scatter:
-            logger.warning_once("Enable Step5 attention o_proj reduce-scatter path.")
 
     def add_and_maybe_inplace_all_reduce(
         self, in1: torch.Tensor, in2: torch.Tensor
@@ -2356,25 +1822,10 @@ class Step5DecoderLayer(nn.Module):
     def _forward_ffn(
         self,
         hidden_states: torch.Tensor,
-        input_is_sequence_parallel: bool = False,
-        residual: torch.Tensor | None = None,
-        orig_num_tokens: int | None = None,
     ) -> torch.Tensor:
         if self.use_moe:
-            shared_output, moe_output = self.moe(
-                hidden_states, input_is_sequence_parallel=input_is_sequence_parallel
-            )
+            shared_output, moe_output = self.moe(hidden_states)
             if self.moe.experts.moe_config.is_sequence_parallel:
-                if input_is_sequence_parallel:
-                    assert residual is not None
-                    assert orig_num_tokens is not None
-                    ffn_output = self._cast_for_residual(
-                        moe_output
-                    ) + self._cast_for_residual(shared_output)
-                    hidden_states = tensor_model_parallel_all_gather(
-                        ffn_output + residual, dim=0
-                    )
-                    return hidden_states[:orig_num_tokens]
                 ffn_output = tensor_model_parallel_all_gather(
                     self._cast_for_residual(moe_output)
                     + self._cast_for_residual(shared_output),
@@ -2404,10 +1855,6 @@ class Step5DecoderLayer(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        use_attention_o_proj_reduce_scatter = (
-            self.use_attention_o_proj_reduce_scatter and hidden_states.dim() == 2
-        )
-        orig_num_tokens = hidden_states.shape[0]
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
@@ -2415,32 +1862,19 @@ class Step5DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            reduce_scatter_output=use_attention_o_proj_reduce_scatter,
         )
         hidden_states = self._cast_for_residual(hidden_states)
-        if use_attention_o_proj_reduce_scatter:
-            residual = sequence_parallel_chunk(residual)
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
 
-        ffn_output = self._forward_ffn(
-            hidden_states,
-            input_is_sequence_parallel=use_attention_o_proj_reduce_scatter,
-            residual=residual if use_attention_o_proj_reduce_scatter else None,
-            orig_num_tokens=(
-                orig_num_tokens if use_attention_o_proj_reduce_scatter else None
-            ),
-        )
-        if use_attention_o_proj_reduce_scatter:
-            return ffn_output
+        ffn_output = self._forward_ffn(hidden_states)
         ffn_output = self._cast_for_residual(ffn_output)
         hidden_states = ffn_output + residual
         return hidden_states
 
 
-@support_torch_compile
 class Step5Model(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
