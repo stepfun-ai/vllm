@@ -31,6 +31,7 @@ def _step5_rms_norm(
     weight: torch.Tensor,
     variance_epsilon: float,
     zero_centered: bool,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     compute = x.float()
     variance = compute.pow(2).mean(dim=-1, keepdim=True)
@@ -38,7 +39,7 @@ def _step5_rms_norm(
     scale = weight.float()
     if zero_centered:
         scale = scale + 1.0
-    return (compute * scale).to(x.dtype)
+    return (compute * scale).to(out_dtype or x.dtype)
 
 
 def apply_step5_rms_norm(
@@ -47,16 +48,33 @@ def apply_step5_rms_norm(
     variance_epsilon: float,
     out: torch.Tensor | None = None,
     zero_centered: bool = False,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    result = _step5_rms_norm(x, weight, variance_epsilon, zero_centered)
+    out_dtype = out_dtype or x.dtype
+    if out is not None and (out.shape != x.shape or out.dtype != out_dtype):
+        raise ValueError("Step5 RMSNorm output buffer must match shape and dtype")
+    if x.is_cuda:
+        from .ops.rms_norm import rms_norm, supports_rms_norm
+
+        if supports_rms_norm(x, weight) and (
+            out is None
+            or (
+                out.device == x.device
+                and out.is_contiguous()
+                and out.data_ptr() % 16 == 0
+            )
+        ):
+            return rms_norm(
+                x,
+                weight,
+                variance_epsilon,
+                out_dtype=out_dtype,
+                weight_bias=float(zero_centered),
+                out=out,
+            )
+    result = _step5_rms_norm(x, weight, variance_epsilon, zero_centered, out_dtype)
     if out is None:
         return result
-    if out.shape != result.shape or out.dtype != result.dtype:
-        raise ValueError(
-            "Step5 RMSNorm output buffer must match the computed output "
-            f"shape/dtype, got out={tuple(out.shape)}/{out.dtype}, "
-            f"result={tuple(result.shape)}/{result.dtype}."
-        )
     out.copy_(result)
     return out
 
@@ -67,19 +85,31 @@ def apply_step5_add_rms_norm(
     weight: torch.Tensor,
     variance_epsilon: float,
     zero_centered: bool = False,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_dtype = x.dtype
+    out_dtype = out_dtype or x.dtype
+    if x.is_cuda:
+        from .ops.rms_norm import rms_norm, supports_rms_norm
+
+        if supports_rms_norm(x, weight, residual):
+            output = rms_norm(
+                x,
+                weight,
+                variance_epsilon,
+                out_dtype=out_dtype,
+                weight_bias=float(zero_centered),
+                residual=residual,
+            )
+            return output, residual
+
     residual_out = (
         (x.float() + residual.float()).to(residual.dtype)
-        if orig_dtype == torch.float16
+        if x.dtype == torch.float16
         else x + residual
     )
     output = _step5_rms_norm(
-        residual_out,
-        weight,
-        variance_epsilon,
-        zero_centered,
-    ).to(orig_dtype)
+        residual_out, weight, variance_epsilon, zero_centered, out_dtype
+    )
     return output, residual_out
 
 
@@ -102,6 +132,8 @@ class Step5RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
         fp16_out: bool = False,
+        *,
+        out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
             if output is not None or fp16_out:
@@ -114,6 +146,7 @@ class Step5RMSNorm(nn.Module):
                 self.weight,
                 self.variance_epsilon,
                 zero_centered=self.zero_centered,
+                out_dtype=out_dtype,
             )
 
         if fp16_out:
@@ -124,6 +157,7 @@ class Step5RMSNorm(nn.Module):
             self.variance_epsilon,
             out=output,
             zero_centered=self.zero_centered,
+            out_dtype=out_dtype,
         )
 
 

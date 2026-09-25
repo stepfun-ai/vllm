@@ -84,35 +84,48 @@ def mrv2_metadata(default_vllm_config):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
     reason="B300 integration",
 )
-@pytest.mark.parametrize("n,topk", [(41, 2), (4105, 512)])
-def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk, mrv2_metadata):
+@pytest.mark.parametrize("n,topk", [(41, 2), (97, 512), (4105, 512)])
+@pytest.mark.parametrize("groups,heads_per_group", [(1, 8), (2, 16), (4, 16)])
+def test_dsa_chunked_prefill_and_decode_match_causal_reference(
+    n, topk, groups, heads_per_group, mrv2_metadata, workspace_init
+):
     torch.manual_seed(7)
     device = torch.device("cuda")
-    dim, heads = 192, 8
+    dim, heads = 192, groups * heads_per_group
     q = torch.randn(n, heads, dim, device=device, dtype=torch.bfloat16)
-    k = torch.randn(n, 1, dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(n, groups, dim, device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    iq = torch.randn(n, 1, 4, 256, device=device, dtype=torch.bfloat16)
+    iq = torch.randn(n, groups, 4, 256, device=device, dtype=torch.bfloat16)
     ik = torch.randn(n, 1, 256, device=device, dtype=torch.bfloat16)
     z = torch.randn_like(ik)
-    weights = torch.randn(n, 1, 4, device=device)
+    weights = torch.randn(n, groups, 4, device=device)
     pages = (n + 15) // 16
     table = torch.randperm(pages, device=device).int().unsqueeze(0)
     physical = table[0, torch.arange(n, device=device) // 16].long()
     offsets = torch.arange(n, device=device) % 16
     slots = physical * 16 + offsets
-    kv = torch.zeros(pages, 1, 16, 2 * dim, device=device, dtype=q.dtype)
-    kv[physical, 0, offsets, :dim] = k[:, 0]
-    kv[physical, 0, offsets, dim:] = v[:, 0]
+    kv = torch.zeros(
+        pages, 16, groups, 2 * dim, device=device, dtype=q.dtype
+    ).transpose(1, 2)
+    kv[physical, :, offsets, :dim] = k
+    kv[physical, :, offsets, dim:] = v
     impl = object.__new__(Step5DSAAttentionImpl)
     impl.adapter = Step5FlashInferSparse(device)
     impl.sparse_topk = topk
     impl.max_num_regions = (n + 7) // 8
     impl.scale = dim**-0.5
 
-    def run(chunks):
+    def run(chunks, group=None):
+        group_slice = slice(None) if group is None else slice(group, group + 1)
+        head_slice = (
+            slice(None)
+            if group is None
+            else slice(group * heads_per_group, (group + 1) * heads_per_group)
+        )
+        run_q = q[:, head_slice].contiguous()
+        run_kv = kv if group is None else kv[:, group_slice].contiguous()
         impl.summary_cache = Step5SparseSummaryCache(pages, 16, device)
-        out = torch.empty_like(q)
+        out = torch.full_like(run_q, float("nan"))
         start = 0
         for count in chunks:
             end = start + count
@@ -127,15 +140,15 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk, mrv2_met
             )
             impl.forward(
                 None,
-                q[start:end],
-                k[start:end],
-                v[start:end],
-                kv,
+                run_q[start:end],
+                k[start:end, group_slice],
+                v[start:end, group_slice],
+                run_kv,
                 metadata,
                 output=out[start:end],
-                dsa_proxy_query=iq[start:end],
+                dsa_proxy_query=iq[start:end, group_slice],
                 dsa_proxy_key=ik[start:end],
-                dsa_proxy_weights=weights[start:end],
+                dsa_proxy_weights=weights[start:end, group_slice],
                 dsa_proxy_z=z[start:end],
             )
             start = end
@@ -144,16 +157,31 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk, mrv2_met
     full = run([n])
     incremental = run([13, n - 27] + [1] * 14)
     torch.testing.assert_close(full, incremental, rtol=0.015, atol=0.003)
+    if groups > 1:
+        for group in range(groups):
+            independent = run([n], group=group)
+            torch.testing.assert_close(
+                full[:, group * heads_per_group : (group + 1) * heads_per_group],
+                independent,
+                rtol=0,
+                atol=0,
+            )
     # Before top-k truncates history, the adapter must equal dense causal GQA.
-    score = torch.einsum("qhd,kd->hqk", q[:24].float(), k[:24, 0].float()) / math.sqrt(
-        dim
-    )
+    score = torch.einsum(
+        "qhd,khd->hqk",
+        q[:24].float(),
+        k[:24].repeat_interleave(heads_per_group, dim=1).float(),
+    ) / math.sqrt(dim)
     mask = (
         torch.arange(24, device=device)[None, :]
         > torch.arange(24, device=device)[:, None]
     )
     score.masked_fill_(mask, float("-inf"))
-    expected = torch.einsum("hqk,kd->qhd", score.softmax(-1), v[:24, 0].float())
+    expected = torch.einsum(
+        "hqk,khd->qhd",
+        score.softmax(-1),
+        v[:24].repeat_interleave(heads_per_group, dim=1).float(),
+    )
     torch.testing.assert_close(full[:24].float(), expected, rtol=0.025, atol=0.004)
 
 
@@ -162,20 +190,26 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(n, topk, mrv2_met
     reason="B300 integration",
 )
 @pytest.mark.parametrize("n,topk", [(43, 2), (4107, 512)])
-def test_full_decode_graph_replay_matches_eager_with_padding(n, topk, mrv2_metadata):
+@pytest.mark.parametrize("output_padding", [0, 2])
+@pytest.mark.parametrize("groups", [1, 4])
+def test_full_decode_graph_replay_matches_eager_with_padding(
+    n, topk, output_padding, groups, mrv2_metadata, workspace_init
+):
     """Replay updates CSA across regions/pages and selects fresh KV each step."""
     torch.manual_seed(17)
     device = torch.device("cuda")
-    batch, dim, heads = 2, 192, 8
+    batch, dim, heads = 2, 192, 8 if groups == 1 else groups * 16
     per_request = (n + 15) // 16
     pages = batch * per_request
     table = torch.randperm(pages, device=device).reshape(batch, per_request).int()
     q = torch.randn(batch, n, heads, dim, device=device, dtype=torch.bfloat16)
-    iq = torch.randn(batch, n, 1, 4, 256, device=device, dtype=torch.bfloat16)
+    iq = torch.randn(batch, n, groups, 4, 256, device=device, dtype=torch.bfloat16)
     ik = torch.randn(batch, n, 1, 256, device=device, dtype=torch.bfloat16)
     z = torch.randn_like(ik)
-    weights = torch.randn(batch, n, 1, 4, device=device)
-    kv = torch.randn(pages, 1, 16, 2 * dim, device=device, dtype=q.dtype)
+    weights = torch.randn(batch, n, groups, 4, device=device)
+    kv = torch.randn(
+        pages, 16, groups, 2 * dim, device=device, dtype=q.dtype
+    ).transpose(1, 2)
     impl = object.__new__(Step5DSAAttentionImpl)
     impl.adapter = Step5FlashInferSparse(device)
     impl.sparse_topk = topk
@@ -190,7 +224,12 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk, mrv2_metad
         for state in (cache, reference):
             state.update(ik[req, :prefix], z[req, :prefix], slots)
     inputs = [t[:, 0].clone() for t in (q, iq, ik, weights, z)]
-    output = torch.empty_like(inputs[0])
+    output = torch.full(
+        (batch + output_padding, heads, dim),
+        float("nan"),
+        device=device,
+        dtype=inputs[0].dtype,
+    )
     metadata = mrv2_metadata(
         for_capture=True,
         num_actual_tokens=batch,
@@ -227,7 +266,7 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk, mrv2_metad
         forward()
     cursors = [prefix, prefix]
     for step in range(19):
-        active = [True, step >= 5]
+        active = [False, False] if step == 0 else [True, step >= 5]
         expected = torch.zeros_like(output)
         for req in range(batch):
             pos = cursors[req]
@@ -264,6 +303,7 @@ def test_full_decode_graph_replay_matches_eager_with_padding(n, topk, mrv2_metad
             )
             cursors[req] += 1
         impl.summary_cache = cache
+        output.fill_(float("nan"))
         graph.replay()
         torch.testing.assert_close(
             output,

@@ -463,7 +463,7 @@ def test_step5_dsa_rejects_kv_transfer_before_cache_binding():
         step5_model._verify_step5_dsa_kv_transfer_compatibility(vllm_config)
 
 
-@pytest.mark.parametrize("tp_size", [4, 8, 16])
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8, 16])
 def test_step5_dsa_parallel_geometry_accepts_supported_layout(tp_size):
     step5_model._validate_step5_dsa_parallel_geometry(
         total_num_heads=64,
@@ -474,27 +474,91 @@ def test_step5_dsa_parallel_geometry_accepts_supported_layout(tp_size):
     )
 
 
-@pytest.mark.parametrize(("tp_size", "local_groups"), [(1, 4), (2, 2)])
-def test_step5_dsa_parallel_geometry_rejects_multiple_local_groups(
-    tp_size,
-    local_groups,
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("fused_checkpoint", [False, True])
+def test_step5_provider_shards_preserve_complete_group_projections(
+    monkeypatch, default_vllm_config, tp_size, fused_checkpoint
 ):
-    with pytest.raises(
-        ValueError,
-        match=rf"exactly one local.*local_groups={local_groups}",
-    ):
-        step5_model._validate_step5_dsa_parallel_geometry(
-            total_num_heads=64,
-            total_num_kv_heads=4,
-            indexer_num_heads=16,
+    """TP1/2 retain all local groups; TP8/16 replicate complete index heads."""
+    torch.manual_seed(127)
+    widths = dict(
+        q=64 * 192,
+        k=4 * 192,
+        v=4 * 192,
+        index_q=16 * 256,
+        index_k=256,
+        index_z=256,
+        index_g=64,
+    )
+    weights = {name: torch.randn(width, 8) for name, width in widths.items()}
+    index_w = torch.randn(16, 8)
+    inputs = torch.randn(3, 8)
+    for rank in range(tp_size):
+        for module in (
+            "vllm.models.step5.nvidia.model",
+            "vllm.model_executor.layers.linear",
+            "vllm.model_executor.parameter",
+        ):
+            monkeypatch.setattr(
+                f"{module}.get_tensor_model_parallel_rank", lambda rank=rank: rank
+            )
+            monkeypatch.setattr(
+                f"{module}.get_tensor_model_parallel_world_size", lambda: tp_size
+            )
+        projection = step5_model.Step5FusedQKVIndexerLinear(
+            8,
+            192,
+            64,
+            4,
+            indexer_q_output_size=16 * 256,
+            indexer_kv_output_size=256,
+            gate_output_size=64,
+            proxy_dim=256,
             index_tp_size=4,
-            tp_size=tp_size,
+            params_dtype=torch.float32,
+        )
+        if fused_checkpoint:
+            projection.weight_loader_v2(
+                projection.weight, torch.cat(list(weights.values()))
+            )
+        else:
+            for name, weight in weights.items():
+                projection.weight_loader_v2(projection.weight, weight, name)
+        indexer = step5_model.Step5SparseIndexerIndexTPLinear(
+            8, 16, params_dtype=torch.float32, index_tp_size=4
+        )
+        indexer.weight_loader(indexer.weight, index_w)
+        group_start = rank * 4 // tp_size
+        groups = max(4 // tp_size, 1)
+        q_start, q_count = rank * 64 // tp_size, 64 // tp_size
+        selected = dict(
+            q=weights["q"][q_start * 192 : (q_start + q_count) * 192],
+            k=weights["k"][group_start * 192 : (group_start + groups) * 192],
+            v=weights["v"][group_start * 192 : (group_start + groups) * 192],
+            index_q=weights["index_q"][
+                group_start * 4 * 256 : (group_start + groups) * 4 * 256
+            ],
+            index_k=weights["index_k"],
+            index_z=weights["index_z"],
+            index_g=weights["index_g"][q_start : q_start + q_count],
+        )
+        expected_weight = torch.cat(list(selected.values()))
+        torch.testing.assert_close(projection.weight, expected_weight, rtol=0, atol=0)
+        expected_index_w = index_w[group_start * 4 : (group_start + groups) * 4]
+        torch.testing.assert_close(indexer.weight, expected_index_w, rtol=0, atol=0)
+        qkv, qkzg = projection(inputs)
+        actual = torch.cat((qkv, *projection.split_indexer(qkzg)), dim=-1)
+        torch.testing.assert_close(
+            actual, torch.nn.functional.linear(inputs, expected_weight)
+        )
+        torch.testing.assert_close(
+            indexer(inputs)[0], torch.nn.functional.linear(inputs, expected_index_w)
         )
 
 
 def test_step5_tp16_provider_replication_matches_main_kv_geometry():
     mappings = [
-        step5_model._step5_replicated_group_rank(
+        step5_model._step5_group_partition(
             total_groups=4,
             tp_size=16,
             tp_rank=rank,
@@ -503,10 +567,10 @@ def test_step5_tp16_provider_replication_matches_main_kv_geometry():
     ]
 
     assert mappings == [
-        *((0, 4),) * 4,
-        *((1, 4),) * 4,
-        *((2, 4),) * 4,
-        *((3, 4),) * 4,
+        *((0, 1, 4),) * 4,
+        *((1, 1, 4),) * 4,
+        *((2, 1, 4),) * 4,
+        *((3, 1, 4),) * 4,
     ]
 
 

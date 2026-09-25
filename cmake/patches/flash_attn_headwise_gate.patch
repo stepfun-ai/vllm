@@ -1,0 +1,332 @@
+diff --git a/csrc/flash_attn/flash_api.cpp b/csrc/flash_attn/flash_api.cpp
+index 60d29f2..7501136 100644
+--- a/csrc/flash_attn/flash_api.cpp
++++ b/csrc/flash_attn/flash_api.cpp
+@@ -582,7 +582,8 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
+                const bool return_softmax,
+                int64_t num_splits,
+                // Retained only for backwards-compat arg positioning; must be None.
+-               std::optional<Tensor> unused_generator_compat) {
++               std::optional<Tensor> unused_generator_compat,
++               std::optional<Tensor> headwise_gate) {
+ 
+     STD_TORCH_CHECK(!unused_generator_compat.has_value(),
+                     "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+@@ -743,6 +744,22 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
+                      seqlenq_ngroups_swapped,
+                      /*unpadded_lse*/true);
+     params.total_q = total_q;
++    if (headwise_gate.has_value()) {
++        const auto gate = headwise_gate.value();
++        STD_TORCH_CHECK(head_size == 192 && q_dtype == torch::headeronly::ScalarType::BFloat16
++                        && softcap == 0.0 && !alibi_slopes_.has_value(),
++                        "Headwise gate requires BF16, head dimension 192, no ALiBi or softcap");
++        STD_TORCH_CHECK(paged_KV && !seqlenq_ngroups_swapped && num_splits <= 1
++                        && max_seqlen_k > 0 && p_dropout == 0.f,
++                        "Headwise gate requires paged, non-swapped, non-split, nonempty attention");
++        STD_TORCH_CHECK(gate.is_cuda() && gate.get_device_index() == q.get_device_index()
++                        && gate.scalar_type() == q_dtype, "Gate dtype/device mismatch");
++        CHECK_SHAPE(gate, total_q, num_heads);
++        params.headwise_gate_ptr = gate.data_ptr();
++        params.gate_row_stride = gate.stride(0);
++        params.gate_head_stride = gate.stride(1);
++    }
++
+ 
+     if (paged_KV) {
+         params.block_table = block_table.mutable_data_ptr<int>();
+diff --git a/csrc/flash_attn/flash_api_torch_lib.cpp b/csrc/flash_attn/flash_api_torch_lib.cpp
+index fb3fb87..e86c1fc 100644
+--- a/csrc/flash_attn/flash_api_torch_lib.cpp
++++ b/csrc/flash_attn/flash_api_torch_lib.cpp
+@@ -41,7 +41,8 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
+                const bool return_softmax,
+                int64_t num_splits,
+                // Retained only for backwards-compat arg positioning; must be None.
+-               std::optional<Tensor> unused_generator_compat);
++               std::optional<Tensor> unused_generator_compat,
++               std::optional<Tensor> headwise_gate);
+ 
+ std::vector<Tensor>
+ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x head_size
+@@ -119,7 +120,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
+             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
+             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
+-            "int num_splits, Tensor? gen) -> Tensor[]");
++            "int num_splits, Tensor? gen, Tensor? headwise_gate=None) -> Tensor[]");
+ 
+     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
+             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index f0215b3..89983d9 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -49,6 +49,9 @@ struct Flash_fwd_params : public Qkv_params {
+     // The O matrix (output).
+     void * __restrict__ o_ptr;
+     void * __restrict__ oaccum_ptr;
++    const void * __restrict__ headwise_gate_ptr;
++    index_t gate_row_stride;
++    index_t gate_head_stride;
+ 
+     // The stride between rows of O.
+     index_t o_batch_stride;
+diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
+index 7b43d72..9941731 100644
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -28,6 +28,54 @@ namespace FLASH_NAMESPACE {
+ 
+ using namespace cute;
+ 
++// Preserve the materialized output and sigmoid rounding before multiplication.
++__forceinline__ __device__ float gate_exp(float x) {
++    float result;
++    asm("{ .reg .f32 scaled; "
++        "mul.rn.f32 scaled, %1, 0f3FB8AA3B; "
++        "ex2.approx.ftz.f32 %0, scaled; }"
++        : "=f"(result) : "f"(x));
++    return result;
++}
++__forceinline__ __device__ float gate_div_rn(float a, float b) {
++    float result;
++    asm("div.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
++    return result;
++}
++__forceinline__ __device__ float gate_mul_rn(float a, float b) {
++    float result;
++    asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
++    return result;
++}
++
++template<typename Element, typename Fragment, typename Coordinates, typename Params, typename BInfo>
++__forceinline__ __device__ void apply_headwise_gate(
++    Fragment &values, const Coordinates &coords, const Params &params,
++    const BInfo &binfo, int batch, int head, int first_row, int rows) {
++    if (params.headwise_gate_ptr == nullptr) { return; }
++    auto gate = reinterpret_cast<const Element *>(params.headwise_gate_ptr);
++    const int64_t base = binfo.q_offset(int64_t(0), params.gate_row_stride, batch)
++        + int64_t(first_row) * params.gate_row_stride
++        + int64_t(head) * params.gate_head_stride;
++    #pragma unroll
++    for (int m = 0; m < size<1>(values); ++m) {
++        const int row = get<0>(coords(0, m, 0));
++        if (row < rows) {
++            const float g = float(gate[base + int64_t(row) * params.gate_row_stride]);
++            const float sig = gate_div_rn(1.0f, __fadd_rn(1.0f, gate_exp(-g)));
++            const float rounded_sig = float(Element(sig));
++            #pragma unroll
++            for (int n = 0; n < size<2>(values); ++n) {
++                #pragma unroll
++                for (int i = 0; i < size<0>(values); ++i) {
++                    values(i, m, n) = Element(
++                        gate_mul_rn(float(values(i, m, n)), rounded_sig));
++                }
++            }
++        }
++    }
++}
++
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+ template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+@@ -494,6 +542,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+         #pragma unroll
+         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+     }
++    if constexpr (Kernel_traits::Has_headwise_gate) {
++        apply_headwise_gate<Element>(tOrO, tOcO, params, binfo, bidb, bidh,
++            m_block * kBlockM, binfo.actual_seqlen_q - m_block * kBlockM);
++    }
+     // Clear_OOB_K must be false since we don't want to write zeros to gmem
+     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+@@ -571,6 +623,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+             for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+         }
+         // Clear_OOB_K must be false since we don't want to write zeros to gmem
++        if constexpr (!Split && Kernel_traits::Has_headwise_gate) {
++            apply_headwise_gate<Element>(tOrOaccum, tOcO, params, binfo, bidb, bidh,
++                m_block * kBlockM, binfo.actual_seqlen_q - m_block * kBlockM);
++        }
+         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+             gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+         );
+@@ -638,9 +694,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+ 
+     if (block_table != nullptr) {
+         auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
+-        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
++        tKgK.data() = gK.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+             block_table, params.k_batch_stride, params.k_row_stride, final_block_size);
+-        tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
++        tVgV.data() = gV.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+             block_table, params.v_batch_stride, params.v_row_stride, final_block_size);
+     }
+ 
+@@ -798,9 +854,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+             } else {
+                 if (n_block > n_block_copy_min) {
+-                    tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
++                    tVgV.data() = gV.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                         block_table, params.v_batch_stride, params.v_row_stride);
+-                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
++                    tKgK.data() = gK.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                         block_table, params.k_batch_stride, params.k_row_stride);
+                 }
+             }
+@@ -894,7 +950,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+             if (block_table == nullptr) {
+                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+             } else {
+-                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
++                tVgV.data() = gV.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+                     block_table, params.v_batch_stride, params.v_row_stride);
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+@@ -930,7 +986,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+             if (block_table == nullptr) {
+                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+             } else {
+-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
++                tKgK.data() = gK.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                     block_table, params.k_batch_stride, params.k_row_stride);
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+@@ -970,7 +1026,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         if (block_table == nullptr) {
+             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+         } else {
+-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
++            tVgV.data() = gV.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+                 block_table, params.v_batch_stride, params.v_row_stride);
+         }
+ 
+@@ -992,7 +1048,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+             if (block_table == nullptr) {
+                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+             } else {
+-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
++                tKgK.data() = gK.data() + FLASH_NAMESPACE::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                     block_table, params.k_batch_stride, params.k_row_stride);            
+             }
+             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+@@ -1087,6 +1143,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
+         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+     }
+     // Clear_OOB_K must be false since we don't want to write zeros to gmem
++    if constexpr (!Split && Kernel_traits::Has_headwise_gate) {
++        apply_headwise_gate<Element>(tOrOaccum, tOcO, params, binfo, bidb, bidh,
++            m_block * kBlockM, binfo.actual_seqlen_q - m_block * kBlockM);
++    }
+     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+         gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+     );
+diff --git a/csrc/flash_attn/src/flash_fwd_launch_template.h b/csrc/flash_attn/src/flash_fwd_launch_template.h
+index 96b7238..771d8c9 100644
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -13,6 +13,12 @@
+ 
+ namespace FLASH_NAMESPACE {
+ 
++template<typename Base>
++struct HeadwiseGateTraits : public Base {
++    static constexpr bool Has_headwise_gate = true;
++};
++
++
+ // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+ #define ARCH_SUPPORTS_FLASH
+@@ -160,6 +166,34 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+     }
+ }
+ 
++// The varlen gate API excludes SplitKV, append-KV, ALiBi and softcap.
++// Instantiate only its supported kernel flags; retain the ordinary dispatch.
++template<typename Kernel_traits, bool Is_causal, bool Paged>
++void run_headwise_gate_fwd(Flash_fwd_params &params, cudaStream_t stream) {
++    static_assert(Kernel_traits::kHeadDim == 192);
++    static_assert(Kernel_traits::Has_headwise_gate);
++    constexpr size_t smem_size = Kernel_traits::kSmemSize;
++    const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
++    dim3 grid(num_m_block, params.b, params.h);
++    LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
++        auto kernel = [&] {
++            if constexpr (Paged) {
++                return &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, Is_local && !Is_causal,
++                    false, false, true, false, false, false>;
++            } else {
++                return &flash_fwd_kernel<Kernel_traits, false, Is_causal, Is_local && !Is_causal,
++                    false, false, true, false, false>;
++            }
++        }();
++        if (smem_size >= 48 * 1024) {
++            FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
++                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++        }
++        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
++        FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
++    });
++}
++
+ // The num_splits==1 blocksize-aligned splitkv template. If a user specifies
+ // num_splits=1, we assume they want bitwise identical numerics across the split
+ // KV and standard kernels so we align kBlockN to match.
+@@ -173,6 +207,13 @@ template<typename T, int Headdim, bool Is_causal>
+ void run_mha_fwd_splitkv_align(Flash_fwd_params &params, cudaStream_t stream) {
+     constexpr static int kBlockM = 64;
+     constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
++    if constexpr (Headdim == 192 && std::is_same_v<T, cutlass::bfloat16_t>) {
++        if (params.headwise_gate_ptr != nullptr) {
++            run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
++                Headdim, kBlockM, kBlockN_standard, 4, false, false, T>>, Is_causal, true>(params, stream);
++            return;
++        }
++    }
+     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
+ }
+ 
+@@ -188,6 +229,13 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
+         run_mha_fwd_splitkv_align<T, Headdim, Is_causal>(params, stream);
+         return;
+     }
++    if constexpr (Headdim == 192 && std::is_same_v<T, cutlass::bfloat16_t>) {
++        if (params.headwise_gate_ptr != nullptr) {
++            run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
++                Headdim, kBlockM, kBlockN, 4, false, false, T>>, Is_causal, true>(params, stream);
++            return;
++        }
++    }
+     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+ }
+ 
+@@ -281,6 +329,13 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+ template<typename T, bool Is_causal>
+ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
+     constexpr static int Headdim = 192;
++    if constexpr (std::is_same_v<T, cutlass::bfloat16_t>) {
++        if (params.headwise_gate_ptr != nullptr) {
++            run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
++                Headdim, 128, 64, 8, false, false, T>>, Is_causal, false>(params, stream);
++            return;
++        }
++    }
+     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+         if constexpr(!Is_dropout) {
+             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+diff --git a/csrc/flash_attn/src/kernel_traits.h b/csrc/flash_attn/src/kernel_traits.h
+index 1c94672..eb4bb7b 100644
+--- a/csrc/flash_attn/src/kernel_traits.h
++++ b/csrc/flash_attn/src/kernel_traits.h
+@@ -49,6 +49,7 @@ struct Flash_kernel_traits {
+ template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
+          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
+ struct Flash_fwd_kernel_traits : public Base {
++    static constexpr bool Has_headwise_gate = false;
+     using Element = typename Base::Element;
+     using ElementAccum = typename Base::ElementAccum;
+     using index_t = typename Base::index_t;

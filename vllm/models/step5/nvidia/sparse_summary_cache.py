@@ -48,6 +48,22 @@ class Step5SparseSummaryCache:
         )
 
     def update_decode(self, key, z, slots):
+        if key.is_cuda:
+            from .ops.summary_update import update_decode
+
+            update_decode(
+                key,
+                z,
+                slots,
+                self._mean,
+                self.numerator,
+                self.denominator,
+                self.maximum,
+                self.last_slot,
+                self.pages,
+                self.block_size,
+            )
+            return
         active = slots >= 0
         pages = torch.where(
             active,
@@ -84,6 +100,24 @@ class Step5SparseSummaryCache:
                 groups.setdefault(slot // 8, [-1] * 8)[slot % 8] = row
         if not groups:
             return
+        if key.is_cuda:
+            from .ops.summary_update import update_prefill
+
+            update_prefill(
+                key,
+                z,
+                groups,
+                self.mean,
+                self.numerator,
+                self.denominator,
+                self.maximum,
+                self.last_slot,
+                self.block_size,
+            )
+        else:
+            self._update_torch(key, z, groups)
+
+    def _update_torch(self, key, z, groups):
         regions = list(groups)
         rows = torch.tensor(list(groups.values()), device=key.device)
         valid = rows >= 0

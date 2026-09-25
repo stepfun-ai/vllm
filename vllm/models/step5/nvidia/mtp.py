@@ -129,9 +129,10 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         if self.mtp_block.use_sequence_parallel:
             padding = _step5_sp_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
-        hidden_states = self.mtp_block(
+        hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, padding=padding
         )
+        hidden_states = self.mtp_block._add_for_residual(hidden_states, residual)
         if self.mtp_block.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         return hidden_states

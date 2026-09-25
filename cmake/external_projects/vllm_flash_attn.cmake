@@ -33,6 +33,11 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
   FetchContent_Declare(
           vllm-flash-attn SOURCE_DIR
           ${VLLM_FLASH_ATTN_SRC_DIR}
+          PATCH_COMMAND
+          ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=<SOURCE_DIR>"
+          "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/../patches/flash_attn_headwise_gate.patch"
+          -P "${CMAKE_CURRENT_LIST_DIR}/../apply_source_patch.cmake"
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
@@ -42,6 +47,11 @@ else()
           GIT_TAG 506341a143fcabd4bb79052a7605ada727d6b3f5
           GIT_PROGRESS TRUE
           # Don't share the vllm-flash-attn build between build types
+          PATCH_COMMAND
+          ${CMAKE_COMMAND}
+          "-DSOURCE_DIR=<SOURCE_DIR>"
+          "-DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/../patches/flash_attn_headwise_gate.patch"
+          -P "${CMAKE_CURRENT_LIST_DIR}/../apply_source_patch.cmake"
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 endif()

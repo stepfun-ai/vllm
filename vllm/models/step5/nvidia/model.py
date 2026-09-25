@@ -16,7 +16,7 @@ from typing_extensions import TypeIs
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -85,11 +85,27 @@ from .config import (
 )
 from .layernorm import (
     Step5IndexerLayerNorm,
+    Step5RMSNorm,
     get_step5_norm_dtype,
     make_step5_rms_norm,
 )
+from .ops.add import add_fp32
+from .ops.attention_gate import headwise_sigmoid_gate
 
 logger = init_logger(__name__)
+
+
+def _can_fuse_decode_aux(metadata, runtime_mode: CUDAGraphMode) -> bool:
+    # BCG prefill reuses captured projections/norms. Keep decode-only state
+    # mutations out of those PIECEWISE segments. MRV2 captures FULL graphs
+    # with runtime_mode=NONE, which is also the eager/warmup mode.
+    return (
+        runtime_mode != CUDAGraphMode.PIECEWISE
+        and metadata is not None
+        and metadata.num_actual_tokens > 0
+        and metadata.max_query_len == 1
+        and metadata.num_actual_tokens == metadata.num_actual_reqs
+    )
 
 
 @eager_break_during_capture
@@ -104,6 +120,8 @@ def step5_dsa_attention_with_output(
     dsa_proxy_key: torch.Tensor,
     dsa_proxy_weights: torch.Tensor,
     dsa_proxy_z: torch.Tensor | None = None,
+    dsa_summary_updated: bool = False,
+    defer_inactive_clear: bool = False,
 ) -> None:
     with torch.profiler.record_function("step5_dsa.op.get_attention_context"):
         attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
@@ -120,7 +138,25 @@ def step5_dsa_attention_with_output(
             dsa_proxy_key=dsa_proxy_key,
             dsa_proxy_weights=dsa_proxy_weights,
             dsa_proxy_z=dsa_proxy_z,
+            dsa_summary_updated=dsa_summary_updated,
+            defer_inactive_clear=defer_inactive_clear,
         )
+
+
+@eager_break_during_capture
+@maybe_transfer_kv_layer
+def step5_swa_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    gate: torch.Tensor,
+) -> None:
+    metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+    typing.cast(Any, layer.impl).forward_with_headwise_gate(
+        layer, query, key, value, kv_cache, metadata, output, gate
+    )
 
 
 STEP5_PACKED_MODULES_MAPPING = {
@@ -255,18 +291,13 @@ def _step5_groups_per_rank(total_groups: int, tp_size: int) -> int:
     )
 
 
-def _step5_replicated_group_rank(
+def _step5_group_partition(
     *,
     total_groups: int,
     tp_size: int,
     tp_rank: int,
-) -> tuple[int, int]:
-    """Map a TP rank to one replicated provider/KV group.
-
-    The DSA kernels consume exactly one local KV/provider group.
-    Consequently global groups may be replicated across ranks, but multiple
-    groups cannot be co-located on one rank.
-    """
+) -> tuple[int, int, int]:
+    """Return the first local group, group count, and replication factor."""
     total_groups = int(total_groups)
     tp_size = int(tp_size)
     tp_rank = int(tp_rank)
@@ -277,15 +308,11 @@ def _step5_replicated_group_rank(
         )
     if not 0 <= tp_rank < tp_size:
         raise ValueError(f"Step5 TP rank must be in [0, {tp_size}), got {tp_rank}.")
-    if tp_size < total_groups or tp_size % total_groups != 0:
-        raise ValueError(
-            "Step5 DSA kernels require exactly one local "
-            "provider/KV group, so the global group count must divide tensor "
-            "parallel size and cannot exceed it; got "
-            f"groups={total_groups}, tp_size={tp_size}."
-        )
+    local_groups = _step5_groups_per_rank(total_groups, tp_size)
+    if tp_size <= total_groups:
+        return tp_rank * local_groups, local_groups, 1
     ranks_per_group = tp_size // total_groups
-    return tp_rank // ranks_per_group, ranks_per_group
+    return tp_rank // ranks_per_group, 1, ranks_per_group
 
 
 def _validate_step5_dsa_parallel_geometry(
@@ -334,13 +361,6 @@ def _validate_step5_dsa_parallel_geometry(
         raise ValueError(
             "local DSA provider groups must align with local KV groups: "
             f"{local_provider_groups} != {local_kv_groups}"
-        )
-    if local_kv_groups != 1:
-        raise ValueError(
-            "Step5 DSA kernels require exactly one local "
-            "KV/provider group per tensor-parallel rank, got "
-            f"local_groups={local_kv_groups} "
-            f"(global_groups={total_num_kv_heads}, tp_size={tp_size})."
         )
     if total_num_heads % tp_size:
         raise ValueError(
@@ -466,21 +486,17 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         else:
             self.local_index_kv_heads = total_index_kv_heads // tp_size
             self.index_kv_head_replicas = 1
-        # The sparse indexer q heads are sharded into `index_tp_size` global
-        # provider groups (default 4, matching the main-attention KV groups).
-        # The DSA kernels consume one group per rank, so each group is
-        # replicated across tp_size // index_tp_size ranks. This keeps the
-        # per-rank index q-head set -- and therefore the GQA sparse-topk
-        # aggregation -- identical at TP4/TP8/TP16. Splitting q across the full
-        # tp_size instead would shrink the aggregation group and corrupt sparse
-        # region selection.
+        # Keep each provider's complete index Q-head set. Providers are sharded
+        # for TP <= index_tp_size and replicated above it, preserving top-k.
         index_tp_size = int(index_tp_size)
         if index_tp_size <= 0:
             index_tp_size = tp_size
-        self.index_tp_rank, ranks_per_index = _step5_replicated_group_rank(
-            total_groups=index_tp_size,
-            tp_size=tp_size,
-            tp_rank=self.tp_rank,
+        self.index_group_start, self.local_index_groups, ranks_per_index = (
+            _step5_group_partition(
+                total_groups=index_tp_size,
+                tp_size=tp_size,
+                tp_rank=self.tp_rank,
+            )
         )
         if total_index_q_heads <= 0 or total_index_q_heads % index_tp_size != 0:
             raise ValueError(
@@ -514,7 +530,9 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             index_tp_size=index_tp_size,
             tp_size=tp_size,
         )
-        self.local_index_q_heads = total_index_q_heads // index_tp_size
+        self.local_index_q_heads = (
+            total_index_q_heads // index_tp_size * self.local_index_groups
+        )
         self.index_q_head_replicas = ranks_per_index
         self.local_gate_size = (
             typing.cast(int, gate_output_size) // tp_size if self.has_gate else 0
@@ -564,10 +582,9 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
 
     def _indexer_source_offset(self, shard_id: str) -> tuple[int, int]:
         if shard_id == "index_q":
-            # q is sharded into index_tp_size provider groups; the ranks that
-            # share an index group load the identical q shard (replicated).
             return (
-                self.index_tp_rank * self.local_index_q_size,
+                self.index_group_start
+                * (self.local_index_q_size // self.local_index_groups),
                 self.local_index_q_size,
             )
         if shard_id in ("index_k", "index_z"):
@@ -739,7 +756,7 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
         index_tp_size = int(index_tp_size)
         if index_tp_size <= 0:
             index_tp_size = tp_size
-        self.index_tp_rank, self.index_tp_rank_replicas = _step5_replicated_group_rank(
+        self.index_group_start, local_groups, _ = _step5_group_partition(
             total_groups=index_tp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
@@ -750,7 +767,8 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
                 f"index_tp_size, got output_size={output_size}, "
                 f"index_tp_size={index_tp_size}."
             )
-        self.output_size_per_partition = output_size // index_tp_size
+        self.output_size_per_group = output_size // index_tp_size
+        self.output_size_per_partition = self.output_size_per_group * local_groups
         self.weight = Parameter(
             torch.empty(
                 self.output_size_per_partition,
@@ -762,7 +780,7 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
         self.weight.data.zero_()
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        start = self.index_tp_rank * self.output_size_per_partition
+        start = self.index_group_start * self.output_size_per_group
         shard = loaded_weight.narrow(0, start, self.output_size_per_partition)
         param.data.copy_(shard)
 
@@ -1045,12 +1063,6 @@ class Step5Attention(nn.Module):
                 raise NotImplementedError(
                     f"Step5 DSA requires B300 SM103; got {capability}."
                 )
-            if self.num_kv_heads != 1:
-                raise ValueError(
-                    "Step5 DSA requires exactly one local KV head, got "
-                    f"{self.num_kv_heads} (global={self.total_num_kv_heads}, "
-                    f"tp_size={tp_size})."
-                )
             if self.num_heads % self.num_kv_heads != 0:
                 raise ValueError(
                     "Step5 DSA query heads must be divisible by local KV heads, "
@@ -1309,6 +1321,15 @@ class Step5Attention(nn.Module):
             else None
         )
 
+        self.fuse_swa_gate = (
+            not self.use_dsa_backend
+            and model_has_dsa_layers
+            and self.use_head_wise_attn_gate
+            and self.params_dtype == torch.bfloat16
+            and current_platform.is_device_capability(103)
+            and typing.cast(Any, self.attn.impl).supports_headwise_gate()
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1322,35 +1343,61 @@ class Step5Attention(nn.Module):
             qkv, extra_dims = qkvg.split(
                 [self.q_size + 2 * self.kv_size, self.num_heads], dim=-1
             )
-            qkv = qkv.contiguous()
-            extra_dims = extra_dims.contiguous()
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             qkzg = None
             extra_dims = None
 
-        _, _, kv_cache, slot_mapping = get_attention_context(self.attn.layer_name)
+        if self.fuse_swa_gate and extra_dims is None:
+            extra_dims, _ = self.g_proj(hidden_states)
+
+        attn_metadata, _, kv_cache, slot_mapping = get_attention_context(
+            self.attn.layer_name
+        )
+        decode_slots = None
+        if self.sparse_attn is not None and _can_fuse_decode_aux(
+            attn_metadata, get_forward_context().cudagraph_runtime_mode
+        ):
+            decode_slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
         kv_cache_dummy_dep = None
+        prepared_indexer = None
         if slot_mapping is not None and kv_cache.numel() > 0:
             key_cache, value_cache = typing.cast(Any, self.attn.impl)._split_kv_cache(
                 kv_cache
             )
-            q, k, v = ops.fused_qknorm_rope_cache(
-                qkv,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                slot_mapping,
-                key_cache,
-                value_cache,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_dim if self.use_rope else 0,
-                self.q_norm.variance_epsilon,
-                float(self.zero_centered),
-            )
+            if (
+                self.sparse_attn is not None
+                and self.sparse_attn.fuse_qkv_preparation
+                and decode_slots is not None
+                and 0 < qkv.shape[0] <= 128
+            ):
+                (q, k, v), prepared_indexer = self.sparse_attn.prepare_qkv(
+                    positions,
+                    hidden_states,
+                    qkv,
+                    qkzg,
+                    slot_mapping,
+                    key_cache,
+                    value_cache,
+                    decode_slots,
+                )
+            else:
+                q, k, v = ops.fused_qknorm_rope_cache(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache,
+                    positions,
+                    slot_mapping,
+                    key_cache,
+                    value_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.rotary_dim if self.use_rope else 0,
+                    self.q_norm.variance_epsilon,
+                    float(self.zero_centered),
+                )
             kv_cache_dummy_dep = q.new_empty(0)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1377,19 +1424,43 @@ class Step5Attention(nn.Module):
                 v,
                 qkzg=qkzg,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
+                decode_slots=decode_slots,
+                prepared_indexer=prepared_indexer,
             )
+        elif self.fuse_swa_gate:
+            assert extra_dims is not None
+            key = k.view(-1, self.num_kv_heads, self.head_dim)
+            value = v.view(-1, self.num_kv_heads, self.head_dim)
+            if (
+                kv_cache_dummy_dep is None
+                and not self.attn.attn_backend.forward_includes_kv_cache_update
+                and self.attn.kv_sharing_target_layer_name is None
+            ):
+                unified_kv_cache_update(key, value, self.attn.layer_name)
+            attn_output = torch.empty(
+                (q.shape[0], self.num_heads, self.head_dim),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            step5_swa_attention_with_output(
+                q.view(-1, self.num_heads, self.head_dim),
+                key,
+                value,
+                attn_output,
+                self.attn.layer_name,
+                extra_dims,
+            )
+            attn_output = attn_output.view(-1, self.q_size)
         else:
             attn_output = self.attn(q, k, v, kv_cache_dummy_dep=kv_cache_dummy_dep)
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
-        if self.use_head_wise_attn_gate:
+        if self.use_head_wise_attn_gate and not self.fuse_swa_gate:
             assert extra_dims is not None
-            output = (
-                attn_output.view(*attn_output.shape[:-1], self.num_heads, self.head_dim)
-                * extra_dims.unsqueeze(-1).sigmoid()
+            attn_output = headwise_sigmoid_gate(
+                attn_output, extra_dims, slot_mapping=decode_slots
             )
-            attn_output = output.view(*attn_output.shape)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1403,7 +1474,76 @@ class Step5SparseAttention:
         self.owner = owner
         self.sparse_config = sparse_config
         self.sparse_rotary_emb = self._build_sparse_rotary_emb()
+        self._indexer_native_rope = not self.sparse_rotary_emb.enabled()
         owner.add_module("sparse_indexer_rotary_emb", self.sparse_rotary_emb)
+        self.fuse_qkv_preparation = (
+            owner.params_dtype == torch.bfloat16
+            and owner.head_dim == 192
+            and owner.num_kv_heads == 1
+            and int(sparse_config.proxy_dim) == 256
+            and int(sparse_config.sparse_indexer_num_k_heads) == 1
+            and self.sparse_rotary_emb.is_neox_style
+            and self.sparse_rotary_emb.rotary_dim > 0
+            and not self.sparse_rotary_emb.use_flashinfer
+        )
+
+    def prepare_qkv(
+        self,
+        positions,
+        hidden_states,
+        qkv,
+        qkzg,
+        slots,
+        key_cache,
+        value_cache,
+        decode_slots,
+    ):
+        from .ops.qkv_indexer_norm_rope import qkv_indexer_norm_rope
+
+        owner = self.owner
+        index_q, index_k, index_z, gate = owner.qkv_indexer_proj.split_indexer(qkzg)
+        weights, _ = owner.sparse_indexer_w(hidden_states)
+        cache = typing.cast(Any, owner.attn.impl).summary_cache
+        index_q, index_k, weights, q, k, v = qkv_indexer_norm_rope(
+            index_q,
+            index_k,
+            weights,
+            owner.sparse_indexer_q_norm.weight,
+            owner.sparse_indexer_k_norm.weight,
+            owner.sparse_indexer_k_norm.bias,
+            self.sparse_rotary_emb.cos_sin_cache,
+            positions.reshape(-1),
+            owner.sparse_indexer_q_norm.variance_epsilon,
+            owner.zero_centered,
+            native_rope=self._indexer_native_rope,
+            main_inputs=(
+                qkv,
+                owner.q_norm.weight,
+                owner.k_norm.weight,
+                owner.rotary_emb.cos_sin_cache,
+                slots,
+                key_cache,
+                value_cache,
+                owner.num_heads,
+                owner.num_kv_heads,
+                owner.rotary_dim if owner.use_rope else 0,
+                owner.q_norm.variance_epsilon,
+                float(owner.zero_centered),
+            ),
+            decode_cache=cache,
+            decode_z=index_z,
+            decode_slots=decode_slots,
+        )
+        if owner.use_head_wise_attn_gate and gate is None:
+            raise RuntimeError("Sparse indexer gate output is missing.")
+        return (q, k, v), (
+            index_q,
+            index_k,
+            weights,
+            index_z.view(-1, 1, 256),
+            gate,
+            True,
+        )
 
     def forward(
         self,
@@ -1414,10 +1554,21 @@ class Step5SparseAttention:
         value: torch.Tensor,
         qkzg: torch.Tensor,
         kv_cache_dummy_dep: torch.Tensor | None = None,
+        decode_slots: torch.Tensor | None = None,
+        prepared_indexer=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        dsa_proxy_query, dsa_proxy_key, dsa_proxy_weights, dsa_proxy_z, extra_dims = (
-            self._project_sparse_indexer(positions, hidden_states, qkzg)
-        )
+        if prepared_indexer is None:
+            prepared_indexer = self._project_sparse_indexer(
+                positions, hidden_states, qkzg, decode_slots=decode_slots
+            )
+        (
+            dsa_proxy_query,
+            dsa_proxy_key,
+            dsa_proxy_weights,
+            dsa_proxy_z,
+            extra_dims,
+            summary_updated,
+        ) = prepared_indexer
         attn_output = self._forward_dsa_attention(
             query,
             key,
@@ -1427,6 +1578,10 @@ class Step5SparseAttention:
             dsa_proxy_weights=dsa_proxy_weights,
             dsa_proxy_z=dsa_proxy_z,
             kv_cache_dummy_dep=kv_cache_dummy_dep,
+            summary_updated=summary_updated,
+            defer_inactive_clear=(
+                decode_slots is not None and self.owner.use_head_wise_attn_gate
+            ),
         )
         return attn_output, extra_dims
 
@@ -1441,6 +1596,8 @@ class Step5SparseAttention:
         dsa_proxy_weights: torch.Tensor,
         dsa_proxy_z: torch.Tensor,
         kv_cache_dummy_dep: torch.Tensor | None = None,
+        summary_updated: bool = False,
+        defer_inactive_clear: bool = False,
     ) -> torch.Tensor:
         attn = self.owner.attn
         hidden_size = attn.num_heads * attn.head_size_v
@@ -1471,6 +1628,8 @@ class Step5SparseAttention:
             dsa_proxy_key,
             dsa_proxy_weights,
             dsa_proxy_z,
+            summary_updated,
+            defer_inactive_clear,
         )
         return output.view(-1, hidden_size)
 
@@ -1522,12 +1681,15 @@ class Step5SparseAttention:
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         qkzg: torch.Tensor,
+        *,
+        decode_slots: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
+        bool,
     ]:
         index_q, index_k, index_z, extra_dims = (
             self.owner.qkv_indexer_proj.split_indexer(qkzg)
@@ -1542,6 +1704,44 @@ class Step5SparseAttention:
         num_k_heads = k_width // proxy_dim
         num_local_kv_heads = int(self.owner.num_kv_heads)
         q_heads_per_kv = num_q_heads // num_local_kv_heads
+
+        if (
+            index_q.is_cuda
+            and index_q.dtype == torch.bfloat16
+            and proxy_dim == 256
+            and num_k_heads == 1
+            and self.sparse_rotary_emb.is_neox_style
+            and self.sparse_rotary_emb.rotary_dim > 0
+            and not self.sparse_rotary_emb.use_flashinfer
+        ):
+            from .ops.indexer_norm_rope import indexer_norm_rope
+
+            cache = (
+                typing.cast(Any, self.owner.attn.impl).summary_cache
+                if decode_slots is not None
+                else None
+            )
+            index_q, index_k, weights = indexer_norm_rope(
+                index_q,
+                index_k,
+                weights,
+                self.owner.sparse_indexer_q_norm.weight,
+                self.owner.sparse_indexer_k_norm.weight,
+                self.owner.sparse_indexer_k_norm.bias,
+                self.sparse_rotary_emb.cos_sin_cache,
+                positions.reshape(-1),
+                self.owner.sparse_indexer_q_norm.variance_epsilon,
+                self.owner.zero_centered,
+                native_rope=self._indexer_native_rope,
+                num_groups=num_local_kv_heads,
+                decode_cache=cache,
+                decode_z=index_z if cache is not None else None,
+                decode_slots=decode_slots if cache is not None else None,
+            )
+            index_z = index_z.view(num_tokens, num_k_heads, proxy_dim)
+            if self.owner.use_head_wise_attn_gate and extra_dims is None:
+                raise RuntimeError("Sparse indexer gate output is missing.")
+            return index_q, index_k, weights, index_z, extra_dims, cache is not None
 
         index_k = self.owner.sparse_indexer_k_norm(index_k.contiguous())
         index_q = index_q.view(
@@ -1565,7 +1765,7 @@ class Step5SparseAttention:
         weights = weights * (float(q_heads_per_kv) ** -0.5)
         if self.owner.use_head_wise_attn_gate and extra_dims is None:
             raise RuntimeError("Sparse indexer gate output is missing.")
-        return index_q, index_k, weights, index_z, extra_dims
+        return index_q, index_k, weights, index_z, extra_dims, False
 
 
 class Step5MoE(nn.Module):
@@ -1889,10 +2089,15 @@ class Step5DecoderLayer(nn.Module):
     def add_and_maybe_inplace_all_reduce(
         self, in1: torch.Tensor, in2: torch.Tensor
     ) -> torch.Tensor:
-        hidden_states = self._cast_for_residual(in1) + self._cast_for_residual(in2)
+        hidden_states = self._add_for_residual(in1, in2)
         if not self.use_fused_all_reduce:
             return hidden_states
         return self.tp_group.all_reduce(hidden_states)
+
+    def _add_for_residual(self, in1: torch.Tensor, in2: torch.Tensor) -> torch.Tensor:
+        if self.fp32_residual_connection:
+            return add_fp32(in1, in2)
+        return in1 + in2
 
     def _cast_for_param_op(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not self.fp32_residual_connection:
@@ -1912,9 +2117,7 @@ class Step5DecoderLayer(nn.Module):
         if self.use_moe:
             shared_output, moe_output = self.moe(hidden_states, padding=padding)
             # Combine shared and routed expert outputs
-            combined = self._cast_for_residual(moe_output) + self._cast_for_residual(
-                shared_output
-            )
+            combined = self._add_for_residual(moe_output, shared_output)
             # When fuse_all_reduce=True, the runner does NOT
             # all-reduce (reduce_results=False), so we must all-reduce
             # the combined output here. When fuse_all_reduce=False,
@@ -1935,11 +2138,27 @@ class Step5DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None = None,
         padding: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self._cast_for_param_op(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fp32_residual_connection and isinstance(
+            self.input_layernorm, Step5RMSNorm
+        ):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(
+                    hidden_states, out_dtype=torch.bfloat16
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual, out_dtype=torch.bfloat16
+                )
+        else:
+            if residual is not None:
+                hidden_states = self._add_for_residual(hidden_states, residual)
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states = self._cast_for_param_op(hidden_states)
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
@@ -1949,16 +2168,21 @@ class Step5DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel:
             hidden_states = sp_reduce_scatter(hidden_states)
-        hidden_states = self._cast_for_residual(hidden_states)
-        hidden_states += residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self._cast_for_param_op(hidden_states)
+        if self.fp32_residual_connection and isinstance(
+            self.post_attention_layernorm, Step5RMSNorm
+        ):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual, out_dtype=torch.bfloat16
+            )
+        else:
+            hidden_states = self._cast_for_residual(hidden_states)
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self._cast_for_param_op(hidden_states)
 
         ffn_output = self._forward_ffn(hidden_states, padding=padding)
-        ffn_output = self._cast_for_residual(ffn_output)
-        hidden_states = ffn_output + residual
-        return hidden_states
+        return ffn_output, residual
 
 
 class Step5Model(nn.Module):
@@ -2040,9 +2264,14 @@ class Step5Model(nn.Module):
         if self.use_sequence_parallel:
             padding = _step5_sp_padding(hidden_states)
             hidden_states = sp_shard(hidden_states)
+        residual = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states, padding=padding)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, padding=padding
+            )
+        if residual is not None:
+            hidden_states = layer._add_for_residual(hidden_states, residual)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 

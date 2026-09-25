@@ -215,6 +215,7 @@ def flash_attn_varlen_func(
     aux_tensor_leading_dims=None,
     dynamic_causal: "torch.Tensor | None" = None,
     seqused_q=None,
+    headwise_gate: torch.Tensor | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -290,6 +291,9 @@ def flash_attn_varlen_func(
         aux_tensors: auxiliary tensors consumed by mask_mod. FA4 only.
         aux_tensor_leading_dims: leading dimensions of each entry in aux_tensors.
         dynamic_causal: optional per-sequence causal offsets. FA4 only.
+        seqused_q: optional per-request effective query lengths. Unavailable in FA2.
+        headwise_gate: optional BF16 (total_q, nheads) sigmoid output gate.
+           Requires paged FA2 with head dimension 192; preserves BF16 output rounding.
 
     Return:
         out: (total, nheads, headdim).
@@ -307,6 +311,12 @@ def flash_attn_varlen_func(
     assert block_table is None or seqused_k is not None, (
         "seqused_k must be provided if block_table is provided"
     )
+
+    if headwise_gate is not None and fa_version != 2:
+        raise NotImplementedError("Headwise output gating requires FA2")
+
+    if headwise_gate is not None and block_table is None:
+        raise NotImplementedError("Headwise output gating requires paged KV")
 
     assert output_scale is None or fa_version == 4, (
         f"Fused FP8 output (output_scale) is only supported by FA4, "
@@ -372,6 +382,7 @@ def flash_attn_varlen_func(
             return_softmax_lse and dropout_p > 0,
             num_splits,
             None,
+            **({"headwise_gate": headwise_gate} if headwise_gate is not None else {}),
         )
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
