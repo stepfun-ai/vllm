@@ -26,6 +26,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
@@ -67,6 +68,12 @@ from vllm.model_executor.models.utils import (
     skip_spec_layers,
 )
 from vllm.model_executor.parameter import BasevLLMParameter, ModelWeightParameter
+from vllm.models.common.ops.sequence_parallel import (
+    sp_all_gather,
+    sp_padding_mask,
+    sp_reduce_scatter,
+    sp_shard,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
@@ -768,6 +775,25 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
         return torch.nn.functional.linear(input_, self.weight, None), None
 
 
+def _step5_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel = vllm_config.parallel_config
+    return (
+        parallel.pipeline_parallel_size == 1
+        and parallel.enable_expert_parallel
+        and parallel.tensor_parallel_size > 1
+        and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    )
+
+
+def _step5_sp_padding(hidden_states: torch.Tensor) -> torch.Tensor:
+    padding = None
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        padding = get_forward_context().is_padding
+        if padding is not None:
+            padding = padding[: hidden_states.shape[0]]
+    return sp_padding_mask(padding, hidden_states)
+
+
 class Step5MLP(nn.Module):
     def __init__(
         self,
@@ -778,13 +804,28 @@ class Step5MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        sequence_parallel: bool = False,
+        can_shard_sequence_parallel: bool = False,
+        reduce_in_fp32: bool = False,
     ) -> None:
         super().__init__()
+        tp_size = get_tensor_model_parallel_world_size()
+        self.shard_sequence_parallel = (
+            sequence_parallel
+            and can_shard_sequence_parallel
+            and envs.VLLM_STEP5_SHARD_SP_SHARED_EXPERT
+            and tp_size > 1
+            and hidden_size % tp_size == 0
+            and intermediate_size % tp_size == 0
+        )
+        replicate = sequence_parallel and not self.shard_sequence_parallel
+        self.reduce_in_fp32 = reduce_in_fp32
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=replicate,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -792,7 +833,8 @@ class Step5MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
-            reduce_results=reduce_results,
+            reduce_results=False if self.shard_sequence_parallel else reduce_results,
+            disable_tp=replicate,
             prefix=f"{prefix}.down_proj",
         )
 
@@ -816,9 +858,15 @@ class Step5MLP(nn.Module):
             self.act_fn = SwigluStepAndMul(limit=self.limit)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.shard_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)
         gate_up, _ = self.gate_up_proj(hidden_states)
         intermediate_act = self.act_fn(gate_up)
         output, _ = self.down_proj(intermediate_act)
+        if self.shard_sequence_parallel:
+            if self.reduce_in_fp32:
+                output = output.float()
+            output = sp_reduce_scatter(output)
         return output
 
 
@@ -1611,6 +1659,14 @@ class Step5MoE(nn.Module):
             get_dp_group().world_size,
         )
 
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        self.use_mega_moe = (
+            getattr(kernel_config, "moe_backend", "auto") == "deep_gemm_mega_moe"
+        )
+        self.use_sequence_parallel = _step5_use_sequence_parallel(vllm_config)
+        if self.use_mega_moe:
+            self.fuse_all_reduce, reduce_results = False, False
+
         self.share_expert = Step5MLP(
             config=config,
             hidden_size=self.hidden_size,
@@ -1619,17 +1675,18 @@ class Step5MoE(nn.Module):
             reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=f"{prefix}.share_expert",
+            sequence_parallel=self.use_sequence_parallel,
+            can_shard_sequence_parallel=self.use_mega_moe,
+            reduce_in_fp32=True,
         )
-        # Keep the shared expert outside FusedMoEFactory so Step5 can combine
-        # shared and routed outputs in FP32 before the final all-reduce.
+        # Keep shared experts separate and combine outputs in FP32.
         # Step5 selects experts with a correction bias but computes routed
         # weights from the unbiased sigmoid scores.
-        self.experts = FusedMoEFactory(
+        expert_kwargs = dict(
             num_experts=config.moe_num_experts,
             top_k=config.moe_top_k,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=reduce_results,
             renormalize=config.norm_expert_weight,
             quant_config=quant_config,
             activation=activation,
@@ -1637,14 +1694,29 @@ class Step5MoE(nn.Module):
             scoring_func=getattr(config, "moe_router_activation", "sigmoid"),
             e_score_correction_bias=self.router_bias,
             routed_scaling_factor=config.moe_router_scaling_factor,
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            router_logits_dtype=torch.float32,
         )
+        if self.use_mega_moe:
+            from vllm.models.step5.nvidia.mega_moe import Step5MegaMoE
+
+            self.experts = Step5MegaMoE(
+                vllm_config,
+                **expert_kwargs,
+                activation_clamp=swiglu_limit or None,
+                sequence_parallel=self.use_sequence_parallel,
+            )
+        else:
+            self.experts = FusedMoEFactory(
+                **expert_kwargs,
+                reduce_results=reduce_results,
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                router_logits_dtype=torch.float32,
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
+        padding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -1652,8 +1724,9 @@ class Step5MoE(nn.Module):
         shared_output = self.share_expert(hidden_states)
 
         router_logits, _ = self.gate(hidden_states)
+        expert_kwargs = {"padding": padding} if padding is not None else {}
         routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=hidden_states, router_logits=router_logits, **expert_kwargs
         )
 
         # Kept separate so _forward_ffn can combine in fp32 and all-reduce after.
@@ -1765,11 +1838,15 @@ class Step5DecoderLayer(nn.Module):
             raise ValueError(
                 f"Unsupported attention implementation: {config.att_impl_type}"
             )
+        self.use_sequence_parallel = _step5_use_sequence_parallel(vllm_config)
+        if self.use_sequence_parallel:
+            self.self_attn.o_proj.reduce_results = False
         self.use_moe = False
         self.tp_group = get_tp_group()
         self.use_fused_all_reduce = (
             get_tensor_model_parallel_world_size() > 1
             and get_dp_group().world_size == 1
+            and not self.use_sequence_parallel
         )
         if self.use_fused_all_reduce:
             logger.warning_once("Step5 fused all-reduce is enabled.")
@@ -1792,6 +1869,8 @@ class Step5DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 reduce_results=True,
                 prefix=f"{prefix}.mlp",
+                sequence_parallel=self.use_sequence_parallel,
+                can_shard_sequence_parallel=True,
             )
         self.input_layernorm = make_step5_rms_norm(
             config.hidden_size,
@@ -1828,9 +1907,10 @@ class Step5DecoderLayer(nn.Module):
     def _forward_ffn(
         self,
         hidden_states: torch.Tensor,
+        padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.use_moe:
-            shared_output, moe_output = self.moe(hidden_states)
+            shared_output, moe_output = self.moe(hidden_states, padding=padding)
             # Combine shared and routed expert outputs
             combined = self._cast_for_residual(moe_output) + self._cast_for_residual(
                 shared_output
@@ -1840,8 +1920,8 @@ class Step5DecoderLayer(nn.Module):
             # the combined output here. When fuse_all_reduce=False,
             # routed output is either already reduced by the combine kernel or
             # reduced by _maybe_reduce_output. The shared expert path is a
-            # separate RowParallelLinear, so DP/EP paths configure it to reduce
-            # internally before it is combined with routed output.
+            # separate RowParallelLinear. Under SP the shared MLP either uses
+            # replicated weights or completes its own FP32 reduce-scatter.
             if self.moe.fuse_all_reduce:
                 if self.use_fused_all_reduce:
                     combined = self.tp_group.all_reduce(combined)
@@ -1852,23 +1932,30 @@ class Step5DecoderLayer(nn.Module):
         return self.mlp(hidden_states)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        padding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
 
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if self.use_sequence_parallel:
+            hidden_states = sp_reduce_scatter(hidden_states)
         hidden_states = self._cast_for_residual(hidden_states)
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self._cast_for_param_op(hidden_states)
 
-        ffn_output = self._forward_ffn(hidden_states)
+        ffn_output = self._forward_ffn(hidden_states, padding=padding)
         ffn_output = self._cast_for_residual(ffn_output)
         hidden_states = ffn_output + residual
         return hidden_states
@@ -1879,6 +1966,7 @@ class Step5Model(nn.Module):
         super().__init__()
 
         self.vllm_config = vllm_config
+        self.use_sequence_parallel = _step5_use_sequence_parallel(vllm_config)
         config = vllm_config.model_config.hf_config
         self.vocab_size = config.vocab_size
         self.config = config
@@ -1948,9 +2036,15 @@ class Step5Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
         hidden_states = self._cast_for_residual(hidden_states)
+        padding = None
+        if self.use_sequence_parallel:
+            padding = _step5_sp_padding(hidden_states)
+            hidden_states = sp_shard(hidden_states)
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, padding=padding)
+        if self.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

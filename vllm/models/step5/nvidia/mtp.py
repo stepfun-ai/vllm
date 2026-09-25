@@ -20,6 +20,7 @@ from vllm.model_executor.models.utils import (
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
+from vllm.models.common.ops.sequence_parallel import sp_all_gather, sp_shard
 from vllm.sequence import IntermediateTensors
 
 from .layernorm import Step5RMSNorm, get_step5_norm_dtype
@@ -29,6 +30,7 @@ from .model import (
     Step5MoE,
     _reset_fused_qkv_indexer_load_state,
     _set_step5_moe_protocol_metadata,
+    _step5_sp_padding,
     _validate_fused_qkv_indexer_weights,
 )
 
@@ -123,7 +125,15 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         if self.fp32_residual_connection:
             hidden_states = hidden_states.to(torch.float32)
 
-        hidden_states = self.mtp_block(positions=positions, hidden_states=hidden_states)
+        padding = None
+        if self.mtp_block.use_sequence_parallel:
+            padding = _step5_sp_padding(hidden_states)
+            hidden_states = sp_shard(hidden_states)
+        hidden_states = self.mtp_block(
+            positions=positions, hidden_states=hidden_states, padding=padding
+        )
+        if self.mtp_block.use_sequence_parallel:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
         return hidden_states
 
 
