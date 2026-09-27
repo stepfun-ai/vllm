@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -15,8 +16,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import MixtureOfExperts
+from vllm.model_executor.models.interfaces import (
+    MixtureOfExperts,
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    _require_is_multimodal,
+)
 from vllm.model_executor.models.utils import (
+    WeightsMapper,
+    _merge_multimodal_embeddings,
     get_spec_layer_idx_from_weight_name,
     maybe_prefix,
 )
@@ -113,18 +121,39 @@ class Step5MultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        if self.fp32_residual_connection:
-            inputs_embeds = inputs_embeds.to(torch.bfloat16)
-            previous_hidden_states = previous_hidden_states.to(torch.bfloat16)
-        inputs_embeds = self.enorm(inputs_embeds)
-        previous_hidden_states = self.hnorm(previous_hidden_states)
+        if (
+            inputs_embeds.is_cuda
+            and previous_hidden_states.device == inputs_embeds.device
+            and inputs_embeds.ndim == previous_hidden_states.ndim == 2
+            and inputs_embeds.shape == previous_hidden_states.shape
+            and inputs_embeds.stride(-1) == previous_hidden_states.stride(-1) == 1
+            and 0 < inputs_embeds.shape[-1] <= 16384
+            and inputs_embeds.dtype == torch.bfloat16
+            and previous_hidden_states.dtype in (torch.bfloat16, torch.float32)
+            and self.fp32_residual_connection
+        ):
+            from .ops.mtp_norm import norm_concat
 
-        hidden_states = self.eh_proj(
-            torch.cat([inputs_embeds, previous_hidden_states], dim=-1)
-        )
+            eh_input = norm_concat(
+                inputs_embeds,
+                previous_hidden_states,
+                self.enorm.weight,
+                self.hnorm.weight,
+                self.enorm.variance_epsilon,
+                self.enorm.zero_centered,
+                self.fp32_residual_connection,
+            )
+        else:
+            if self.fp32_residual_connection:
+                inputs_embeds = inputs_embeds.to(torch.bfloat16)
+                previous_hidden_states = previous_hidden_states.to(torch.bfloat16)
+            eh_input = torch.cat(
+                [self.enorm(inputs_embeds), self.hnorm(previous_hidden_states)], dim=-1
+            )
+
+        hidden_states = self.eh_proj(eh_input)
         if self.fp32_residual_connection:
             hidden_states = hidden_states.to(torch.float32)
-
         padding = None
         if self.mtp_block.use_sequence_parallel:
             padding = _step5_sp_padding(hidden_states)
@@ -236,17 +265,32 @@ def _is_step5_mtp_dense(model: Step5MultiTokenPredictor) -> bool:
     return not _get_step5_mtp_moe_blocks(model)
 
 
-class Step5MTP(nn.Module, MixtureOfExperts):
+class Step5MTP(nn.Module, MixtureOfExperts, SupportsMultiModal):
+    supports_multimodal_embeddings = True
+    has_own_lm_head = True
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
     _enable_weights_track_by_default = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        # The target VL model maps quantization exclusions to language_model.*.
+        # Draft modules live at model.* and must not mutate the target config.
+        if vllm_config.quant_config is not None:
+            quant_config = deepcopy(vllm_config.quant_config)
+            quant_config.apply_vllm_mapper(
+                WeightsMapper(orig_to_new_prefix={"language_model.": ""})
+            )
+            vllm_config = replace(vllm_config, quant_config=quant_config)
         self.config = _get_mtp_config(vllm_config)
         self.vllm_config = vllm_config
         self.model = Step5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        # Expose the first draft head to the generic sharing policy. Each MTP
+        # layer retains its own checkpoint head for compute_logits.
+        self.lm_head = self.model.layers[
+            str(self.model.mtp_start_layer_idx)
+        ].shared_head.head
         self.num_moe_layers: int
         self.num_expert_groups: int
         self.num_shared_experts: int
@@ -265,8 +309,23 @@ class Step5MTP(nn.Module, MixtureOfExperts):
             moe_blocks[0] if moe_blocks else None,
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.get_input_embeddings(input_ids)
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self._embed_text_input_ids(
+            input_ids, self.model.embed_input_ids, is_multimodal=is_multimodal
+        )
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=_require_is_multimodal(is_multimodal),
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

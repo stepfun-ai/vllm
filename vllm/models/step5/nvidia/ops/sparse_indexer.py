@@ -32,6 +32,7 @@ class PagedDecodeMetadata(NamedTuple):
     indices: torch.Tensor
     indptr: torch.Tensor
     block_size: int
+    page_stride: int = 0
 
 
 class PagedPrefillMetadata(NamedTuple):
@@ -51,7 +52,7 @@ def _emit_prefill_pages(
     Table,
     Pages,
     Indptr,
-    K: tl.constexpr,
+    K,
     OWNER_STRIDE: tl.constexpr,
     TABLE_ROW: tl.constexpr,
     TABLE_COL: tl.constexpr,
@@ -103,14 +104,14 @@ def _emit_indexer_schedule(
     tl.store(Schedule + sm * 2 + 1, local, sm <= NUM_SMS)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH"])
 def _emit_decode_schedule(
     Slots,
     SeqLens,
     Schedule,
     SLOT_STRIDE: tl.constexpr,
     SEQ_STRIDE: tl.constexpr,
-    BATCH: tl.constexpr,
+    BATCH,
     BLOCK_BATCH: tl.constexpr,
     NUM_SMS: tl.constexpr,
     BLOCK_SMS: tl.constexpr,
@@ -135,8 +136,8 @@ def _copy_summary_page(
     Scales,
     request,
     page,
-    REGIONS: tl.constexpr,
-    PAGES: tl.constexpr,
+    REGIONS,
+    PAGES,
     CACHE_PAGES: tl.constexpr,
     REGIONS_PER_BLOCK: tl.constexpr,
     TABLE_COLS: tl.constexpr,
@@ -182,8 +183,8 @@ def _copy_summary_tile(
     Scales,
     request,
     page,
-    REGIONS: tl.constexpr,
-    PAGES: tl.constexpr,
+    REGIONS,
+    PAGES,
     CACHE_PAGES: tl.constexpr,
     REGIONS_PER_BLOCK: tl.constexpr,
     TABLE_COLS: tl.constexpr,
@@ -220,7 +221,8 @@ def _copy_summary_tile(
     tl.store(Scales + output_page * (32 * 65) + offset % 32, 1.0, packed_page < PAGES)
 
 
-@triton.jit
+# Context-dependent sizes stay runtime values so new prompt lengths reuse code.
+@triton.jit(do_not_specialize=["REGIONS", "PAGES", "BATCH"])
 def _pack_summary_pages(
     Mean,
     Table,
@@ -235,8 +237,8 @@ def _pack_summary_pages(
     IndexTable,
     TopKLengths,
     Schedule,
-    REGIONS: tl.constexpr,
-    PAGES: tl.constexpr,
+    REGIONS,
+    PAGES,
     CACHE_PAGES: tl.constexpr,
     REGIONS_PER_BLOCK: tl.constexpr,
     TABLE_COLS: tl.constexpr,
@@ -244,7 +246,7 @@ def _pack_summary_pages(
     DECODE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     SEQ_STRIDE: tl.constexpr,
-    BATCH: tl.constexpr,
+    BATCH,
     BLOCK_BATCH: tl.constexpr,
     NUM_SMS: tl.constexpr,
     BLOCK_SMS: tl.constexpr,
@@ -411,7 +413,7 @@ def pack_decode_summary_pages(
 
 
 @triton.jit
-def _emit_all_regions(current, Output, K: tl.constexpr, BLOCK: tl.constexpr):
+def _emit_all_regions(current, Output, K, BLOCK: tl.constexpr):
     col = tl.arange(0, BLOCK)
     # Left-pad with -1, then include every historical region and the current one.
     region = col - (K - current)
@@ -436,14 +438,14 @@ def select_all_regions(current: torch.Tensor, capacity: int) -> torch.Tensor:
     return output
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SCORE_STRIDE", "BATCH"])
 def _stable_topk_regions(
     Scores,
     Current,
     Indices,
     Scratch,
     Output,
-    SCORE_STRIDE: tl.constexpr,
+    SCORE_STRIDE,
     INDEX_STRIDE: tl.constexpr,
     K: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -456,17 +458,19 @@ def _stable_topk_regions(
     Mask=None,
     Pages=None,
     Indptr=None,
-    BATCH: tl.constexpr = 1,
+    BATCH=1,
     BLOCK_B: tl.constexpr = 1,
     POSITION_STRIDE: tl.constexpr = 0,
     ACTIVE_STRIDE: tl.constexpr = 0,
     TABLE_ROW: tl.constexpr = 0,
     TABLE_COL: tl.constexpr = 0,
     BLOCK_SIZE: tl.constexpr = 8,
+    PAGE_STRIDE: tl.constexpr = 0,
     PREPARE_PREFILL: tl.constexpr = False,
     Owners=None,
     OWNER_STRIDE: tl.constexpr = 0,
     INDPTR_STRIDE: tl.constexpr = 1,
+    SORT: tl.constexpr = True,
 ):
     row = tl.program_id(0)
     length = tl.load(Current + row).to(tl.int32)
@@ -491,12 +495,19 @@ def _stable_topk_regions(
         above = valid & (values > threshold)
         above_rank = tl.cumsum(above.to(tl.int32))
         num_above = tl.sum(above.to(tl.int32), 0)
-        output = Scratch + row * (K + 1)
+        # Unsorted output keeps the decode contract (-1 left padding, current
+        # last) in DeepSelect's deterministic order, skipping the 1024 sort.
+        if SORT:
+            output = Scratch + row * (K + 1)
+            pad = 0
+        else:
+            output = Output + row * (K + 1)
+            pad = K - tl.minimum(length, K)
         # Also initialize capture/dummy rows whose scores can be NaN.
         tl.store(output + col, -1, col < K)
         tl.store(output + K, length)
         tl.debug_barrier()
-        tl.store(output + above_rank - 1, chosen, above)
+        tl.store(output + pad + above_rank - 1, chosen, above)
         # Public top-k backends need not prefer smaller IDs at the cutoff.
         # Keep every score above the cutoff and fill ties in increasing region order.
         needed = tl.minimum(length, K) - num_above
@@ -513,20 +524,24 @@ def _stable_topk_regions(
             equal = (region < length) & (scores == threshold)
             rank = tl.cumsum(equal.to(tl.int32))
             tl.store(
-                output + num_above + found + rank - 1,
+                output + pad + num_above + found + rank - 1,
                 region,
                 equal & (found + rank <= needed),
             )
             found += tl.sum(equal.to(tl.int32), 0)
             start += BLOCK_SCAN
 
-        tl.debug_barrier()
-        sorted_col = tl.arange(0, BLOCK_SORT)
-        selected = tl.load(output + sorted_col, sorted_col <= K, other=2147483647)
-        selected = tl.sort(selected, descending=False)
+        if SORT:
+            tl.debug_barrier()
+            sorted_col = tl.arange(0, BLOCK_SORT)
+            selected = tl.load(output + sorted_col, sorted_col <= K, other=2147483647)
+            selected = tl.sort(selected, descending=False)
+        else:
+            selected = tl.full([BLOCK_SORT], -1, tl.int32)
 
     col = tl.arange(0, BLOCK_SORT)
-    tl.store(Output + row * (K + 1) + col, selected, col <= K)
+    if SORT or short_finite:
+        tl.store(Output + row * (K + 1) + col, selected, col <= K)
     if PREPARE_PREFILL:
         _emit_prefill_pages(
             selected,
@@ -564,7 +579,7 @@ def _stable_topk_regions(
             valid,
             other=0,
         )
-        page = physical * (BLOCK_SIZE // 8) + nonnegative % (BLOCK_SIZE // 8)
+        page = physical * PAGE_STRIDE + nonnegative % (BLOCK_SIZE // 8)
         tl.store(Pages + prefix + compact_col, page, valid)
         tl.store(Indptr + row, prefix)
         if row == BATCH - 1:
@@ -580,15 +595,21 @@ def select_regions(
     topk_lengths: torch.Tensor | None = None,
     paged_decode: PagedDecodeMetadata | None = None,
     paged_prefill: PagedPrefillMetadata | None = None,
+    sort: bool = True,
 ) -> torch.Tensor:
-    """Select stable top-k historical regions, append current, and sort by ID."""
+    """Select stable top-k historical regions and append current.
+
+    With ``sort=False`` selected regions keep top-k order, left-padded with -1.
+    """
     rows, regions = scores.shape
     k = min(topk, regions)
     if paged_prefill is not None:
         if paged_decode is not None or regions <= topk:
             raise ValueError("Fused prefill pages require scored prefill only")
-        if paged_prefill.block_size not in (16, 64, 128):
+        if paged_prefill.block_size not in (16, 32, 64, 128):
             raise ValueError("Unsupported prefill cache block size")
+    if not sort and (paged_decode is not None or paged_prefill is not None):
+        raise ValueError("Fused page metadata requires sorted regions")
     if paged_decode is not None and (k != 512 or regions <= topk):
         raise ValueError("Fused paged decode requires top-k 512 and more regions")
     if regions <= topk:
@@ -639,6 +660,7 @@ def select_regions(
             TABLE_ROW=paged_decode.block_table.stride(0),
             TABLE_COL=paged_decode.block_table.stride(1),
             BLOCK_SIZE=paged_decode.block_size,
+            PAGE_STRIDE=paged_decode.page_stride or paged_decode.block_size // 8,
         )
     if paged_prefill is not None:
         paged_kwargs = dict(
@@ -666,5 +688,6 @@ def select_regions(
         1024,
         triton.next_power_of_2(k + 1),
         **paged_kwargs,
+        SORT=sort,
     )
     return output

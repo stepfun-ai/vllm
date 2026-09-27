@@ -3636,3 +3636,32 @@ def test_revision_resolved_when_weights_match_model(mock_resolve):
     assert isinstance(config.revision, ResolvedRevision)
     assert config.revision.resolved == REVISION
     mock_resolve.assert_any_call(model, None, config.hf_token)
+
+
+@pytest.mark.parametrize("attention_support", ["NEVER", "UNIFORM_SINGLE_TOKEN_DECODE"])
+@pytest.mark.parametrize("breakable_enabled", [False, True])
+@pytest.mark.parametrize("piecewise_capture_available", [False, True])
+def test_spec_decode_retains_breakable_graphs_without_compile(
+    monkeypatch,
+    attention_support,
+    breakable_enabled,
+    piecewise_capture_available,
+):
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(breakable_enabled)))
+    envs.disable_envs_cache()
+    config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+    )
+    resolved = config.resolve_cudagraph_mode_and_sizes(
+        AttentionCGSupport[attention_support],
+        "FakeAttentionBackend",
+        uniform_decode_query_len=4,
+        piecewise_capture_available=piecewise_capture_available,
+    )
+    expected = (
+        CUDAGraphMode.PIECEWISE
+        if breakable_enabled and piecewise_capture_available
+        else CUDAGraphMode.NONE
+    )
+    assert resolved == expected

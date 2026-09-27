@@ -43,6 +43,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -108,6 +109,19 @@ def _can_fuse_decode_aux(metadata, runtime_mode: CUDAGraphMode) -> bool:
     )
 
 
+def _is_uniform_verify(
+    metadata, runtime_mode: CUDAGraphMode, num_speculative_tokens: int
+) -> bool:
+    return (
+        runtime_mode != CUDAGraphMode.PIECEWISE
+        and metadata is not None
+        and metadata.num_actual_tokens > 0
+        and metadata.max_query_len <= num_speculative_tokens + 1
+        and metadata.num_actual_tokens
+        == metadata.num_actual_reqs * metadata.max_query_len
+    )
+
+
 @eager_break_during_capture
 @maybe_transfer_kv_layer
 def step5_dsa_attention_with_output(
@@ -122,25 +136,25 @@ def step5_dsa_attention_with_output(
     dsa_proxy_z: torch.Tensor | None = None,
     dsa_summary_updated: bool = False,
     defer_inactive_clear: bool = False,
+    gate: torch.Tensor | None = None,
 ) -> None:
-    with torch.profiler.record_function("step5_dsa.op.get_attention_context"):
-        attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
-    with torch.profiler.record_function("step5_dsa.op.impl_forward"):
-        typing.cast(Any, attn_layer.impl).forward(
-            attn_layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output=output,
-            dsa_proxy_query=dsa_proxy_query,
-            dsa_proxy_key=dsa_proxy_key,
-            dsa_proxy_weights=dsa_proxy_weights,
-            dsa_proxy_z=dsa_proxy_z,
-            dsa_summary_updated=dsa_summary_updated,
-            defer_inactive_clear=defer_inactive_clear,
-        )
+    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    typing.cast(Any, attn_layer.impl).forward(
+        attn_layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        dsa_proxy_query=dsa_proxy_query,
+        dsa_proxy_key=dsa_proxy_key,
+        dsa_proxy_weights=dsa_proxy_weights,
+        dsa_proxy_z=dsa_proxy_z,
+        dsa_summary_updated=dsa_summary_updated,
+        defer_inactive_clear=defer_inactive_clear,
+        dsa_gate=gate,
+    )
 
 
 @eager_break_during_capture
@@ -1036,14 +1050,31 @@ class Step5Attention(nn.Module):
         # column-parallel GEMM if KV heads are partitioned (rather than
         # replicated) across TP ranks.  The local output layout is
         # [Q, K, V, gate].
-        weight_block_size = getattr(quant_config, "weight_block_size", None)
-        qkvg_widths = (self.q_size, self.kv_size, self.kv_size, self.num_heads)
         self.fuse_qkv_gate = (
             use_head_wise_attn_gate
             and self.total_num_kv_heads >= tp_size
             and (
-                weight_block_size is None
-                or all(width % weight_block_size[0] == 0 for width in qkvg_widths)
+                quant_config is None
+                or all(
+                    isinstance(
+                        LinearBase(
+                            hidden_size,
+                            width,
+                            quant_config=quant_config,
+                            prefix=f"{prefix}.{name}",
+                            tp_rank=self.rank,
+                            tp_size=tp_size,
+                        ).quant_method,
+                        UnquantizedLinearMethod,
+                    )
+                    for name, width in (
+                        (
+                            "qkv_proj",
+                            (self.total_num_heads + 2 * num_kv_heads) * self.head_dim,
+                        ),
+                        ("g_proj", self.total_num_heads),
+                    )
+                )
             )
         )
         self.sparse_config = sparse_config
@@ -1355,10 +1386,24 @@ class Step5Attention(nn.Module):
             self.attn.layer_name
         )
         decode_slots = None
-        if self.sparse_attn is not None and _can_fuse_decode_aux(
-            attn_metadata, get_forward_context().cudagraph_runtime_mode
+        speculative = (
+            typing.cast(Any, self.attn.impl).num_speculative_tokens
+            if self.sparse_attn is not None
+            else 0
+        )
+        runtime_mode = get_forward_context().cudagraph_runtime_mode
+        if (
+            self.sparse_attn is not None
+            and not speculative
+            and _can_fuse_decode_aux(attn_metadata, runtime_mode)
         ):
             decode_slots = attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens]
+        # MTP verify fuses the preparation only; its CSA update runs in the
+        # attention through the request journal.
+        fuse_prepare = decode_slots is not None or (
+            speculative > 0
+            and _is_uniform_verify(attn_metadata, runtime_mode, speculative)
+        )
         kv_cache_dummy_dep = None
         prepared_indexer = None
         if slot_mapping is not None and kv_cache.numel() > 0:
@@ -1368,7 +1413,7 @@ class Step5Attention(nn.Module):
             if (
                 self.sparse_attn is not None
                 and self.sparse_attn.fuse_qkv_preparation
-                and decode_slots is not None
+                and fuse_prepare
                 and 0 < qkv.shape[0] <= 128
             ):
                 (q, k, v), prepared_indexer = self.sparse_attn.prepare_qkv(
@@ -1397,6 +1442,9 @@ class Step5Attention(nn.Module):
                     self.rotary_dim if self.use_rope else 0,
                     self.q_norm.variance_epsilon,
                     float(self.zero_centered),
+                    self.attn.kv_cache_dtype,
+                    self.attn._k_scale,
+                    self.attn._v_scale,
                 )
             kv_cache_dummy_dep = q.new_empty(0)
         else:
@@ -1456,7 +1504,12 @@ class Step5Attention(nn.Module):
         if extra_dims is None and self.use_head_wise_attn_gate:
             extra_dims, _ = self.g_proj(hidden_states)
 
-        if self.use_head_wise_attn_gate and not self.fuse_swa_gate:
+        # SWA (fuse_swa_gate) and DSA attention apply the gate themselves.
+        if (
+            self.use_head_wise_attn_gate
+            and not self.fuse_swa_gate
+            and self.sparse_attn is None
+        ):
             assert extra_dims is not None
             attn_output = headwise_sigmoid_gate(
                 attn_output, extra_dims, slot_mapping=decode_slots
@@ -1479,7 +1532,6 @@ class Step5SparseAttention:
         self.fuse_qkv_preparation = (
             owner.params_dtype == torch.bfloat16
             and owner.head_dim == 192
-            and owner.num_kv_heads == 1
             and int(sparse_config.proxy_dim) == 256
             and int(sparse_config.sparse_indexer_num_k_heads) == 1
             and self.sparse_rotary_emb.is_neox_style
@@ -1503,7 +1555,11 @@ class Step5SparseAttention:
         owner = self.owner
         index_q, index_k, index_z, gate = owner.qkv_indexer_proj.split_indexer(qkzg)
         weights, _ = owner.sparse_indexer_w(hidden_states)
-        cache = typing.cast(Any, owner.attn.impl).summary_cache
+        cache = (
+            typing.cast(Any, owner.attn.impl).summary_cache
+            if decode_slots is not None
+            else None
+        )
         index_q, index_k, weights, q, k, v = qkv_indexer_norm_rope(
             index_q,
             index_k,
@@ -1529,9 +1585,11 @@ class Step5SparseAttention:
                 owner.rotary_dim if owner.use_rope else 0,
                 owner.q_norm.variance_epsilon,
                 float(owner.zero_centered),
+                owner.attn._k_scale,
+                owner.attn._v_scale,
             ),
             decode_cache=cache,
-            decode_z=index_z,
+            decode_z=index_z if cache is not None else None,
             decode_slots=decode_slots,
         )
         if owner.use_head_wise_attn_gate and gate is None:
@@ -1542,7 +1600,7 @@ class Step5SparseAttention:
             weights,
             index_z.view(-1, 1, 256),
             gate,
-            True,
+            cache is not None,
         )
 
     def forward(
@@ -1582,6 +1640,8 @@ class Step5SparseAttention:
             defer_inactive_clear=(
                 decode_slots is not None and self.owner.use_head_wise_attn_gate
             ),
+            # The attention applies the headwise gate while writing its output.
+            gate=extra_dims if self.owner.use_head_wise_attn_gate else None,
         )
         return attn_output, extra_dims
 
@@ -1598,6 +1658,7 @@ class Step5SparseAttention:
         kv_cache_dummy_dep: torch.Tensor | None = None,
         summary_updated: bool = False,
         defer_inactive_clear: bool = False,
+        gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn = self.owner.attn
         hidden_size = attn.num_heads * attn.head_size_v
@@ -1630,6 +1691,7 @@ class Step5SparseAttention:
             dsa_proxy_z,
             summary_updated,
             defer_inactive_clear,
+            gate,
         )
         return output.view(-1, hidden_size)
 
@@ -1879,7 +1941,6 @@ class Step5MoE(nn.Module):
             can_shard_sequence_parallel=self.use_mega_moe,
             reduce_in_fp32=True,
         )
-        # Keep shared experts separate and combine outputs in FP32.
         # Step5 selects experts with a correction bias but computes routed
         # weights from the unbiased sigmoid scores.
         expert_kwargs = dict(
@@ -1904,6 +1965,8 @@ class Step5MoE(nn.Module):
                 activation_clamp=swiglu_limit or None,
                 sequence_parallel=self.use_sequence_parallel,
             )
+            if config.fp32_residual_connection:
+                self.experts.routed_experts.configure_shared_expert(self.share_expert)
         else:
             self.experts = FusedMoEFactory(
                 **expert_kwargs,
@@ -1917,11 +1980,14 @@ class Step5MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         padding: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        shared_output = self.share_expert(hidden_states)
+        fused_shared = (
+            self.use_mega_moe and self.experts.routed_experts.has_fused_shared_experts
+        )
+        shared_output = None if fused_shared else self.share_expert(hidden_states)
 
         router_logits, _ = self.gate(hidden_states)
         expert_kwargs = {"padding": padding} if padding is not None else {}
@@ -1929,7 +1995,6 @@ class Step5MoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits, **expert_kwargs
         )
 
-        # Kept separate so _forward_ffn can combine in fp32 and all-reduce after.
         return shared_output, routed_output
 
 
@@ -2116,8 +2181,11 @@ class Step5DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.use_moe:
             shared_output, moe_output = self.moe(hidden_states, padding=padding)
-            # Combine shared and routed expert outputs
-            combined = self._add_for_residual(moe_output, shared_output)
+            combined = (
+                moe_output
+                if shared_output is None
+                else self._add_for_residual(moe_output, shared_output)
+            )
             # When fuse_all_reduce=True, the runner does NOT
             # all-reduce (reduce_results=False), so we must all-reduce
             # the combined output here. When fuse_all_reduce=False,
@@ -2560,6 +2628,13 @@ class Step5Model(nn.Module):
 class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     # Required so quantization exclude lists match fused module prefixes.
     packed_modules_mapping = STEP5_PACKED_MODULES_MAPPING
+
+    @staticmethod
+    def get_model_state_cls():
+        from .model_state import Step5ModelState
+
+        return Step5ModelState
+
     # The custom loader returns the complete loaded-parameter set.
     _enable_weights_track_by_default = True
 

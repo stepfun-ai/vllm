@@ -515,7 +515,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin, "
       "Tensor positions, Tensor slot_mapping, Tensor! k_cache, "
       "Tensor! v_cache, int head_dim, int num_q_heads, int num_kv_heads, "
-      "int rotary_pairs, float epsilon, float norm_weight_bias) -> ()");
+      "int rotary_pairs, float epsilon, float norm_weight_bias, "
+      "str kv_cache_dtype=\"auto\", Tensor? k_scale=None, Tensor? "
+      "v_scale=None) -> ()");
   ops.def(
       "minimax_allreduce_rms_qk("
       "Tensor qkv, Tensor norm_weight_q, Tensor norm_weight_k, "

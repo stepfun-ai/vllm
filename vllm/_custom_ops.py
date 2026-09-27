@@ -2667,8 +2667,11 @@ def fused_qknorm_rope_cache(
     rotary_dim: int,
     eps: float,
     norm_weight_bias: float = 0.0,
+    kv_cache_dtype: str = "auto",
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse per-head RMSNorm, partial NeoX RoPE and unquantized KV insertion.
+    """Fuse per-head RMSNorm, partial NeoX RoPE and KV insertion.
 
     Norm weights may be FP32 independently of QKV. A zero rotary dimension
     skips RoPE; norm outputs are rounded to QKV dtype before rotation.
@@ -2698,6 +2701,9 @@ def fused_qknorm_rope_cache(
         rotary_dim // 2,
         eps,
         norm_weight_bias,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
     )
     return q, k, v
 

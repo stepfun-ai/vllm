@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Step5 FP8/BF16 DeepGEMM MegaMoE with shared symmetric storage."""
 
+import inspect
 import weakref
 from importlib import import_module
 
@@ -15,13 +16,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.deep_gemm import _import_deep_gemm
-from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -29,10 +30,12 @@ logger = init_logger(__name__)
 class _BufferPool:
     # Modules retain their pool; removing the model releases the allocation.
     pools: weakref.WeakValueDictionary[
-        tuple[int, torch.device, int, int, int, int, int, str], "_BufferPool"
+        tuple[int, torch.device, int, int, int, int, int, str, int], "_BufferPool"
     ] = weakref.WeakValueDictionary()
 
-    def __init__(self, dg, group, experts, tokens, topk, hidden, intermediate, act):
+    def __init__(
+        self, dg, group, experts, tokens, topk, hidden, intermediate, act, shared
+    ):
         symm_buffer = import_module(f"{dg.__name__}.mega").SymmBuffer
         alignment = dg._C.get_token_alignment_for_mega_moe()
         tokens = (tokens + alignment - 1) // alignment * alignment
@@ -46,7 +49,7 @@ class _BufferPool:
                 intermediate,
                 dtype,
                 act,
-                0,
+                shared,
             )[0]
             for dtype in ("fp8xfp8", "bf16xbf16")
         }
@@ -59,6 +62,7 @@ class _BufferPool:
             hidden=hidden,
             intermediate_hidden=intermediate,
             activation=act,
+            num_shared_experts=shared,
         )
         self.owner = symm_buffer(**kwargs, mma_type=owner_type)
         self.views = {
@@ -69,14 +73,28 @@ class _BufferPool:
         }
 
     @classmethod
-    def get(cls, dg, group, experts, tokens, topk, hidden, intermediate, act, device):
-        key = (id(group), device, experts, tokens, topk, hidden, intermediate, act)
+    def get(
+        cls, dg, group, experts, tokens, topk, hidden, intermediate, act, device, shared
+    ):
+        key = (
+            id(group),
+            device,
+            experts,
+            tokens,
+            topk,
+            hidden,
+            intermediate,
+            act,
+            shared,
+        )
         pool = cls.pools.get(key)
         if pool is None:
             # Keep first-launch ordering consistent across EP ranks (Kimi path).
             torch.accelerator.synchronize()
             torch.distributed.barrier(group=get_ep_group().cpu_group)
-            pool = cls(dg, group, experts, tokens, topk, hidden, intermediate, act)
+            pool = cls(
+                dg, group, experts, tokens, topk, hidden, intermediate, act, shared
+            )
             cls.pools[key] = pool
         return pool
 
@@ -178,12 +196,43 @@ class Step5MegaMoEExperts(nn.Module):
                 set_weight_attrs(scale, {"weight_loader": self.weight_loader})
                 self.register_parameter(f"{name}_weight_scale_inv", scale)
         self.quant_method = _MegaMoEMethod()
+        self.num_shared_experts = 0
+        self._shared_expert_ref: weakref.ReferenceType | None = None
+        self.register_buffer("shared_l1_weight", None, persistent=False)
+        self.register_buffer("shared_l2_weight", None, persistent=False)
         self.ready = False
         self.pool = None
-        context = vllm_config.compilation_config.static_forward_context
-        if prefix in context:
-            raise ValueError(f"Duplicate MegaMoE layer: {prefix}")
-        context[prefix] = self
+
+    @property
+    def has_fused_shared_experts(self) -> bool:
+        return self.num_shared_experts > 0
+
+    def configure_shared_expert(self, shared_expert) -> None:
+        if self.fp8 or shared_expert.shard_sequence_parallel:
+            return
+        gate_up, down = shared_expert.gate_up_proj, shared_expert.down_proj
+        shared_activation = "swiglustep" if shared_expert.limit else "swiglu"
+        if (
+            shared_activation != self.activation
+            or (shared_expert.limit or None) != self.activation_clamp
+            or gate_up.tp_size != 1
+            or down.tp_size != 1
+            or not isinstance(gate_up.quant_method, UnquantizedLinearMethod)
+            or not isinstance(down.quant_method, UnquantizedLinearMethod)
+            or gate_up.weight.dtype != torch.bfloat16
+            or down.weight.dtype != torch.bfloat16
+        ):
+            return
+        intermediate = down.weight.shape[1]
+        if intermediate % self.intermediate_size:
+            return
+        if gate_up.weight.shape != (2 * intermediate, self.hidden_size):
+            return
+        if down.weight.shape[0] != self.hidden_size:
+            return
+        self.num_shared_experts = intermediate // self.intermediate_size
+        # Keep the checkpoint's original parameter names and module ownership.
+        self._shared_expert_ref = weakref.ref(shared_expert)
 
     def weight_loader(
         self,
@@ -255,6 +304,26 @@ class Step5MegaMoEExperts(nn.Module):
         if self.fp8:
             self.w13_weight_scale_inv.data = w1[1]
             self.w2_weight_scale_inv.data = w2[1]
+        if self.has_fused_shared_experts:
+            if (
+                "combine_in_fp32"
+                not in inspect.signature(self.dg.bf16_mega_moe).parameters
+            ):
+                raise RuntimeError(
+                    "Step5 BF16 shared fusion requires a DeepGEMM build with "
+                    "bf16_mega_moe(combine_in_fp32=True)"
+                )
+            assert self._shared_expert_ref is not None
+            shared = self._shared_expert_ref()
+            if shared is None:
+                raise RuntimeError("Step5 shared expert was released before loading")
+            self.shared_l1_weight, self.shared_l2_weight = (
+                self.dg.transform_weights_for_mega_moe(
+                    shared.gate_up_proj.weight.data,
+                    shared.down_proj.weight.data,
+                    activation=self.activation,
+                )
+            )
         self.ready = True
 
     def get_symm_buffer(self):
@@ -274,6 +343,7 @@ class Step5MegaMoEExperts(nn.Module):
             self.intermediate_size,
             self.activation,
             self.w13_weight.device,
+            self.num_shared_experts,
         )
         return self.pool.views[self.mma_type]
 
@@ -314,7 +384,19 @@ class Step5MegaMoEExperts(nn.Module):
                 buffer.topk_weights[:n].masked_fill_(padding[:n, None], 0)
             w1, w2 = self.w13_weight, self.w2_weight
             kernel = self.dg.bf16_mega_moe
-        output = torch.empty_like(hidden_states)
+        shared_kwargs = {}
+        if self.has_fused_shared_experts:
+            shared_kwargs = dict(
+                shared_l1_weights=self.shared_l1_weight,
+                shared_l2_weights=self.shared_l2_weight,
+                combine_in_fp32=True,
+            )
+        output = torch.empty_like(
+            hidden_states,
+            dtype=torch.float32
+            if self.has_fused_shared_experts
+            else hidden_states.dtype,
+        )
         kernel(
             y=output,
             l1_weights=w1,
@@ -322,61 +404,35 @@ class Step5MegaMoEExperts(nn.Module):
             sym_buffer=buffer,
             activation=self.activation,
             activation_clamp=self.activation_clamp,
+            **shared_kwargs,
         )
         if not getattr(self, "_kernel_logged", False):
             if self.group.rank() == 0:
                 logger.info(
                     "Step5 MegaMoE executed: layer=%s kernel=%s mma=%s "
-                    "weight_dtype=%s buffer_owner=%s tokens=%d",
+                    "weight_dtype=%s buffer_owner=%s tokens=%d "
+                    "fused_shared=%d output_dtype=%s",
                     self.prefix,
                     "fp8_fp4_mega_moe" if self.fp8 else "bf16_mega_moe",
                     self.mma_type,
                     self.w13_weight.dtype,
                     id(self.pool.owner),
                     n,
+                    self.num_shared_experts,
+                    output.dtype,
                 )
             self._kernel_logged = True
         return output
 
     def forward(self, hidden_states, topk_weights, topk_ids, padding=None):
-        if not is_forward_context_available():
-            return self._forward_impl(hidden_states, topk_weights, topk_ids, padding)
-        return torch.ops.vllm.step5_mega_moe(
-            hidden_states, topk_weights, topk_ids, self.prefix, padding
-        )
+        return self._forward_impl(hidden_states, topk_weights, topk_ids, padding)
 
 
 Step5MegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
 
 
-def _mega_moe(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    layer_name: str,
-    padding: torch.Tensor | None = None,
-) -> torch.Tensor:
-    layer = get_forward_context().no_compile_layers[layer_name]
-    return layer._forward_impl(hidden_states, topk_weights, topk_ids, padding)
-
-
-def _mega_moe_fake(
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    layer_name: str,
-    padding: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
-direct_register_custom_op(
-    op_name="step5_mega_moe", op_func=_mega_moe, fake_impl=_mega_moe_fake
-)
-
-
 class Step5MegaMoE(nn.Module):
-    """Router plus EP experts; shared experts are managed by the caller."""
+    """Router plus EP experts, with optional fused BF16 shared experts."""
 
     def __init__(
         self,
@@ -399,7 +455,6 @@ class Step5MegaMoE(nn.Module):
         super().__init__()
         self.sequence_parallel = sequence_parallel
         self.layer_id = extract_layer_index(prefix)
-        self.capture_fn = None
         self.router = create_fused_moe_router(
             top_k=top_k,
             global_num_experts=num_experts,
@@ -429,8 +484,6 @@ class Step5MegaMoE(nn.Module):
         weights, ids = self.router.select_experts(
             hidden_states, router_logits, topk_indices_dtype=torch.int64
         )
-        if self.capture_fn is not None:
-            self.capture_fn(ids)
         num_tokens = hidden_states.shape[0]
         if (
             padding is None

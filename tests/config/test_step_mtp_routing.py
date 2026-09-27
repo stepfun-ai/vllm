@@ -187,7 +187,7 @@ def test_heterogeneous_draft_uses_draft_tokenizer_revision(monkeypatch):
     "architecture",
     ["Step5ForCausalLM", "Step5ForConditionalGeneration", "Step5MTP"],
 )
-def test_step5_v2_model_runner_support_excludes_mtp(architecture):
+def test_step5_v2_model_runner_support_includes_mtp(architecture):
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             architecture=architecture,
@@ -220,4 +220,49 @@ def test_step5_v2_model_runner_support_excludes_mtp(architecture):
         cast(VllmConfig, config)
     )
 
-    assert unsupported == (["Step5 MTP"] if architecture == "Step5MTP" else [])
+    assert unsupported == []
+
+
+def test_step5_mtp_requires_v2_model_runner():
+    """DSA speculative undo needs MRv2 persistent request indices."""
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(is_diffusion=False),
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            enable_adaptive_verification=False,
+            draft_model_config=SimpleNamespace(architecture="Step5MTP"),
+        ),
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=1, enable_batch_sharded_sampling=False
+        ),
+        _dflash_needs_multi_kv_group=lambda: False,
+        _is_dflash2_draft=lambda: False,
+    )
+
+    unsupported = VllmConfig._get_v1_model_runner_unsupported_features(
+        cast(VllmConfig, config)
+    )
+
+    assert unsupported == ["Step5 MTP"]
+
+
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3])
+def test_step5_mrv2_uses_module_aware_proposer(monkeypatch, num_speculative_tokens):
+    from vllm.v1.worker.gpu.spec_decode import init_speculator
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import speculator as multi
+
+    config = object.__new__(SpeculativeConfig)
+    config.method = "mtp"
+    config.num_speculative_tokens = num_speculative_tokens
+    config.draft_model_config = cast(
+        ModelConfig,
+        SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="step5_mtp", num_nextn_predict_layers=3
+            )
+        ),
+    )
+    sentinel = object()
+    monkeypatch.setattr(multi, "MultiModuleMTPSpeculator", lambda *args: sentinel)
+    vllm_config = cast(VllmConfig, SimpleNamespace(speculative_config=config))
+    assert init_speculator(vllm_config, None) is sentinel

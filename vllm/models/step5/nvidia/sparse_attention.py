@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B300 sparse attention using FlashInfer and PyTorch."""
 
-from typing import Any, ClassVar, cast
+import functools
+from typing import Any, ClassVar, NamedTuple, cast
 
+import numpy as np
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
@@ -17,9 +19,48 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from .ops.attention_gate import headwise_sigmoid_gate
 from .ops.sparse_prefill import make_prefill_chunks
+from .ops.sparse_prefill_pages import plan_staged_prefill_pages, stage_prefill_pages
+from .ops.summary_update import build_prefill_groups
+
+# Transient dense BF16 copy of a prefill batch's live pages for one KV group.
+_PREFILL_STAGING_BYTES = 512 << 20
+
+
+class _PrefillLayout(NamedTuple):
+    heads_per_group: int
+    head_size: int
+    groups: int
+    dtype: torch.dtype
+    quantized: bool
+    block_size: int
+
+
+def _upload(values: np.ndarray, device: torch.device) -> torch.Tensor:
+    return (
+        torch.from_numpy(values.astype(np.int64))
+        .pin_memory()
+        .to(device, non_blocking=True)
+    )
+
+
+def _request_state(attn_metadata) -> torch.Tensor:
+    state = getattr(attn_metadata, "step5_request_state", None)
+    if state is None:
+        raise RuntimeError(
+            "Step5 DSA speculative decoding requires the V2 model runner "
+            "(Step5ModelState supplies persistent request indices)"
+        )
+    return state
+
+
+@functools.cache
+def _num_sms(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 class Step5SplitKVFlashAttentionImpl(FlashAttentionImpl):
@@ -45,8 +86,6 @@ class Step5SplitKVFlashAttentionImpl(FlashAttentionImpl):
     ):
         from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-        from .ops.attention_gate import headwise_sigmoid_gate
-
         if (
             attn_metadata is None
             or not attn_metadata.num_actual_tokens
@@ -70,6 +109,42 @@ class Step5SplitKVFlashAttentionImpl(FlashAttentionImpl):
 
         n = attn_metadata.num_actual_tokens
         key_cache, value_cache = self._split_kv_cache(kv_cache)
+        requests = attn_metadata.seq_lens.shape[0]
+        query_len = attn_metadata.max_query_len
+        if (
+            n == requests * query_len
+            and query_len <= 4
+            and self.head_size == 192
+            and self.num_heads // self.num_kv_heads <= 16
+            and self.sliding_window[1] == 0
+        ):
+            # Uniform decode and MTP verify: GQA-packed split-window kernel.
+            from .ops.swa_decode import swa_decode_gated, swa_decode_plan
+
+            window = self.sliding_window[0] + 1
+            pack, splits = swa_decode_plan(
+                n,
+                self.num_kv_heads,
+                self.num_heads // self.num_kv_heads,
+                query_len,
+                _num_sms(query.device),
+                window,
+            )
+            swa_decode_gated(
+                query[:n],
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[:requests],
+                attn_metadata.seq_lens,
+                gate[:n],
+                output[:n],
+                scale=self.scale,
+                window=window,
+                query_len=query_len,
+                splits=splits,
+                pack=pack,
+            )
+            return output
         flash_attn_varlen_func(
             q=query[:n],
             k=key_cache,
@@ -138,6 +213,17 @@ def _validate_step5_dsa_attention_contract(
 class Step5DSAMetadataBuilder(FlashAttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     supports_update_block_table = False
+    # Set by Step5ModelState: persistent request state indices (MRv2).
+    step5_request_state: torch.Tensor | None = None
+    # Overrides the static forward context lookup of the DSA impl (tests).
+    step5_impl: Any = None
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        # MTP verify batches take the multi-token decode path.
+        if vllm_config.speculative_config is not None:
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
@@ -145,18 +231,81 @@ class Step5DSAMetadataBuilder(FlashAttentionMetadataBuilder):
         step5_metadata.num_actual_reqs = common_attn_metadata.num_reqs
         step5_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         step5_metadata.step5_runtime = None
+        request_state = self.step5_request_state
+        step5_metadata.step5_request_state = (
+            request_state[: common_attn_metadata.num_reqs]
+            if request_state is not None
+            else None
+        )
+        self._plan_prefill(step5_metadata, common_attn_metadata)
         return metadata
+
+    def _impl(self):
+        impl = self.step5_impl
+        if impl is None and self.layer_names:
+            context = self.vllm_config.compilation_config.static_forward_context
+            layer = context.get(self.layer_names[0])
+            impl = getattr(layer, "impl", None)
+        return impl
+
+    def _plan_prefill(self, metadata, common) -> None:
+        """Plan prefill steps here, before the forward, so the forward has no
+        host sync: host lengths come from the scheduler and exact positions
+        stay on device. Uniform (decode and MTP verify) batches need no plan.
+        """
+        impl = self._impl()
+        n, reqs, query_len = (
+            common.num_actual_tokens,
+            common.num_reqs,
+            common.max_query_len,
+        )
+        if (
+            impl is None
+            or impl.adapter is None
+            or impl.summary_cache is None
+            or not n
+            or common.seq_lens_cpu_upper_bound is None
+            or (n == reqs * query_len and query_len <= impl.num_speculative_tokens + 1)
+        ):
+            return
+        # Upper bounds are exact without speculative decoding.
+        positions = common.positions[:n] if impl.num_speculative_tokens else None
+        if impl.num_speculative_tokens and common.positions is None:
+            return
+        spec = cast(AttentionSpec, self.kv_cache_spec)
+        metadata.step5_runtime = impl.plan_prefill_step(
+            metadata,
+            n,
+            common.seq_lens_cpu_upper_bound[:reqs].numpy(),
+            _PrefillLayout(
+                impl.num_heads // spec.num_kv_heads,
+                spec.head_size,
+                spec.num_kv_heads,
+                self.vllm_config.model_config.dtype,
+                is_quantized_kv_cache(impl.kv_cache_dtype),
+                spec.block_size,
+            ),
+            positions,
+        )
 
     def use_cascade_attention(self, *args, **kwargs):
         return False
 
 
 class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
+    num_speculative_tokens = 0
     can_return_lse_for_decode = False
     supports_dcp = False
 
     def __init__(
         self,
+        num_heads,
+        head_size,
+        scale,
+        num_kv_heads,
+        alibi_slopes,
+        sliding_window,
+        kv_cache_dtype,
         *args,
         sparse_config=None,
         max_model_len=None,
@@ -164,7 +313,19 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         num_speculative_tokens=0,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        # Sparse attention consumes model-dtype KV gathered from the cache.
+        super().__init__(
+            num_heads,
+            head_size,
+            scale,
+            num_kv_heads,
+            alibi_slopes,
+            sliding_window,
+            "auto",
+            *args,
+            **kwargs,
+        )
+        self.kv_cache_dtype = kv_cache_dtype
         config = get_current_vllm_config_or_none()
         if not current_platform.is_device_capability(103):
             raise NotImplementedError("Step5 DSA currently supports B300 (SM103) only")
@@ -173,20 +334,22 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             config.compilation_config.cudagraph_num_of_warmups = max(
                 1, config.compilation_config.cudagraph_num_of_warmups
             )
-            if config.speculative_config is not None:
-                raise NotImplementedError(
-                    "Step5 does not currently support speculative decoding"
-                )
             if config.parallel_config.decode_context_parallel_size > 1:
                 raise NotImplementedError(
                     "Step5 does not support decode context parallelism"
                 )
             if config.parallel_config.use_ubatching:
                 raise NotImplementedError("Step5 does not support DBO/ubatching")
-        if num_speculative_tokens:
-            raise NotImplementedError("Step5 does not currently support MTP")
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError("Step5 requires BF16 or FP16 KV cache")
+        self.num_speculative_tokens = (
+            config.speculative_config.num_speculative_tokens
+            if config is not None and config.speculative_config is not None
+            else num_speculative_tokens
+        )
+        if is_quantized_kv_cache(self.kv_cache_dtype) and self.kv_cache_dtype not in (
+            "fp8",
+            "fp8_e4m3",
+        ):
+            raise NotImplementedError("Step5 DSA supports E4M3 FP8 KV cache only")
         _validate_step5_dsa_attention_contract(
             dtype=torch.get_default_dtype(),
             head_size=self.head_size,
@@ -221,7 +384,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         dsa_proxy_z=None,
         dsa_summary_updated=False,
         defer_inactive_clear=False,
+        dsa_gate=None,
     ):
+        """``dsa_gate`` ([tokens, heads]) returns headwise-gated output."""
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("Step5 does not support output quantization")
         if output is None:
@@ -234,12 +399,84 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             output[n:].zero_()
         if not n:
             return output
-        is_decode = (
-            attn_metadata.max_query_len == 1 and n == attn_metadata.num_actual_reqs
+        # Uniform batches take the decode kernels, including MTP verify where
+        # each request scores k + 1 tokens as independent rows. That path has
+        # no host metadata, so it is FULL CUDA graph capturable.
+        query_len = attn_metadata.max_query_len
+        is_decode = n == attn_metadata.num_actual_reqs * query_len and (
+            query_len <= self.num_speculative_tokens + 1
         )
         if (dsa_summary_updated or defer_inactive_clear) and not is_decode:
             raise ValueError("Decode attention fusions cannot be used for prefill")
+        # The direct sparse decode kernel applies the gate while writing out;
+        # other paths gate the finished output.
+        fuse_gate = (
+            is_decode
+            and query.shape[2] == 192
+            and query.shape[1] // kv_cache.shape[1] <= 16
+            and kv_cache.shape[-1] == 384
+        )
+        if dsa_gate is not None and not fuse_gate:
+            self.forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                dsa_proxy_query=dsa_proxy_query,
+                dsa_proxy_key=dsa_proxy_key,
+                dsa_proxy_weights=dsa_proxy_weights,
+                dsa_proxy_z=dsa_proxy_z,
+                dsa_summary_updated=dsa_summary_updated,
+                defer_inactive_clear=defer_inactive_clear,
+            )
+            gated = headwise_sigmoid_gate(output[:n].flatten(1), dsa_gate[:n])
+            output[:n].copy_(gated.view_as(output[:n]))
+            return output
+        kv_scales = (
+            (layer._k_scale, layer._v_scale)
+            if kv_cache.dtype in (torch.uint8, torch.float8_e4m3fn)
+            else (None, None)
+        )
         groups = kv_cache.shape[1]
+        if not is_decode and attn_metadata.step5_runtime is None:
+            # Fallback when the builder could not plan ahead: one host sync.
+            count = attn_metadata.num_actual_reqs
+            attn_metadata.step5_runtime = self.plan_prefill_step(
+                attn_metadata,
+                n,
+                attn_metadata.seq_lens[:count].cpu().numpy(),
+                _PrefillLayout(
+                    query.shape[1] // groups,
+                    query.shape[2],
+                    groups,
+                    query.dtype,
+                    kv_cache.dtype in (torch.uint8, torch.float8_e4m3fn),
+                    kv_cache.shape[2],
+                ),
+            )
+        if groups > 1 and is_decode:
+            # Fold (token, KV group) into rows: one launch chain for all groups.
+            rows, heads, dim = n * groups, query.shape[1] // groups, query.shape[2]
+            self._forward_decode(
+                query[:n].view(rows, heads, dim),
+                kv_cache,
+                attn_metadata,
+                output[:n].view(rows, heads, dim),
+                # Indexer outputs may be group-major; kernels read their strides.
+                dsa_proxy_query[:n],
+                dsa_proxy_key[:n],
+                dsa_proxy_weights[:n],
+                dsa_proxy_z[:n],
+                summary_updated=dsa_summary_updated,
+                defer_inactive_clear=defer_inactive_clear,
+                kv_scales=kv_scales,
+                query_len=query_len,
+                gate=dsa_gate,
+            )
+            return output
         if groups > 1:
             heads = query.shape[1] // groups
             # FlashInfer's output rows are contiguous even when KV is strided.
@@ -261,14 +498,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                     dsa_proxy_weights[:n, group : group + 1],
                     dsa_proxy_z[:n],
                 )
-                if is_decode:
-                    self._forward_decode(
-                        *args,
-                        summary_updated=dsa_summary_updated or group > 0,
-                        defer_inactive_clear=defer_inactive_clear,
-                    )
-                else:
-                    self._forward_prefill(*args, summary_updated=group > 0)
+                self._forward_prefill(
+                    *args, summary_updated=group > 0, kv_scales=kv_scales
+                )
             output[:n].view(n, groups, heads, query.shape[2]).copy_(
                 grouped_output.transpose(0, 1)
             )
@@ -285,6 +517,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                 dsa_proxy_z[:n],
                 summary_updated=dsa_summary_updated,
                 defer_inactive_clear=defer_inactive_clear,
+                kv_scales=kv_scales,
+                query_len=query_len,
+                gate=dsa_gate,
             )
         return self._forward_prefill(
             query[:n],
@@ -295,6 +530,99 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             dsa_proxy_key[:n],
             dsa_proxy_weights[:n],
             dsa_proxy_z[:n],
+            kv_scales=kv_scales,
+        )
+
+    def plan_prefill_step(self, attn_metadata, n, lengths, layout, positions=None):
+        """Layer-invariant prefill metadata, built once per step.
+
+        ``lengths`` are host sequence lengths. Without ``positions`` they must
+        be exact; with exact device ``positions`` they may be upper bounds
+        (MRv2 speculative decoding), which is what lets the metadata builder
+        plan before the forward without a host sync. Returns None if only the
+        ragged fallback applies and the lengths are not exact. ``layout`` is a
+        ``_PrefillLayout`` of the full (all-group) query and KV cache.
+        """
+        assert self.summary_cache is not None and self.adapter is not None
+        exact = positions is None
+        device = attn_metadata.slot_mapping.device
+        count = attn_metadata.num_actual_reqs
+        starts = attn_metadata.query_start_loc_cpu[: count + 1].numpy()
+        query_lens = np.diff(starts)
+        host_positions = np.arange(n) + np.repeat(
+            lengths - query_lens - starts[:-1], query_lens
+        )
+        owners = _upload(np.repeat(np.arange(count), query_lens), device)
+        if positions is None:
+            positions = _upload(host_positions, device)
+        table = attn_metadata.block_table[:count]
+        num_regions = (int(lengths.max()) + 7) // 8
+        groups, block_size = layout.groups, layout.block_size
+        # FP8 and multi-group (strided) caches cannot feed the paged FA2
+        # kernels directly; stage live pages into dense BF16 per layer
+        # instead of gathering ~4K tokens of KV for every query row.
+        staging = layout.quantized or groups > 1
+        staged_pages = int(((lengths + block_size - 1) // block_size).sum())
+        paged_plan = None
+        if not staging or (
+            staged_pages * block_size * layout.head_size * 4 <= _PREFILL_STAGING_BYTES
+        ):
+            paged_plan = self.adapter.prepare_prefill_attention(
+                (n, layout.heads_per_group, layout.head_size),
+                layout.dtype,
+                device,
+                block_size,
+                host_positions,
+                min(num_regions, self.sparse_topk) + 1,
+                self.scale,
+                contiguous_query=groups == 1,
+            )
+        if paged_plan is None and not exact:
+            return None
+        if paged_plan is not None and not exact:
+            paged_plan.fixup_positions(positions)
+        staged = (
+            plan_staged_prefill_pages(table, lengths.tolist(), block_size)
+            if paged_plan is not None and staging
+            else None
+        )
+        attn_table = table if staged is None else staged.table
+        chunks = (
+            make_prefill_chunks(host_positions.tolist(), self.sparse_topk, device)
+            if paged_plan is None
+            else None
+        )
+        summary_plan = build_prefill_groups(
+            attn_metadata.slot_mapping[:n],
+            positions,
+            owners,
+            attn_metadata.query_start_loc[: count + 1],
+            block_size,
+            # Speculative rows in each last window are journaled separately.
+            prefix_width=self.num_speculative_tokens + 1
+            if self.num_speculative_tokens
+            else 0,
+        )
+        indexer = self.adapter.prefill_metadata(
+            owners,
+            positions,
+            num_regions,
+            self.sparse_topk,
+            paged_prefill=(
+                paged_plan.page_metadata(attn_table, owners)
+                if paged_plan is not None and num_regions <= self.sparse_topk
+                else None
+            ),
+        )
+        return (
+            owners,
+            positions,
+            num_regions,
+            chunks,
+            indexer,
+            paged_plan,
+            summary_plan,
+            staged,
         )
 
     def _forward_prefill(
@@ -309,64 +637,43 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         dsa_proxy_z,
         *,
         summary_updated=False,
+        kv_scales=(None, None),
     ):
         assert self.summary_cache is not None and self.adapter is not None
         n = query.shape[0]
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Step5 prefill requires a breakable CUDA graph")
         table = attn_metadata.block_table[: attn_metadata.num_actual_reqs]
-        if attn_metadata.step5_runtime is None:
-            count = attn_metadata.num_actual_reqs
-            starts = attn_metadata.query_start_loc_cpu[: count + 1].tolist()
-            lengths = attn_metadata.seq_lens[:count].tolist()
-            slots = attn_metadata.slot_mapping[:n].tolist()
-            owners_cpu: list[int] = []
-            positions_cpu: list[int] = []
-            for req in range(count):
-                qlen = starts[req + 1] - starts[req]
-                owners_cpu.extend([req] * qlen)
-                positions_cpu.extend(range(lengths[req] - qlen, lengths[req]))
-            owners = torch.tensor(owners_cpu, device=query.device, dtype=torch.long)
-            positions = torch.tensor(
-                positions_cpu, device=query.device, dtype=torch.long
-            )
-            num_regions = (max(lengths) + 7) // 8
-            paged_plan = self.adapter.prepare_prefill_attention(
-                query[:n],
-                kv_cache,
-                positions_cpu,
-                min(num_regions, self.sparse_topk) + 1,
-                self.scale,
-            )
-            chunks = (
-                make_prefill_chunks(positions_cpu, self.sparse_topk, query.device)
-                if paged_plan is None
-                else None
-            )
-            attn_metadata.step5_runtime = (
-                slots,
-                owners,
-                positions,
-                num_regions,
-                chunks,
-                self.adapter.prefill_metadata(
-                    owners,
-                    positions,
-                    num_regions,
-                    self.sparse_topk,
-                    paged_prefill=(
-                        paged_plan.page_metadata(table, owners)
-                        if paged_plan is not None and num_regions <= self.sparse_topk
-                        else None
-                    ),
-                ),
-                paged_plan,
-            )
-        slots, owners, positions, num_regions, chunks, indexer, paged_plan = (
-            attn_metadata.step5_runtime
-        )
+        (
+            owners,
+            positions,
+            num_regions,
+            chunks,
+            indexer,
+            paged_plan,
+            summary_plan,
+            staged,
+        ) = attn_metadata.step5_runtime
+        attn_cache, attn_table = kv_cache, table
+        if staged is not None:
+            attn_cache = stage_prefill_pages(kv_cache, staged, query.dtype, *kv_scales)
+            attn_table = staged.table
         if not summary_updated:
-            self.summary_cache.update(dsa_proxy_key[:n], dsa_proxy_z[:n], slots)
+            if self.num_speculative_tokens:
+                count = attn_metadata.num_actual_reqs
+                self.summary_cache.update_request_journal(
+                    dsa_proxy_key[:n],
+                    dsa_proxy_z[:n],
+                    attn_metadata.slot_mapping[:n],
+                    attn_metadata.query_start_loc[: count + 1],
+                    attn_metadata.seq_lens[:count],
+                    _request_state(attn_metadata)[:count],
+                    summary_plan,
+                )
+            else:
+                self.summary_cache.update(
+                    dsa_proxy_key[:n], dsa_proxy_z[:n], [], summary_plan
+                )
         packed_summaries = None
         if num_regions > self.sparse_topk:
             packed_summaries = self.adapter.pack_summaries(
@@ -398,7 +705,7 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                     self.sparse_topk,
                     topk_lengths=indexer_meta.topk_lengths,
                     paged_prefill=(
-                        paged_plan.page_metadata(table, owners, start, end)
+                        paged_plan.page_metadata(attn_table, owners, start, end)
                         if paged_plan is not None
                         else None
                     ),
@@ -408,9 +715,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                     paged_plan.prepare_chunk(
                         start,
                         query[start:end],
-                        kv_cache,
+                        attn_cache,
                         selected,
-                        table,
+                        attn_table,
                         owners[start:end],
                     )
                 start = end
@@ -425,10 +732,12 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                 output[start:end],
                 self.scale,
                 prefill_chunks=chunks[start // 32 : (end + 31) // 32],
+                k_scale=kv_scales[0],
+                v_scale=kv_scales[1],
             )
             start = end
         if paged_plan is not None:
-            paged_plan.finish(query[:n], kv_cache, output[:n])
+            paged_plan.finish(query[:n], attn_cache, output[:n])
         return output
 
     def _forward_decode(
@@ -444,14 +753,32 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         *,
         summary_updated=False,
         defer_inactive_clear=False,
+        kv_scales=(None, None),
+        query_len=1,
+        gate=None,
     ):
         assert self.summary_cache is not None and self.adapter is not None
-        n = query.shape[0]
+        n = proxy_key.shape[0]
+        requests = n // query_len
         slots = metadata.slot_mapping[:n]
-        table = metadata.block_table[:n]
-        if not summary_updated:
+        table = metadata.block_table[:requests]
+        seq_lens = metadata.seq_lens[:requests]
+        if self.num_speculative_tokens:
+            # Tokens of one request update the same open region in order, and
+            # rejected drafts are undone next step from the request journal.
+            assert not summary_updated
+            self.summary_cache.update_request_journal(
+                proxy_key,
+                proxy_z,
+                slots,
+                metadata.query_start_loc[: requests + 1],
+                seq_lens,
+                _request_state(metadata)[:requests],
+            )
+        elif not summary_updated:
             self.summary_cache.update_decode(proxy_key, proxy_z, slots)
         num_regions = min(self.max_num_regions, table.shape[1] * kv_cache.shape[2] // 8)
+        # Rows are (token, KV group): row r is group r % G of token r // G.
         scores, decode = self.adapter.decode_logits(
             proxy_query,
             proxy_weights,
@@ -459,7 +786,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             table,
             num_regions,
             slots,
-            metadata.seq_lens[:n],
+            seq_lens,
+            row_groups=kv_cache.shape[1],
+            query_len=query_len,
         )
         self.adapter.select_and_run_decode_attention(
             query,
@@ -474,6 +803,10 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             self.scale,
             topk_lengths=decode.topk_lengths,
             clear_inactive=not defer_inactive_clear,
+            k_scale=kv_scales[0],
+            v_scale=kv_scales[1],
+            query_len=query_len,
+            gate=gate,
         )
         return output
 
@@ -501,6 +834,8 @@ class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
     forward_includes_kv_cache_update: bool = False
 
@@ -511,6 +846,35 @@ class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
         return int(head_size) in (128, 192)
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        return kv_cache_dtype is None or kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+        device_capability,
+    ):
+        return super().supports_combination(
+            head_size,
+            dtype,
+            "auto",
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:

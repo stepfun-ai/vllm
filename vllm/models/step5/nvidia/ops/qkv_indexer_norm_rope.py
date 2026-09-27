@@ -9,7 +9,7 @@ from vllm.triton_utils import tl, triton
 from .indexer_norm_rope import _indexer_norm_rope
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SLOT_ROWS"])
 def _prepare_main(
     QKV,
     QWeight,
@@ -29,13 +29,16 @@ def _prepare_main(
     STRIDE: tl.constexpr,
     ROTARY: tl.constexpr,
     ROPE_STRIDE: tl.constexpr,
-    SLOT_ROWS: tl.constexpr,
+    SLOT_ROWS,
     BLOCK_SIZE: tl.constexpr,
     CACHE_BLOCK: tl.constexpr,
     CACHE_TOKEN: tl.constexpr,
     CACHE_HEAD: tl.constexpr,
     EPS: tl.constexpr,
     BIAS: tl.constexpr,
+    KScale,
+    VScale,
+    FP8_CACHE: tl.constexpr,
 ):
     DIM: tl.constexpr = 192
     LANES: tl.constexpr = 32 if ROTARY > 128 else 16
@@ -104,10 +107,14 @@ def _prepare_main(
         + d[None, :]
     )
     cache_ptr = tl.where((h < QH + KH)[:, None], KCache + offset, VCache + offset)
+    if FP8_CACHE:
+        scale = tl.where((h < QH + KH)[:, None], tl.load(KScale), tl.load(VScale))
+        result = tl.div_rn(result.to(tl.float32), scale)
+        result = tl.minimum(tl.maximum(result, -448.0), 448.0)
     tl.store(cache_ptr, result, valid & (h >= QH)[:, None] & (slot >= 0))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["CSA_ROWS", "TOKENS"])
 def _joint_prepare(
     Q,
     K,
@@ -128,7 +135,7 @@ def _joint_prepare(
     Maximum,
     LastSlot,
     UPDATE_CSA: tl.constexpr,
-    CSA_ROWS: tl.constexpr,
+    CSA_ROWS,
     Z_STRIDE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     CACHE_PAGES: tl.constexpr,
@@ -138,7 +145,8 @@ def _joint_prepare(
     W_STRIDE: tl.constexpr,
     HEADS: tl.constexpr,
     PAD_HEADS: tl.constexpr,
-    TOKENS: tl.constexpr,
+    GROUPS: tl.constexpr,
+    TOKENS,
     ROTARY: tl.constexpr,
     ROPE_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
@@ -166,8 +174,11 @@ def _joint_prepare(
     MAIN_CACHE_HEAD: tl.constexpr,
     MAIN_EPS: tl.constexpr,
     MAIN_BIAS: tl.constexpr,
+    MainKScale,
+    MainVScale,
+    FP8_CACHE: tl.constexpr,
 ):
-    if tl.program_id(1) <= PAD_HEADS:
+    if tl.program_id(1) <= GROUPS * PAD_HEADS:
         _indexer_norm_rope(
             Q,
             K,
@@ -198,7 +209,7 @@ def _joint_prepare(
             W_STRIDE,
             HEADS,
             PAD_HEADS,
-            1,
+            GROUPS,
             TOKENS,
             ROTARY,
             ROPE_STRIDE,
@@ -220,7 +231,7 @@ def _joint_prepare(
             MainKC,
             MainVC,
             tl.program_id(0),
-            tl.program_id(1) - PAD_HEADS - 1,
+            tl.program_id(1) - GROUPS * PAD_HEADS - 1,
             MAIN_QH,
             MAIN_KH,
             MAIN_STRIDE,
@@ -233,6 +244,9 @@ def _joint_prepare(
             MAIN_CACHE_HEAD,
             MAIN_EPS,
             MAIN_BIAS,
+            MainKScale,
+            MainVScale,
+            FP8_CACHE,
         )
 
 
@@ -270,7 +284,13 @@ def qkv_indexer_norm_rope(
         main_rotary,
         main_eps,
         main_bias,
+        main_k_scale,
+        main_v_scale,
     ) = main_inputs
+    fp8_cache = main_kc.dtype in (torch.uint8, torch.float8_e4m3fn)
+    if fp8_cache:
+        main_kc = main_kc.view(torch.float8_e4m3fn)
+        main_vc = main_vc.view(torch.float8_e4m3fn)
     tokens, width = query.shape
     main_q = main_qkv.new_empty((tokens, main_qh * 192))
     main_k = main_qkv.new_empty((tokens, main_kh * 192))
@@ -283,21 +303,25 @@ def qkv_indexer_norm_rope(
         raise ValueError("CSA decode inputs need a summary cache")
     if decode_slots is not None and decode_slots.numel() > tokens:
         raise ValueError("CSA decode rows must fit the indexer token count")
-    heads = width // 256
+    # One indexer group per local KV head; outputs are group-major.
+    groups = main_kh
+    if width % (groups * 256):
+        raise ValueError("Indexer query heads must divide evenly into KV groups")
+    heads = width // (groups * 256)
     padded_heads = max(heads, 8)
     q = torch.empty(
-        (tokens, 1, padded_heads, 256),
+        (groups, tokens, padded_heads, 256),
         device=query.device,
         dtype=torch.float8_e4m3fn,
     )
     k = torch.empty((tokens, 1, 256), device=key.device, dtype=key.dtype)
     w = torch.empty(
-        (tokens, 1, padded_heads), device=weights.device, dtype=torch.float32
+        (groups, tokens, padded_heads), device=weights.device, dtype=torch.float32
     )
     if tokens:
-        _joint_prepare[
-            (tokens, padded_heads + 1 + triton.cdiv(main_qh + 2 * main_kh, main_group))
-        ](
+        indexer_programs = groups * padded_heads + 1
+        main_programs = triton.cdiv(main_qh + 2 * main_kh, main_group)
+        _joint_prepare[(tokens, indexer_programs + main_programs)](
             query,
             key,
             weights,
@@ -327,6 +351,7 @@ def qkv_indexer_norm_rope(
             weights.stride(0),
             heads,
             padded_heads,
+            groups,
             tokens,
             cos_sin_cache.shape[1],
             cos_sin_cache.stride(0),
@@ -355,8 +380,11 @@ def qkv_indexer_norm_rope(
             main_kc.stride(2),
             main_eps,
             main_bias,
+            main_k_scale,
+            main_v_scale,
+            fp8_cache,
             num_warps=4,
             enable_fp_fusion=False,
             debug=decode_cache is not None,
         )
-    return q, k, w, main_q, main_k, main_v
+    return q.transpose(0, 1), k, w.transpose(0, 1), main_q, main_k, main_v

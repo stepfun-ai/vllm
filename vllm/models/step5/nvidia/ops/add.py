@@ -7,8 +7,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
-def _add_fp32(X, Y, Output, N: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["N"])
+def _add_fp32(X, Y, Output, N, BLOCK: tl.constexpr):
     offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + offset, offset < N, other=0).to(tl.float32)
     y = tl.load(Y + offset, offset < N, other=0).to(tl.float32)

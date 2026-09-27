@@ -25,7 +25,9 @@ class PrefillIndexerMetadata(NamedTuple):
     selected: torch.Tensor | None
 
 
-@triton.jit
+# Row, page and region counts follow the prompt; keep them runtime values so
+# each new prompt length does not recompile.
+@triton.jit(do_not_specialize=["ROWS", "PAGES", "REGIONS"])
 def _prepare_prefill_indexer(
     Owners,
     Positions,
@@ -35,14 +37,14 @@ def _prepare_prefill_indexer(
     Table,
     Schedules,
     Selected,
-    ROWS: tl.constexpr,
-    PAGES: tl.constexpr,
+    ROWS,
+    PAGES,
     OWNER_STRIDE: tl.constexpr,
     POSITION_STRIDE: tl.constexpr,
     NUM_SMS: tl.constexpr,
     BLOCK_SMS: tl.constexpr,
     NEED_SCORES: tl.constexpr,
-    REGIONS: tl.constexpr,
+    REGIONS,
     BLOCK_REGIONS: tl.constexpr,
     CHUNK_SIZE: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
@@ -138,7 +140,7 @@ def prepare_prefill_indexer(
     need_scores = regions > topk
     paged_kwargs = {}
     if paged_prefill is not None:
-        if need_scores or paged_prefill.block_size not in (16, 64, 128):
+        if need_scores or paged_prefill.block_size not in (16, 32, 64, 128):
             raise ValueError("Shared pages require unscored prefill")
         paged_kwargs = dict(
             PREPARE_PAGES=True,
@@ -188,7 +190,7 @@ def prepare_prefill_indexer(
             num_sms,
             triton.next_power_of_2(num_sms + 1),
             need_scores,
-            regions,
+            regions if not need_scores else 0,
             triton.next_power_of_2(regions + 1) if not need_scores else 1,
             chunk_size,
             chunk_size.bit_length(),

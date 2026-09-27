@@ -661,9 +661,9 @@ class Step3p5MTPProposer(EagleProposer):
             if num_scheduled_tokens.get(req_id, 0) == 0:
                 continue
             slot_mapping[req_index] = self._get_or_create_history_slot(req_id)
-            lookahead_token_ids = validated_lookahead[req_index]
-            if lookahead_token_ids is not None:
-                overrides[req_index, : len(lookahead_token_ids)] = lookahead_token_ids
+            validated_token_ids = validated_lookahead[req_index]
+            if validated_token_ids is not None:
+                overrides[req_index, : len(validated_token_ids)] = validated_token_ids
 
         self._history_slot_mapping.copy_to_gpu(num_rows)
         self._prefill_token_overrides.copy_to_gpu(num_rows)
@@ -795,9 +795,7 @@ class Step3p5MTPProposer(EagleProposer):
         history_slot_mapping: torch.Tensor,
         prefill_token_overrides: torch.Tensor,
     ) -> tuple[int, torch.Tensor]:
-        if self.uses_mrope or (
-            self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0
-        ):
+        if self.uses_mrope or target_positions.ndim != 1:
             raise NotImplementedError(
                 "Step MTP rejection re-prefill currently requires 1D positions."
             )

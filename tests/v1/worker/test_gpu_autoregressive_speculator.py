@@ -17,6 +17,7 @@ from vllm.model_executor.models.mistral_eagle import EagleMistralForCausalLM
 from vllm.model_executor.models.mistral_large_3_eagle import (
     EagleMistralLarge3ForCausalLM,
 )
+from vllm.models.step5.nvidia.mtp import Step5MTP
 from vllm.v1.attention.backends import flash_attn as flash_attn_module
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -293,6 +294,7 @@ def test_multi_module_mm_support_configured_after_model_load(monkeypatch):
         (EagleMistralForCausalLM, True),
         (EagleMistralLarge3ForCausalLM, True),
         (Exaone4_5_MTP, True),
+        (Step5MTP, True),
         (Eagle3LlamaForCausalLM, False),
     ],
 )
@@ -493,3 +495,120 @@ def test_update_draft_decode_metadata_skips_without_scheduler_metadata(monkeypat
 
     assert not called
     assert metadata.scheduler_metadata is None
+
+
+@pytest.mark.parametrize("sampling", ["greedy", "local_argmax", "probabilistic"])
+def test_multi_module_draft_uses_each_modules_head(monkeypatch, sampling):
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import speculator as multi
+
+    spec = object.__new__(MultiModuleMTPSpeculator)
+    spec.num_speculative_steps = 3
+    spec.last_token_indices = torch.tensor([0, 1])
+    spec.input_buffers = SimpleNamespace(positions=torch.tensor([10, 20]))
+    spec.idx_mapping = torch.arange(2)
+    spec.current_draft_step = torch.tensor(0)
+    spec.inputs_embeds = None
+    spec.hidden_states = torch.zeros(2, 4)
+    spec.cached_draft_input_ids = None
+    spec.cached_draft_input_embeds = None
+    spec.cached_target_hidden_states = None
+    spec.draft_tokens = torch.empty(2, 3, dtype=torch.long)
+    spec.draft_input_id_overrides = torch.full((2, 2), -1)
+    spec.temperature = torch.ones(2)
+    spec.seeds = torch.zeros(2, dtype=torch.long)
+    spec.use_local_argmax_reduction = sampling == "local_argmax"
+    spec.draft_logits = torch.empty(2, 3, 4) if sampling == "probabilistic" else None
+    spec.draft_watermarker = None
+    spec.use_fp64_gumbel = False
+    spec.acceptance_estimator = None
+    calls = []
+
+    def logits(hidden_states, spec_step_idx=0):
+        calls.append(spec_step_idx)
+        result = torch.zeros(2, 4)
+        result[:, spec_step_idx] = 1
+        return result
+
+    spec.model = SimpleNamespace(
+        compute_logits=logits,
+        get_top_tokens=lambda h, **kw: logits(h, **kw).argmax(-1),
+    )
+    spec._run_model = lambda *a, **kw: (spec.hidden_states, spec.hidden_states)
+    monkeypatch.setattr(multi, "cache_inputs", lambda *a, **kw: None)
+    monkeypatch.setattr(multi, "update_draft_inputs", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        base_spec_module, "gumbel_sample", lambda logits, *a, **kw: logits.argmax(-1)
+    )
+
+    spec._generate_drafts(2, 2, None, None, None)
+    assert calls == [0, 1, 2]
+    torch.testing.assert_close(spec.draft_tokens, torch.tensor([[0, 1, 2], [0, 1, 2]]))
+
+
+@pytest.mark.parametrize(
+    "draft_support", ["NEVER", "UNIFORM_SINGLE_TOKEN_DECODE", "UNIFORM_BATCH", "ALWAYS"]
+)
+@pytest.mark.parametrize(
+    "requested", [CUDAGraphMode.NONE, CUDAGraphMode.FULL_AND_PIECEWISE]
+)
+def test_multi_module_draft_graph_uses_own_attention_support(
+    monkeypatch, draft_support, requested
+):
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp import speculator as multi
+
+    spec = object.__new__(MultiModuleMTPSpeculator)
+    spec.requested_cudagraph_mode = requested
+    spec.draft_model_config = SimpleNamespace(enforce_eager=False)
+    spec.attn_cg_support = SimpleNamespace(
+        min_cg_support=AttentionCGSupport[draft_support]
+    )
+    spec.vllm_config = None
+    spec.device = torch.device("cpu")
+    spec.num_speculative_steps = 3
+    monkeypatch.setattr(multi, "is_breakable_cudagraph_enabled", lambda: True)
+    manager = Mock()
+    monkeypatch.setattr(multi, "SpeculatorCudaGraphManager", manager)
+    target_mode = CUDAGraphMode.PIECEWISE if requested else CUDAGraphMode.NONE
+
+    spec.init_cudagraph_manager(target_mode)
+
+    expected = (
+        CUDAGraphMode.FULL_AND_PIECEWISE
+        if requested and draft_support in ("UNIFORM_BATCH", "ALWAYS")
+        else target_mode
+    )
+    assert manager.call_args.args[2] == expected
+
+
+def test_step5_mtp_preserves_external_image_embeddings():
+    model = Step5MTP.__new__(Step5MTP)
+    torch.nn.Module.__init__(model)
+    table = torch.nn.Embedding.from_pretrained(torch.arange(20).view(5, 4).float())
+    model.model = SimpleNamespace(embed_input_ids=table)
+    ids = torch.tensor([1, 2, 3])
+    image = torch.tensor([[101.0, 102.0, 103.0, 104.0]])
+    mask = torch.tensor([False, True, False])
+
+    actual = model.embed_input_ids(ids, [image], is_multimodal=mask)
+
+    expected = table(ids)
+    expected[1] = image[0]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(model.embed_input_ids(ids), table(ids), rtol=0, atol=0)
+
+
+def test_multi_module_metadata_keeps_draft_graph_mode_without_mutating_target():
+    spec = object.__new__(MultiModuleMTPSpeculator)
+    spec.requested_cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    spec.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+    )
+
+    draft_config = spec.attn_vllm_config
+
+    assert (
+        draft_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert spec.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE

@@ -665,3 +665,63 @@ def test_unwrap_recurses_through_nested_wrappers():
 
     assert inner.unwrap() is model
     assert outer.unwrap() is model
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_wrapper_specializes_multi_module_mtp(cuda_capture_stream, num_tokens):
+    from vllm.compilation import monitor
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    config = _mock_vllm_config()
+    x = torch.zeros((num_tokens, 4), device="cuda")
+    weights = torch.arange(1, 4, device="cuda", dtype=torch.float32)
+    captured_modules = []
+    eager_modules = []
+
+    @eager_break_during_capture
+    def scale(output, module_idx):
+        eager_modules.append(module_idx)
+        output.mul_(weights[module_idx])
+
+    def model(x, *, spec_step_idx):
+        module_idx = spec_step_idx % 3
+        captured_modules.append(module_idx)
+        output = x + weights[module_idx]
+        scale(output, module_idx)
+        return output
+
+    wrapper = BreakableCUDAGraphWrapper(
+        model,
+        config,
+        runtime_mode=CUDAGraphMode.PIECEWISE,
+        key_fn=lambda x, *, spec_step_idx: spec_step_idx % 3,
+    )
+    wrapper.is_debugging_mode = True
+    desc = BatchDescriptor(num_tokens=num_tokens)
+    was_enabled = monitor.cudagraph_capturing_enabled
+    monitor.set_cudagraph_capturing_enabled(True)
+    try:
+        with set_forward_context(
+            None,
+            config,
+            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            batch_descriptor=desc,
+        ):
+            for step in range(3):
+                wrapper(x, spec_step_idx=step)
+            for step in [0, 1, 2, 5, 3, 4, 0, 2, 1]:
+                x.fill_(step + 10)
+                expected = (x + weights[step % 3]) * weights[step % 3]
+                output = wrapper(x, spec_step_idx=step)
+                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        assert captured_modules == [0, 1, 2]
+        assert eager_modules == [0, 1, 2, 0, 1, 2, 2, 0, 1, 0, 2, 1]
+        assert len(wrapper.entries) == 3
+    finally:
+        monitor.set_cudagraph_capturing_enabled(was_enabled)
+        wrapper.clear_graphs()

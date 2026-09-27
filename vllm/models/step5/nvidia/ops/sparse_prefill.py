@@ -9,7 +9,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["REGION_COUNT"])
 def _gather_prefill_kv(
     Cache,
     Regions,
@@ -19,12 +19,15 @@ def _gather_prefill_kv(
     CuKV,
     Key,
     Value,
+    KScale,
+    VScale,
+    FP8_CACHE: tl.constexpr,
     CACHE_PAGE: tl.constexpr,
     CACHE_TOKEN: tl.constexpr,
     CACHE_DIM: tl.constexpr,
     REGION_ROW: tl.constexpr,
     REGION_COL: tl.constexpr,
-    REGION_COUNT: tl.constexpr,
+    REGION_COUNT,
     TABLE_ROW: tl.constexpr,
     TABLE_COL: tl.constexpr,
     OWNER_STRIDE: tl.constexpr,
@@ -59,8 +62,11 @@ def _gather_prefill_kv(
         + dim[None, :] * CACHE_DIM
     )
     mask = valid[:, None] & (dim[None, :] < DIM)
-    key = tl.load(Cache + address, mask, other=0)
-    value = tl.load(Cache + address + DIM * CACHE_DIM, mask, other=0)
+    key = tl.load(Cache + address, mask, other=0.0)
+    value = tl.load(Cache + address + DIM * CACHE_DIM, mask, other=0.0)
+    if FP8_CACHE:
+        key = key.to(tl.float32) * tl.load(KScale)
+        value = value.to(tl.float32) * tl.load(VScale)
     output = (start - base + offset)[:, None] * DIM + dim[None, :]
     tl.store(Key + output, key, mask)
     tl.store(Value + output, value, mask)
@@ -78,26 +84,49 @@ def make_indptr(positions: list[int], region_count: int) -> torch.Tensor:
 
 
 def gather_prefill_kv(
-    cache, regions, block_table, owners, positions, cu_kv, total_tokens, max_length
+    cache,
+    regions,
+    block_table,
+    owners,
+    positions,
+    cu_kv,
+    total_tokens,
+    max_length,
+    *,
+    output_dtype=None,
+    k_scale=None,
+    v_scale=None,
 ):
     """Gather selected tokens in exactly the boolean-indexed reference order."""
-    if cache.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("Sparse prefill requires BF16 or FP16 cache")
+    fp8_cache = cache.dtype in (torch.uint8, torch.float8_e4m3fn)
+    if fp8_cache:
+        if output_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError("FP8 gather requires a model output dtype")
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 gather requires K/V scales")
+        cache = cache.view(torch.float8_e4m3fn)
+    elif cache.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("Unsupported sparse KV cache dtype")
     rows, count = regions.shape
     dim = cache.shape[-1] // 2
-    key = torch.empty((total_tokens, 1, dim), device=cache.device, dtype=cache.dtype)
+    key = torch.empty(
+        (total_tokens, 1, dim), device=cache.device, dtype=output_dtype or cache.dtype
+    )
     value = torch.empty_like(key)
     if rows and total_tokens:
         # Integer views make bit preservation explicit, including NaN payloads.
         _gather_prefill_kv[(triton.cdiv(max_length, 16), rows)](
-            cache.view(torch.int16),
+            cache if fp8_cache else cache.view(torch.int16),
             regions,
             block_table,
             owners,
             positions,
             cu_kv,
-            key.view(torch.int16),
-            value.view(torch.int16),
+            key if fp8_cache else key.view(torch.int16),
+            value if fp8_cache else value.view(torch.int16),
+            k_scale,
+            v_scale,
+            fp8_cache,
             cache.stride(0),
             cache.stride(2),
             cache.stride(3),
@@ -127,7 +156,7 @@ def make_prefill_chunks(
 ) -> list[PrefillChunk]:
     """Share CPU plans and one GPU prefix copy across all sparse layers."""
     cu_k = make_indptr(positions, topk + 1)
-    device_cu_k = cu_k.to(device=device)
+    device_cu_k = cu_k.pin_memory().to(device=device, non_blocking=True)
     chunks = []
     for start in range(0, len(positions), 32):
         end = min(start + 32, len(positions))

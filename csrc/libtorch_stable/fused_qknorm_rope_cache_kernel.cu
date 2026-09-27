@@ -7,6 +7,8 @@
 #include "libtorch_stable/torch_utils.h"
 #include "libtorch_stable/dispatch_utils.h"
 #include "libtorch_stable/type_convert.cuh"
+#include "attention/dtype_fp8.cuh"
+#include "quantization/w8a8/fp8/nvidia/quant_utils.cuh"
 
 #include <torch/csrc/stable/macros.h>
 
@@ -23,7 +25,7 @@ constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 128;
 
 template <typename scalar_t, typename weight_t, typename rope_t, int HEAD_DIM,
-          bool WIDE_192_ROTARY = false>
+          bool WIDE_192_ROTARY = false, bool FP8_CACHE = false>
 __global__ void qknorm_rope_cache_kernel(
     const void* __restrict__ qkv_void, void* __restrict__ q_out_void,
     void* __restrict__ k_out_void, void* __restrict__ v_out_void,
@@ -37,7 +39,8 @@ __global__ void qknorm_rope_cache_kernel(
     int64_t cache_block_stride, int64_t cache_page_stride,
     int64_t cache_head_stride, int num_tokens, int num_slots, int num_q_heads,
     int num_kv_heads, int rotary_pairs, int block_size, float epsilon,
-    int block_size_shift, float norm_weight_bias) {
+    int block_size_shift, float norm_weight_bias, const float* k_scale,
+    const float* v_scale) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   if constexpr (std::is_same_v<scalar_t, torch::headeronly::BFloat16> ||
                 std::is_same_v<weight_t, torch::headeronly::BFloat16> ||
@@ -155,7 +158,16 @@ __global__ void qknorm_rope_cache_kernel(
           }
           const Scalar value = qkv[input_offset + dim];
           output[output_offset + dim] = value;
-          if (write_cache) v_cache[cache_offset + dim] = value;
+          if (write_cache) {
+            if constexpr (FP8_CACHE) {
+              reinterpret_cast<uint8_t*>(v_cache_void)[cache_offset + dim] =
+                  fp8::scaled_convert<uint8_t, float,
+                                      Fp8KVCacheDataType::kFp8E4M3>(value,
+                                                                    *v_scale);
+            } else {
+              v_cache[cache_offset + dim] = value;
+            }
+          }
         }
       }
       return;
@@ -267,7 +279,16 @@ __global__ void qknorm_rope_cache_kernel(
         }
         const Scalar value = normalized_head[dim];
         output[output_offset + dim] = value;
-        if (write_cache) k_cache[cache_offset + dim] = value;
+        if (write_cache) {
+          if constexpr (FP8_CACHE) {
+            reinterpret_cast<uint8_t*>(k_cache_void)[cache_offset + dim] =
+                fp8::scaled_convert<uint8_t, float,
+                                    Fp8KVCacheDataType::kFp8E4M3>(value,
+                                                                  *k_scale);
+          } else {
+            k_cache[cache_offset + dim] = value;
+          }
+        }
       }
     }
 
@@ -276,7 +297,7 @@ __global__ void qknorm_rope_cache_kernel(
 #endif
 }
 
-template <typename scalar_t, typename weight_t, typename rope_t>
+template <typename scalar_t, typename weight_t, typename rope_t, bool FP8_CACHE>
 void launch_qknorm_rope_cache(
     const torch::stable::Tensor& qkv, torch::stable::Tensor& q_out,
     torch::stable::Tensor& k_out, torch::stable::Tensor& v_out,
@@ -286,7 +307,7 @@ void launch_qknorm_rope_cache(
     const torch::stable::Tensor& slot_mapping, torch::stable::Tensor& k_cache,
     torch::stable::Tensor& v_cache, int head_dim, int num_q_heads,
     int num_kv_heads, int rotary_pairs, float epsilon, float norm_weight_bias,
-    cudaStream_t stream) {
+    cudaStream_t stream, const float* k_scale, const float* v_scale) {
   const int total_heads = num_q_heads + 2 * num_kv_heads;
   const int64_t total_work = qkv.size(0) * total_heads;
   const int block_size = static_cast<int>(k_cache.size(1));
@@ -295,28 +316,29 @@ void launch_qknorm_rope_cache(
           ? __builtin_ctz(static_cast<unsigned int>(block_size))
           : -1;
 
-#define LAUNCH_QKNORM_ROPE_CACHE(HEAD_DIM, WIDE_192_ROTARY)                   \
-  do {                                                                        \
-    constexpr int threads_per_head =                                          \
-        WIDE_192_ROTARY ? 32                                                  \
-                        : (HEAD_DIM <= 64 ? 8 : (HEAD_DIM <= 192 ? 16 : 32)); \
-    constexpr int heads_per_block = kThreadsPerBlock / threads_per_head;      \
-    const dim3 grid((total_work + heads_per_block - 1) / heads_per_block);    \
-    const dim3 block(kThreadsPerBlock);                                       \
-    qknorm_rope_cache_kernel<scalar_t, weight_t, rope_t, HEAD_DIM,            \
-                             WIDE_192_ROTARY><<<grid, block, 0, stream>>>(    \
-        qkv.data_ptr(), q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr(), \
-        q_weight.data_ptr(), k_weight.data_ptr(), cos.data_ptr(),             \
-        sin.data_ptr(),                                                       \
-        reinterpret_cast<const int64_t*>(positions.data_ptr()),               \
-        reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),            \
-        k_cache.data_ptr(), v_cache.data_ptr(), qkv.stride(0),                \
-        q_out.stride(0), k_out.stride(0), v_out.stride(0), cos.stride(0),     \
-        sin.stride(0), k_cache.stride(0), k_cache.stride(1),                  \
-        k_cache.stride(2), static_cast<int>(qkv.size(0)),                     \
-        static_cast<int>(slot_mapping.numel()), num_q_heads, num_kv_heads,    \
-        rotary_pairs, block_size, epsilon, block_size_shift,                  \
-        norm_weight_bias);                                                    \
+#define LAUNCH_QKNORM_ROPE_CACHE(HEAD_DIM, WIDE_192_ROTARY)                    \
+  do {                                                                         \
+    constexpr int threads_per_head =                                           \
+        WIDE_192_ROTARY ? 32                                                   \
+                        : (HEAD_DIM <= 64 ? 8 : (HEAD_DIM <= 192 ? 16 : 32));  \
+    constexpr int heads_per_block = kThreadsPerBlock / threads_per_head;       \
+    const dim3 grid((total_work + heads_per_block - 1) / heads_per_block);     \
+    const dim3 block(kThreadsPerBlock);                                        \
+    qknorm_rope_cache_kernel<scalar_t, weight_t, rope_t, HEAD_DIM,             \
+                             WIDE_192_ROTARY, FP8_CACHE>                       \
+        <<<grid, block, 0, stream>>>(                                          \
+            qkv.data_ptr(), q_out.data_ptr(), k_out.data_ptr(),                \
+            v_out.data_ptr(), q_weight.data_ptr(), k_weight.data_ptr(),        \
+            cos.data_ptr(), sin.data_ptr(),                                    \
+            reinterpret_cast<const int64_t*>(positions.data_ptr()),            \
+            reinterpret_cast<const int64_t*>(slot_mapping.data_ptr()),         \
+            k_cache.data_ptr(), v_cache.data_ptr(), qkv.stride(0),             \
+            q_out.stride(0), k_out.stride(0), v_out.stride(0), cos.stride(0),  \
+            sin.stride(0), k_cache.stride(0), k_cache.stride(1),               \
+            k_cache.stride(2), static_cast<int>(qkv.size(0)),                  \
+            static_cast<int>(slot_mapping.numel()), num_q_heads, num_kv_heads, \
+            rotary_pairs, block_size, epsilon, block_size_shift,               \
+            norm_weight_bias, k_scale, v_scale);                               \
   } while (false)
 
   switch (head_dim) {
@@ -362,7 +384,10 @@ void fused_qknorm_rope_cache(
     torch::stable::Tensor& positions, torch::stable::Tensor& slot_mapping,
     torch::stable::Tensor& k_cache, torch::stable::Tensor& v_cache,
     int64_t head_dim, int64_t num_q_heads, int64_t num_kv_heads,
-    int64_t rotary_pairs, double epsilon, double norm_weight_bias) {
+    int64_t rotary_pairs, double epsilon, double norm_weight_bias,
+    const std::string& kv_cache_dtype,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale) {
   check_cuda_tensor(qkv, "qkv");
   check_cuda_tensor(q_out, "q_out");
   check_cuda_tensor(k_out, "k_out");
@@ -462,10 +487,34 @@ void fused_qknorm_rope_cache(
                       qkv.scalar_type() == k_out.scalar_type() &&
                       qkv.scalar_type() == v_out.scalar_type(),
                   "qkv and Q/K/V outputs must have the same dtype");
-  STD_TORCH_CHECK(qkv.scalar_type() == k_cache.scalar_type() &&
-                      qkv.scalar_type() == v_cache.scalar_type(),
-                  "This fused kernel requires cache and qkv to have the same "
-                  "dtype");
+  const bool fp8_cache =
+      kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
+  STD_TORCH_CHECK(fp8_cache || kv_cache_dtype == "auto" ||
+                      kv_cache_dtype == "bfloat16" ||
+                      kv_cache_dtype == "float16",
+                  "Unsupported KV cache dtype: ", kv_cache_dtype);
+  STD_TORCH_CHECK(k_cache.scalar_type() == v_cache.scalar_type(),
+                  "K/V caches must have the same dtype");
+  if (fp8_cache) {
+    STD_TORCH_CHECK(
+        k_cache.scalar_type() == torch::headeronly::ScalarType::Byte ||
+            k_cache.scalar_type() ==
+                torch::headeronly::ScalarType::Float8_e4m3fn,
+        "FP8 cache requires uint8 or float8_e4m3fn storage");
+    STD_TORCH_CHECK(k_scale.has_value() && v_scale.has_value(),
+                    "FP8 cache requires K/V scales");
+    for (const auto* scale : {&*k_scale, &*v_scale}) {
+      check_cuda_tensor(*scale, "KV scale");
+      check_same_device(qkv, *scale, "KV scale");
+      STD_TORCH_CHECK(
+          scale->numel() == 1 &&
+              scale->scalar_type() == torch::headeronly::ScalarType::Float,
+          "KV scales must be single FP32 values");
+    }
+  } else {
+    STD_TORCH_CHECK(qkv.scalar_type() == k_cache.scalar_type(),
+                    "Unquantized cache must match QKV dtype");
+  }
   STD_TORCH_CHECK(q_weight.scalar_type() == k_weight.scalar_type(),
                   "Q/K norm weights must have the same dtype");
   STD_TORCH_CHECK(cos.scalar_type() == sin.scalar_type(),
@@ -485,16 +534,30 @@ void fused_qknorm_rope_cache(
               VLLM_STABLE_DISPATCH_FLOATING_TYPES(
                   cos.scalar_type(), "qknorm_rope_cache_rope", [&] {
                     using rope_cache_t = scalar_t;
-                    launch_qknorm_rope_cache<input_t, norm_weight_t,
-                                             rope_cache_t>(
-                        qkv, q_out, k_out, v_out, q_weight, k_weight, cos, sin,
-                        positions, slot_mapping, k_cache, v_cache,
-                        static_cast<int>(head_dim),
-                        static_cast<int>(num_q_heads),
-                        static_cast<int>(num_kv_heads),
-                        static_cast<int>(rotary_pairs),
-                        static_cast<float>(epsilon),
-                        static_cast<float>(norm_weight_bias), stream);
+                    auto launch = [&](auto fp8_tag) {
+                      launch_qknorm_rope_cache<input_t, norm_weight_t,
+                                               rope_cache_t,
+                                               decltype(fp8_tag)::value>(
+                          qkv, q_out, k_out, v_out, q_weight, k_weight, cos,
+                          sin, positions, slot_mapping, k_cache, v_cache,
+                          static_cast<int>(head_dim),
+                          static_cast<int>(num_q_heads),
+                          static_cast<int>(num_kv_heads),
+                          static_cast<int>(rotary_pairs),
+                          static_cast<float>(epsilon),
+                          static_cast<float>(norm_weight_bias), stream,
+                          fp8_cache
+                              ? static_cast<const float*>(k_scale->data_ptr())
+                              : nullptr,
+                          fp8_cache
+                              ? static_cast<const float*>(v_scale->data_ptr())
+                              : nullptr);
+                    };
+                    if (fp8_cache) {
+                      launch(std::true_type{});
+                    } else {
+                      launch(std::false_type{});
+                    }
                   });
             });
       });

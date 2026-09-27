@@ -73,7 +73,7 @@ def _layer_norm_stats(x):
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["CSA_ROWS", "TOKENS"])
 def _indexer_norm_rope(
     Q,
     K,
@@ -94,7 +94,7 @@ def _indexer_norm_rope(
     Maximum,
     LastSlot,
     UPDATE_CSA: tl.constexpr,
-    CSA_ROWS: tl.constexpr,
+    CSA_ROWS,
     Z_STRIDE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     CACHE_PAGES: tl.constexpr,
@@ -105,7 +105,7 @@ def _indexer_norm_rope(
     HEADS: tl.constexpr,
     PAD_HEADS: tl.constexpr,
     GROUPS: tl.constexpr,
-    TOKENS: tl.constexpr,
+    TOKENS,
     ROTARY: tl.constexpr,
     ROPE_STRIDE: tl.constexpr,
     EPS: tl.constexpr,

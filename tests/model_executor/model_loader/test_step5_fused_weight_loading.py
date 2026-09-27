@@ -66,13 +66,37 @@ def test_step5_custom_linear_dispatch(monkeypatch, kind, invariant, cuda_alike):
 
 
 @pytest.mark.parametrize(
-    "gate,block_size,fused",
-    [(False, None, False), (True, None, True), (True, [128, 128], False)],
+    "gate,ignored_projections,tp_size,fused",
+    [
+        (False, None, 1, False),
+        (True, None, 1, True),
+        (True, ("qkv_proj", "g_proj"), 1, True),
+        (True, ("qkv_proj",), 1, False),
+        (True, ("g_proj",), 1, False),
+        (True, (), 1, False),
+        (True, ("qkv_proj", "g_proj"), 8, False),
+    ],
 )
 def test_step5_attention_quantizes_projections_but_not_kv_cache(
-    monkeypatch, gate, block_size, fused
+    monkeypatch, gate, ignored_projections, tp_size, fused
 ):
-    quant_config = SimpleNamespace(weight_block_size=block_size)
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod",
+        lambda _config: SimpleNamespace(),
+    )
+    quant_config = (
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            ignored_layers=[
+                f"model.layers.0.self_attn.{name}" for name in ignored_projections
+            ],
+        )
+        if ignored_projections is not None
+        else None
+    )
     projection_quant_configs = []
     attention_quant_configs = []
 
@@ -93,7 +117,9 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(
             super().__init__()
             self.register_buffer("cos_sin_cache", torch.zeros(1, 8))
 
-    monkeypatch.setattr(step5_model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        step5_model, "get_tensor_model_parallel_world_size", lambda: tp_size
+    )
     monkeypatch.setattr(step5_model, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(step5_model, "QKVParallelLinear", FakeProjection)
     monkeypatch.setattr(step5_model, "MergedColumnParallelLinear", FakeProjection)
@@ -110,8 +136,8 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(
     attention = step5_model.Step5Attention(
         hidden_size=8,
         use_head_wise_attn_gate=gate,
-        num_heads=2,
-        num_kv_heads=1,
+        num_heads=8,
+        num_kv_heads=4,
         max_position=16,
         head_dim=4,
         quant_config=quant_config,
@@ -340,6 +366,7 @@ def test_step5_moe_passes_fp32_gate_logits_to_runner():
 
     moe = step5_model.Step5MoE.__new__(step5_model.Step5MoE)
     nn.Module.__init__(moe)
+    moe.use_mega_moe = False
     moe.experts = Runner()
     moe.gate = lambda inputs: (logits, None)
     moe.share_expert = nn.Identity()

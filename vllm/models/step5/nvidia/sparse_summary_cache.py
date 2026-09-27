@@ -4,6 +4,7 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -14,7 +15,12 @@ class Step5SparseSummaryCache:
     """FP8 history and ordered FP32 accumulators for each page's open region."""
 
     def __init__(
-        self, pages: int, block_size: int, device: torch.device, max_num_seqs: int = 1
+        self,
+        pages: int,
+        block_size: int,
+        device: torch.device,
+        max_num_seqs: int = 1,
+        request_journal_width: int = 0,
     ):
         if block_size % 8:
             raise ValueError("Step5 KV blocks must align to eight-token regions")
@@ -35,6 +41,129 @@ class Step5SparseSummaryCache:
         self.last_slot = torch.full(
             (pages + max_num_seqs,), -1, dtype=torch.long, device=device
         )
+        # CPU reference journal; CUDA uses ``update_request_journal``.
+        self._speculative_tails: dict[int, dict[int, tuple[torch.Tensor, ...]]] = {}
+        # MRv2 journal addressed by persistent request state index; see
+        # ``update_request_journal``.
+        self.request_journal_width = request_journal_width
+        if request_journal_width:
+            rows = max_num_seqs * request_journal_width
+            self.request_journal_values = torch.empty(
+                (rows, 513), device=device, dtype=torch.float32
+            )
+            self.request_journal_last = torch.empty(
+                rows, device=device, dtype=torch.int64
+            )
+            self.request_journal_tag = torch.full(
+                (rows,), -1, device=device, dtype=torch.int64
+            )
+
+    def update_request_journal(
+        self,
+        key,
+        z,
+        slots,
+        query_start_loc,
+        seq_lens,
+        request_state,
+        prefix_metadata=None,
+    ):
+        """Speculative update undone on device; no host metadata when uniform.
+
+        ``prefix_metadata`` covers rows before each request's last window.
+        """
+        from .ops.summary_update import update_prefill, update_request_journal
+
+        args = (
+            key,
+            z,
+            slots,
+            query_start_loc,
+            seq_lens,
+            request_state,
+            self.request_journal_values,
+            self.request_journal_last,
+            self.request_journal_tag,
+            self.mean,
+            self.numerator,
+            self.denominator,
+            self.maximum,
+            self.last_slot,
+            self.pages,
+            self.block_size,
+            self.request_journal_width,
+        )
+        if prefix_metadata is None:
+            update_request_journal(*args)
+            return
+        update_request_journal(*args, update=False)
+        update_prefill(
+            key,
+            z,
+            prefix_metadata,
+            self.mean,
+            self.numerator,
+            self.denominator,
+            self.maximum,
+            self.last_slot,
+            self.block_size,
+        )
+        update_request_journal(*args, restore=False)
+
+    def _invalidate_request_journal(self, blocks) -> None:
+        if self.request_journal_width and blocks:
+            tag = self.request_journal_tag
+            pages = torch.tensor(sorted(blocks), device=tag.device)
+            tag.masked_fill_(torch.isin(tag // self.block_size, pages), -1)
+
+    def update_speculative(
+        self,
+        key,
+        z,
+        slots,
+        starts,
+        tables,
+        num_speculative_tokens,
+        *,
+        owned_pages=None,
+        slot_mapping=None,
+    ):
+        """Restore the accepted tail before overwriting rejected draft positions.
+
+        Only the last verification window needs undo state. Completed regions
+        before that window are immutable; overwritten regions are recomputed.
+        """
+        assert not key.is_cuda, "CUDA uses update_request_journal"
+        tensors = (self.numerator, self.denominator, self.maximum, self.last_slot)
+        for req, (start, end) in enumerate(zip(starts, starts[1:])):
+            if start == end:
+                continue
+            slot = slots[start]
+            if slot < 0:
+                continue
+            page = slot // self.block_size
+            snapshot = self._speculative_tails.get(page, {}).get(slot)
+            if snapshot is not None:
+                for tensor, saved in zip(tensors, snapshot):
+                    tensor[page] = saved
+            # Metadata contains padding block IDs after the request's last page.
+            # Only remove journals for pages actually owned by this request.
+            last_page = slots[end - 1] // self.block_size
+            table = tables[req]
+            last_index = table.index(last_page)
+            for old_page in table[: last_index + 1]:
+                self._speculative_tails.pop(old_page, None)
+            tail = max(start, end - num_speculative_tokens - 1)
+            self.update(key[start:tail], z[start:tail], slots[start:tail])
+            for row in range(tail, end):
+                slot = slots[row]
+                if slot < 0:
+                    continue
+                page = slot // self.block_size
+                self._speculative_tails.setdefault(page, {})[slot] = tuple(
+                    tensor[page].clone() for tensor in tensors
+                )
+                self.update(key[row : row + 1], z[row : row + 1], [slot])
 
     @staticmethod
     def _accumulate(numerator, denominator, maximum, key, z):
@@ -93,11 +222,61 @@ class Step5SparseSummaryCache:
         self.maximum[pages] = maximum
         self.last_slot[pages] = torch.where(active & (slots % 8 != 7), slots, -1)
 
-    def update(self, key: torch.Tensor, z: torch.Tensor, slots: list[int]) -> None:
+    def speculative_prefix_metadata(
+        self, slots: np.ndarray, starts: np.ndarray, device
+    ) -> torch.Tensor | None:
+        """Grouped rows before each request's journaled last window, if any."""
+        slots, starts = np.asarray(slots), np.asarray(starts)
+        begin, end = starts[:-1], starts[1:]
+        live = (begin < end) & (slots[np.minimum(begin, len(slots) - 1)] >= 0)
+        tail = np.where(
+            live, np.maximum(begin, end - self.request_journal_width), begin
+        )
+        # Mark [begin, tail) of each live request; everything else is skipped.
+        marks = np.zeros(len(slots) + 1, dtype=np.int64)
+        np.add.at(marks, begin, 1)
+        np.add.at(marks, tail, -1)
+        prefix = np.where(np.cumsum(marks[:-1]) > 0, slots, -1)
+        return self.prefill_metadata(prefix, device)
+
+    def prefill_metadata(self, slots: np.ndarray, device) -> torch.Tensor | None:
+        from .ops.summary_update import make_prefill_metadata_from_slots
+
+        return make_prefill_metadata_from_slots(
+            np.asarray(slots), self.block_size, device
+        )
+
+    @staticmethod
+    def _group_slots(slots: list[int]) -> dict[int, list[int]]:
         groups: dict[int, list[int]] = {}
         for row, slot in enumerate(slots):
             if slot >= 0:
                 groups.setdefault(slot // 8, [-1] * 8)[slot % 8] = row
+        return groups
+
+    def update(
+        self,
+        key: torch.Tensor,
+        z: torch.Tensor,
+        slots: list[int],
+        prefill_metadata: torch.Tensor | None = None,
+    ) -> None:
+        if prefill_metadata is not None:
+            from .ops.summary_update import update_prefill
+
+            update_prefill(
+                key,
+                z,
+                prefill_metadata,
+                self.mean,
+                self.numerator,
+                self.denominator,
+                self.maximum,
+                self.last_slot,
+                self.block_size,
+            )
+            return
+        groups = self._group_slots(slots)
         if not groups:
             return
         if key.is_cuda:
@@ -167,6 +346,10 @@ class Step5SparseSummaryCache:
 
     def reset(self, block_ids: list[int], clear_mean: bool = True) -> None:
         blocks = set(block_ids)
+        for block in blocks:
+            self._speculative_tails.pop(block, None)
+        # Reused pages must not match a finished request's undo tags.
+        self._invalidate_request_journal(blocks)
         if clear_mean and blocks:
             self.mean[list(blocks)] = 0
         self.last_slot[list(blocks)] = -1
@@ -191,6 +374,22 @@ class Step5SparseSummaryCache:
             (self.mean, self.numerator, self.denominator, self.maximum), snapshots
         ):
             tensor[destinations] = snapshot
+        journals = [self._speculative_tails.get(src, {}) for src in sources]
+        for src, dst, journal in zip(sources, destinations, journals):
+            copied = {}
+            for slot, saved in journal.items():
+                state = tuple(t.clone() for t in saved)
+                state[-1].copy_(
+                    torch.where(
+                        state[-1] >= 0,
+                        dst * self.block_size + state[-1] % self.block_size,
+                        -1,
+                    )
+                )
+                copied[dst * self.block_size + slot % self.block_size] = state
+            self._speculative_tails[dst] = copied
+        # A COW destination starts a new request, which has no window to undo.
+        self._invalidate_request_journal(destinations)
         old_slots = snapshots[-1]
         offsets = torch.tensor(destinations, device=self.mean.device) * self.block_size
         self.last_slot[destinations] = torch.where(
@@ -232,9 +431,19 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
             raise ValueError("Step5 KV blocks must align to eight-token regions")
         return block_size // 8 * 256 + 513 * 4 + 8
 
+    def _request_journal_width(self) -> int:
+        tokens = self._target_impl.num_speculative_tokens
+        return tokens + 1 if tokens else 0
+
     def _fixed_runtime_state_budget(self, block_size: int) -> int:
-        return self._target_impl.max_num_seqs * self._set_summary_cache_budget(
-            block_size
+        # Undo rows per request slot: 513 FP32 state, last slot and tag.
+        journal = (
+            self._target_impl.max_num_seqs
+            * self._request_journal_width()
+            * (513 * 4 + 16)
+        )
+        return journal + self._target_impl.max_num_seqs * (
+            self._set_summary_cache_budget(block_size)
         )
 
     def _peers(self, context):
@@ -259,7 +468,11 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
         )
         kv = forward_context[self.main_layer_name].kv_cache
         self._cache = Step5SparseSummaryCache(
-            kv.shape[0], kv.shape[2], kv.device, self._target_impl.max_num_seqs
+            kv.shape[0],
+            kv.shape[2],
+            kv.device,
+            self._target_impl.max_num_seqs,
+            self._request_journal_width(),
         )
         self.kv_cache = self._cache.mean.view(kv.shape[0], -1)
         self._target_impl.summary_cache = self._cache
@@ -280,6 +493,9 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
         if self._cache is not None:
             self._cache.last_slot.fill_(-1)
             self._cache.mean.zero_()
+            self._cache._speculative_tails.clear()
+            if self._cache.request_journal_width:
+                self._cache.request_journal_tag.fill_(-1)
         return 1, 0
 
     def copy_kv_cache_side_storage(self, block_copies, num_blocks):

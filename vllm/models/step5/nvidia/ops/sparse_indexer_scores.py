@@ -23,8 +23,10 @@ def _direct_scores(
     Current,
     Lengths,
     TopKLengths,
-    Q_ROW: tl.constexpr,
-    W_ROW: tl.constexpr,
+    Q_TOKEN: tl.constexpr,
+    Q_GROUP: tl.constexpr,
+    W_TOKEN: tl.constexpr,
+    W_GROUP: tl.constexpr,
     TABLE_COLS: tl.constexpr,
     TABLE_ROW: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
@@ -36,11 +38,20 @@ def _direct_scores(
     HEADS: tl.constexpr,
     TILE: tl.constexpr,
     WORKERS: tl.constexpr,
+    ROW_GROUPS: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
 ):
     worker = tl.program_id(0)
     row = tl.program_id(1)
-    active = tl.load(Slots + row * SLOT_STRIDE) >= 0
-    seq = tl.load(SeqLens + row * SEQ_STRIDE).to(tl.int64)
+    # Rows are (token, KV group) pairs; each request has QUERY_LEN tokens.
+    # A token at offset i of its request sees seq_len - (QUERY_LEN - 1 - i).
+    token = row // ROW_GROUPS
+    kv_group = row % ROW_GROUPS
+    request = token // QUERY_LEN
+    active = tl.load(Slots + token * SLOT_STRIDE) >= 0
+    seq = tl.load(SeqLens + request * SEQ_STRIDE).to(tl.int64) - (
+        QUERY_LEN - 1 - token % QUERY_LEN
+    )
     position = tl.where(active, seq - 1, 0)
     current = position >> 3
     length = current + 1
@@ -54,7 +65,9 @@ def _direct_scores(
     for tile in range(worker, live_tiles, WORKERS):
         region = tile * TILE + tl.arange(0, TILE)
         col = region // REGIONS_PER_BLOCK
-        physical = tl.load(Table + row * TABLE_ROW + col, col < TABLE_COLS, other=-1)
+        physical = tl.load(
+            Table + request * TABLE_ROW + col, col < TABLE_COLS, other=-1
+        )
         valid = (region < CAPACITY) & (physical >= 0) & (physical < CACHE_PAGES)
         d = tl.arange(0, 256)
         h = tl.arange(0, 16)
@@ -71,7 +84,8 @@ def _direct_scores(
         key = raw.to(tl.float8e4nv, bitcast=True)
         query = tl.load(
             Q.to(tl.pointer_type(tl.uint8))
-            + row * Q_ROW
+            + token * Q_TOKEN
+            + kv_group * Q_GROUP
             + h[None, :] * 256
             + d[:, None],
             h[None, :] < HEADS,
@@ -80,7 +94,7 @@ def _direct_scores(
         query = query.to(tl.float8e4nv, bitcast=True)
         dot = tl.dot(key, query, out_dtype=tl.float32, max_num_imprecise_acc=0)
         dot = tl.maximum(dot, 0.0)
-        w = tl.load(W + row * W_ROW + h, h < HEADS, other=0)
+        w = tl.load(W + token * W_TOKEN + kv_group * W_GROUP + h, h < HEADS, other=0)
         # FI's FP32 epilogue has four independent FMA chains followed by
         # left-associated addition. Keep this order, not a tree reduction.
         sums = tl.full((TILE, 4), 0, tl.float32)
@@ -108,13 +122,22 @@ def decode_summary_scores(
     capacity: int,
     *,
     num_sms: int,
+    row_groups: int = 1,
+    query_len: int = 1,
 ) -> tuple[torch.Tensor, DecodeIndexerMetadata]:
     """Read raw FP8 summaries without repacking keys or allocating unit scales.
 
     Only the 128-region rounded live prefix is written. Consumers must use
-    lengths/topk_lengths to ignore the unspecified score tail.
+    lengths/topk_lengths to ignore the unspecified score tail. Each group of
+    ``row_groups`` query rows is one token of ``slots``; each ``query_len``
+    tokens are one request of ``block_table``/``seq_lens``.
     """
-    batch = query.shape[0]
+    # query: [tokens, groups, 8, 256] and weights: [tokens, groups, 8], each
+    # group's heads contiguous; groups may be the outer storage dimension.
+    tokens, groups = query.shape[:2]
+    assert groups == row_groups and query.stride(3) == 1 and query.stride(2) == 256
+    assert weights.shape == query.shape[:3] and weights.stride(2) == 1
+    batch = tokens * groups
     scores = torch.empty(
         (batch, triton.cdiv(capacity, 256) * 256),
         device=query.device,
@@ -141,7 +164,9 @@ def decode_summary_scores(
         lengths,
         topk_lengths,
         query.stride(0),
+        query.stride(1),
         weights.stride(0),
+        weights.stride(1),
         block_table.shape[1],
         block_table.stride(0),
         slots.stride(0),
@@ -153,6 +178,8 @@ def decode_summary_scores(
         8,
         128,
         workers,
+        row_groups,
+        query_len,
         num_warps=4,
         enable_fp_fusion=False,
     )

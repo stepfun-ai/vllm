@@ -406,9 +406,11 @@ class DraftModelSpeculator(BaseSpeculator):
         seeds: torch.Tensor,
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
+        spec_step_idx: int | None = None,
     ) -> torch.Tensor:
+        head_kwargs = {} if spec_step_idx is None else {"spec_step_idx": spec_step_idx}
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states, **head_kwargs)
             sampled = gumbel_sample(
                 logits,
                 idx_mapping,
@@ -429,9 +431,9 @@ class DraftModelSpeculator(BaseSpeculator):
                     temperature,
                 )
         elif self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            return self.model.get_top_tokens(hidden_states, **head_kwargs)
         else:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states, **head_kwargs)
             sampled = logits.argmax(dim=-1)
         self._maybe_predict_acceptance(logits, idx_mapping, draft_step)
         return sampled

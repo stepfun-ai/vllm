@@ -225,7 +225,7 @@ index 7b43d72..9941731 100644
          gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
      );
 diff --git a/csrc/flash_attn/src/flash_fwd_launch_template.h b/csrc/flash_attn/src/flash_fwd_launch_template.h
-index 96b7238..771d8c9 100644
+index 96b7238..9a6ea7d 100644
 --- a/csrc/flash_attn/src/flash_fwd_launch_template.h
 +++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
 @@ -13,6 +13,12 @@
@@ -241,7 +241,7 @@ index 96b7238..771d8c9 100644
  // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
  #define ARCH_SUPPORTS_FLASH
-@@ -160,6 +166,34 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -160,6 +166,53 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
      }
  }
  
@@ -273,15 +273,35 @@ index 96b7238..771d8c9 100644
 +    });
 +}
 +
++// Keep the key tile and reduction order; reduce unused query rows in decode.
++template<typename T, int Headdim, bool Is_causal>
++bool try_run_headwise_gate_swa_decode(Flash_fwd_params &params, cudaStream_t stream) {
++    if (params.seqlen_q != 1 || params.window_size_left < 0
++        || params.window_size_left > 511 || params.window_size_right != 0) {
++        return false;
++    }
++    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
++    if (cc_major != 10 || cc_minor != 3) { return false; }
++    if (int64_t(params.b) * params.h >= 512) {
++        run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
++            Headdim, 16, 64, 1, false, false, T>>, Is_causal, true>(params, stream);
++    } else {
++        run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
++            Headdim, 32, 64, 2, false, false, T>>, Is_causal, true>(params, stream);
++    }
++    return true;
++}
++
  // The num_splits==1 blocksize-aligned splitkv template. If a user specifies
  // num_splits=1, we assume they want bitwise identical numerics across the split
  // KV and standard kernels so we align kBlockN to match.
-@@ -173,6 +207,13 @@ template<typename T, int Headdim, bool Is_causal>
+@@ -173,6 +226,14 @@ template<typename T, int Headdim, bool Is_causal>
  void run_mha_fwd_splitkv_align(Flash_fwd_params &params, cudaStream_t stream) {
      constexpr static int kBlockM = 64;
      constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
 +    if constexpr (Headdim == 192 && std::is_same_v<T, cutlass::bfloat16_t>) {
 +        if (params.headwise_gate_ptr != nullptr) {
++            if (try_run_headwise_gate_swa_decode<T, Headdim, Is_causal>(params, stream)) { return; }
 +            run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
 +                Headdim, kBlockM, kBlockN_standard, 4, false, false, T>>, Is_causal, true>(params, stream);
 +            return;
@@ -290,12 +310,13 @@ index 96b7238..771d8c9 100644
      run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
  }
  
-@@ -188,6 +229,13 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
+@@ -188,6 +249,14 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
          run_mha_fwd_splitkv_align<T, Headdim, Is_causal>(params, stream);
          return;
      }
 +    if constexpr (Headdim == 192 && std::is_same_v<T, cutlass::bfloat16_t>) {
 +        if (params.headwise_gate_ptr != nullptr) {
++            if (try_run_headwise_gate_swa_decode<T, Headdim, Is_causal>(params, stream)) { return; }
 +            run_headwise_gate_fwd<HeadwiseGateTraits<Flash_fwd_kernel_traits<
 +                Headdim, kBlockM, kBlockN, 4, false, false, T>>, Is_causal, true>(params, stream);
 +            return;
@@ -304,7 +325,7 @@ index 96b7238..771d8c9 100644
      run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
  }
  
-@@ -281,6 +329,13 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
+@@ -281,6 +350,13 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
  template<typename T, bool Is_causal>
  void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
      constexpr static int Headdim = 192;
