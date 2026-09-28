@@ -177,27 +177,26 @@ def _validate_step5_dsa_attention_contract(
     kv_sharing_target_layer_name: str | None,
     sinks: torch.Tensor | None,
 ) -> None:
-    if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError(
-            f"Step5 DSA kernels require float16 or bfloat16 activations, got {dtype}."
+    if dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"Step5 DSA kernels require bfloat16 activations, got {dtype}."
         )
-    if int(head_size) not in (128, 192):
-        raise ValueError(
-            "Step5 DSA kernels require head_size in {128, 192}, got "
-            f"{int(head_size)}."
+    if head_size != 192:
+        raise NotImplementedError(
+            f"Step5 DSA kernels require head_size 192, got {head_size}."
         )
-    if int(q_heads_per_kv) not in (4, 8, 16):
+    if q_heads_per_kv not in (4, 8, 16):
         raise ValueError(
             "Step5 DSA kernels require q_heads_per_kv in {4, 8, 16}, got "
-            f"{int(q_heads_per_kv)}."
+            f"{q_heads_per_kv}."
         )
     if alibi_slopes is not None:
         raise NotImplementedError("Step5 DSA does not support ALiBi.")
-    if tuple(sliding_window) != (-1, -1):
+    if sliding_window != (-1, -1):
         raise NotImplementedError(
             "Step5 DSA does not support sliding-window attention."
         )
-    if float(logits_soft_cap) != 0.0:
+    if logits_soft_cap != 0:
         raise NotImplementedError("Step5 DSA does not support logits soft cap.")
     if attn_type != AttentionType.DECODER:
         raise NotImplementedError(
@@ -350,6 +349,8 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             "fp8_e4m3",
         ):
             raise NotImplementedError("Step5 DSA supports E4M3 FP8 KV cache only")
+        if self.kv_cache_dtype == "float16":
+            raise NotImplementedError("Step5 DSA does not support a float16 KV cache")
         _validate_step5_dsa_attention_contract(
             dtype=torch.get_default_dtype(),
             head_size=self.head_size,
@@ -408,15 +409,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         )
         if (dsa_summary_updated or defer_inactive_clear) and not is_decode:
             raise ValueError("Decode attention fusions cannot be used for prefill")
-        # The direct sparse decode kernel applies the gate while writing out;
-        # other paths gate the finished output.
-        fuse_gate = (
-            is_decode
-            and query.shape[2] == 192
-            and query.shape[1] // kv_cache.shape[1] <= 16
-            and kv_cache.shape[-1] == 384
-        )
-        if dsa_gate is not None and not fuse_gate:
+        # The sparse decode kernel applies the gate while writing out; prefill
+        # gates the finished output.
+        if dsa_gate is not None and not is_decode:
             self.forward(
                 layer,
                 query,
@@ -832,7 +827,6 @@ class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):
 
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
-        "float16",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
@@ -845,7 +839,7 @@ class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return int(head_size) in (128, 192)
+        return head_size == 192
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:

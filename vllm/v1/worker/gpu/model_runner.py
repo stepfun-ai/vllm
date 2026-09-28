@@ -178,7 +178,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     copy_kv_cache_side_storage_blocks,
     get_uniform_decode_token_count,
-    reset_kv_cache_side_storage_runtime_state,
+    reset_kv_cache_side_storage_and_log,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
@@ -967,19 +967,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def post_kv_cache_wake_up(self) -> None:
         self.block_tables.init_block_table_layout_tensors()
-        num_side_storages, num_scratch_buffers = (
-            reset_kv_cache_side_storage_runtime_state(
-                self.compilation_config.static_forward_context
-            )
+        reset_kv_cache_side_storage_and_log(
+            self.compilation_config.static_forward_context, "wake-up"
         )
-        if num_side_storages:
-            torch.accelerator.synchronize()
-            logger.info(
-                "Reset KV side-storage state after wake-up: "
-                "storages=%d scratch_buffers=%d",
-                num_side_storages,
-                num_scratch_buffers,
-            )
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -1072,19 +1062,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             lock_workspace()
 
         torch.accelerator.synchronize()
-        num_side_storages, num_scratch_buffers = (
-            reset_kv_cache_side_storage_runtime_state(
-                self.compilation_config.static_forward_context
-            )
+        reset_kv_cache_side_storage_and_log(
+            self.compilation_config.static_forward_context, "graph capture"
         )
-        if num_side_storages:
-            logger.info(
-                "Reset KV side-storage state after graph capture: "
-                "storages=%d scratch_buffers=%d",
-                num_side_storages,
-                num_scratch_buffers,
-            )
-            torch.accelerator.synchronize()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

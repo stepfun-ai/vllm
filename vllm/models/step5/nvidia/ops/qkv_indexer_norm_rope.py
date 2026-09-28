@@ -385,6 +385,5 @@ def qkv_indexer_norm_rope(
             fp8_cache,
             num_warps=4,
             enable_fp_fusion=False,
-            debug=decode_cache is not None,
         )
     return q.transpose(0, 1), k, w.transpose(0, 1), main_q, main_k, main_v

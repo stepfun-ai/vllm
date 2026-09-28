@@ -949,10 +949,7 @@ def estimate_max_model_len(
         The estimated maximum model length that can fit in the available memory.
 
     """
-    if any(
-        spec.extra_budget_page_size_bytes or spec.extra_budget_fixed_size_bytes
-        for spec in kv_cache_spec.values()
-    ):
+    if _has_extra_kv_budget(kv_cache_spec.values()):
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
         return _estimate_max_model_len_from_groups(
             vllm_config, groups, available_memory
@@ -1024,11 +1021,7 @@ def check_enough_kv_cache_memory(
             check_memory,
             lambda: (
                 _max_memory_usage_bytes_from_groups(vllm_config, groups)
-                if any(
-                    spec.extra_budget_page_size_bytes
-                    or spec.extra_budget_fixed_size_bytes
-                    for spec in kv_cache_spec.values()
-                )
+                if _has_extra_kv_budget(kv_cache_spec.values())
                 else max_memory_usage_bytes(vllm_config, kv_cache_spec.values())
             ),
             vllm_config.model_config.max_model_len,
@@ -1196,7 +1189,7 @@ def _get_scheduler_kv_cache_spec(spec: KVCacheSpec) -> KVCacheSpec:
     # representative and aggregate group-level behavior that
     # `generate_scheduler_kv_cache_config` exposes at runtime.
     scheduler_spec = copy.deepcopy(next(iter(spec.kv_cache_specs.values())))
-    side_storage_updates = {}
+    side_storage_updates: dict[str, Any] = {}
     if spec.requires_zeroing and not scheduler_spec.requires_zeroing:
         side_storage_updates["requires_zeroing"] = True
     if (
@@ -1211,28 +1204,37 @@ def _get_scheduler_kv_cache_spec(spec: KVCacheSpec) -> KVCacheSpec:
     return scheduler_spec
 
 
-def _kv_cache_group_extra_page_budget(group: KVCacheGroupSpec) -> int:
+def _has_extra_kv_budget(specs: Iterable[KVCacheSpec]) -> bool:
+    return any(
+        spec.extra_budget_page_size_bytes or spec.extra_budget_fixed_size_bytes
+        for spec in specs
+    )
+
+
+def _kv_cache_group_layers_multiplier(group: KVCacheGroupSpec) -> int:
+    """How many times a group's per-layer side-storage budget is counted."""
     if not group.layer_names:
         return 0
-    spec = group.kv_cache_spec
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        return spec.extra_budget_page_size_bytes
-    return len(group.layer_names) * spec.extra_budget_page_size_bytes
+    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+        return 1
+    return len(group.layer_names)
+
+
+def _kv_cache_group_extra_page_budget(group: KVCacheGroupSpec) -> int:
+    return (
+        _kv_cache_group_layers_multiplier(group)
+        * group.kv_cache_spec.extra_budget_page_size_bytes
+    )
 
 
 def _kv_cache_groups_fixed_budget_size(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
-    fixed_budget = 0
-    for group in kv_cache_groups:
-        if not group.layer_names:
-            continue
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            fixed_budget += spec.extra_budget_fixed_size_bytes
-        else:
-            fixed_budget += len(group.layer_names) * spec.extra_budget_fixed_size_bytes
-    return fixed_budget
+    return sum(
+        _kv_cache_group_layers_multiplier(group)
+        * group.kv_cache_spec.extra_budget_fixed_size_bytes
+        for group in kv_cache_groups
+    )
 
 
 def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
@@ -1534,7 +1536,9 @@ def unify_kv_cache_spec_page_size(
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 if layer_spec.extra_budget_page_size_bytes:
-                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    new_spec = replace(
+                        cast(AttentionSpec, layer_spec), page_size_padded=max_page_size
+                    )
                 else:
                     new_spec = replace(layer_spec, block_size=new_block_size)
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
@@ -2382,7 +2386,7 @@ def _ensure_min_page_size(
     scaled: list[KVCacheGroupSpec] = []
     for g in groups:
         s = g.kv_cache_spec
-        kw: dict[str, int] = {"block_size": s.block_size * scale}
+        kw: dict[str, Any] = {"block_size": s.block_size * scale}
         if isinstance(s, (AttentionSpec, MambaSpec)) and s.page_size_padded is not None:
             kw["page_size_padded"] = s.page_size_padded * scale
         scaled.append(KVCacheGroupSpec(g.layer_names, replace(s, **kw)))

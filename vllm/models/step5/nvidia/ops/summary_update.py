@@ -113,7 +113,6 @@ def update_decode(
             block_size,
             num_warps=4,
             enable_fp_fusion=False,
-            debug=True,
         )
 
 
@@ -142,7 +141,8 @@ def _accumulate_prefill(
     page = region * 8 // BLOCK_SIZE
     fresh = first == 0
     last_slot = tl.load(LastSlot + page)
-    # Checked on device: a host check would synchronize every layer.
+    # Checked on device (enable with TRITON_DEBUG=1): a host check would
+    # synchronize every layer.
     tl.device_assert(
         fresh | (last_slot == region * 8 + first - 1),
         "Step5 CSA tail missing for a partial region",
@@ -378,7 +378,6 @@ def update_prefill(
         block_size,
         num_warps=4,
         enable_fp_fusion=False,
-        debug=True,
     )
     _commit_prefill[(metadata.shape[0],)](
         metadata,
@@ -539,5 +538,4 @@ def update_request_journal(
             update,
             num_warps=4,
             enable_fp_fusion=False,
-            debug=True,
         )

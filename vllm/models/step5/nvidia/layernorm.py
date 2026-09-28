@@ -8,8 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm.model_executor.layers.layernorm import RMSNorm
-
 _NORM_DTYPE_TO_TORCH_DTYPE = {
     "bf16": torch.bfloat16,
     "bfloat16": torch.bfloat16,
@@ -102,11 +100,7 @@ def apply_step5_add_rms_norm(
             )
             return output, residual
 
-    residual_out = (
-        (x.float() + residual.float()).to(residual.dtype)
-        if x.dtype == torch.float16
-        else x + residual
-    )
+    residual_out = x + residual
     output = _step5_rms_norm(
         residual_out, weight, variance_epsilon, zero_centered, out_dtype
     )
@@ -167,9 +161,9 @@ def make_step5_rms_norm(
     zero_centered: bool = False,
     dtype: torch.dtype | None = None,
 ) -> nn.Module:
-    if zero_centered:
-        return Step5RMSNorm(hidden_size, eps, zero_centered, dtype=dtype)
-    return RMSNorm(hidden_size, eps, dtype=dtype)
+    if not zero_centered:
+        raise NotImplementedError("Step5 requires zero-centered RMSNorm weights")
+    return Step5RMSNorm(hidden_size, eps, zero_centered, dtype=dtype)
 
 
 class Step5IndexerLayerNorm(nn.Module):

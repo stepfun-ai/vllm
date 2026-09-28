@@ -494,14 +494,7 @@ class Step3p5MTPProposer(EagleProposer):
                 "history can be repaired. Please unset "
                 "disable_padded_drafter_batch in the speculative config."
             )
-        if (
-            getattr(
-                self.speculative_config,
-                "num_speculative_tokens_per_batch_size",
-                None,
-            )
-            is not None
-        ):
+        if self.speculative_config.num_speculative_tokens_per_batch_size is not None:
             raise NotImplementedError(
                 "Step MTP does not support dynamic speculative token counts. "
                 "Changing K skips later MTP modules and leaves their KV state "
@@ -843,6 +836,14 @@ class Step3p5MTPProposer(EagleProposer):
             )
         return num_tokens, num_rejected
 
+    def _cached_draft_input_embeds_strides(self) -> tuple[int, int]:
+        if self.cached_draft_input_embeds is None:
+            return 0, 0
+        return (
+            self.cached_draft_input_embeds.stride(0),
+            self.cached_draft_input_embeds.stride(1),
+        )
+
     def _prepare_packed_hidden_states(
         self,
         target_hidden_states: torch.Tensor,
@@ -869,16 +870,7 @@ class Step3p5MTPProposer(EagleProposer):
             self.inputs_embeds,
             self.inputs_embeds.stride(0),
             self.cached_draft_input_embeds,
-            (
-                self.cached_draft_input_embeds.stride(0)
-                if self.cached_draft_input_embeds is not None
-                else 0
-            ),
-            (
-                self.cached_draft_input_embeds.stride(1)
-                if self.cached_draft_input_embeds is not None
-                else 0
-            ),
+            *self._cached_draft_input_embeds_strides(),
             self.cached_history_lens,
             history_slot_mapping,
             num_rejected_tokens_gpu,
@@ -908,16 +900,7 @@ class Step3p5MTPProposer(EagleProposer):
             self.cached_draft_input_ids,
             self.cached_draft_input_ids.stride(0),
             self.cached_draft_input_embeds,
-            (
-                self.cached_draft_input_embeds.stride(0)
-                if self.cached_draft_input_embeds is not None
-                else 0
-            ),
-            (
-                self.cached_draft_input_embeds.stride(1)
-                if self.cached_draft_input_embeds is not None
-                else 0
-            ),
+            *self._cached_draft_input_embeds_strides(),
             self.cached_target_hidden_states,
             self.cached_target_hidden_states.stride(0),
             self.cached_target_hidden_states.stride(1),

@@ -24,17 +24,6 @@ class DecodeIndexerMetadata(NamedTuple):
     schedule: torch.Tensor | None = None
 
 
-class PagedDecodeMetadata(NamedTuple):
-    positions: torch.Tensor
-    active: torch.Tensor
-    block_table: torch.Tensor
-    mask: torch.Tensor
-    indices: torch.Tensor
-    indptr: torch.Tensor
-    block_size: int
-    page_stride: int = 0
-
-
 class PagedPrefillMetadata(NamedTuple):
     owners: torch.Tensor
     block_table: torch.Tensor
@@ -438,7 +427,7 @@ def select_all_regions(current: torch.Tensor, capacity: int) -> torch.Tensor:
     return output
 
 
-@triton.jit(do_not_specialize=["SCORE_STRIDE", "BATCH"])
+@triton.jit(do_not_specialize=["SCORE_STRIDE"])
 def _stable_topk_regions(
     Scores,
     Current,
@@ -451,21 +440,12 @@ def _stable_topk_regions(
     BLOCK_K: tl.constexpr,
     BLOCK_SCAN: tl.constexpr,
     BLOCK_SORT: tl.constexpr,
-    PREPARE_PAGED: tl.constexpr = False,
-    Positions=None,
-    Active=None,
     Table=None,
-    Mask=None,
     Pages=None,
     Indptr=None,
-    BATCH=1,
-    BLOCK_B: tl.constexpr = 1,
-    POSITION_STRIDE: tl.constexpr = 0,
-    ACTIVE_STRIDE: tl.constexpr = 0,
     TABLE_ROW: tl.constexpr = 0,
     TABLE_COL: tl.constexpr = 0,
     BLOCK_SIZE: tl.constexpr = 8,
-    PAGE_STRIDE: tl.constexpr = 0,
     PREPARE_PREFILL: tl.constexpr = False,
     Owners=None,
     OWNER_STRIDE: tl.constexpr = 0,
@@ -479,7 +459,7 @@ def _stable_topk_regions(
     valid = (col < K) & (chosen >= 0) & (chosen < length)
     values = tl.load(Scores + row * SCORE_STRIDE + chosen, valid, other=float("inf"))
     # When Top-K contains every historical region, its ordering is irrelevant.
-    # Preserve the original path for non-finite scores and incomplete selection.
+    # Non-finite scores or an incomplete selection take the general path.
     complete = tl.sum(valid.to(tl.int32), 0) == length
     short_finite = False
     if (length <= K) & complete:
@@ -558,32 +538,6 @@ def _stable_topk_regions(
             INDPTR_STRIDE,
             BLOCK_SIZE,
         )
-    if PREPARE_PAGED:
-        rows = tl.arange(0, BLOCK_B)
-        all_pos = tl.load(Positions + rows * POSITION_STRIDE, rows < BATCH, other=0)
-        historical = tl.minimum(tl.maximum(all_pos >> 3, 0), K)
-        counts = K + 1 - ((K - historical) // 32) * 32
-        prefix = tl.sum(tl.where(rows < row, counts, 0), 0)
-        count = tl.sum(tl.where(rows == row, counts, 0), 0)
-        drop = K + 1 - count
-        compact_col = col - drop
-        valid = (col <= K) & (compact_col >= 0)
-        position = tl.load(Positions + row * POSITION_STRIDE)
-        active = tl.load(Active + row * ACTIVE_STRIDE)
-        length = tl.minimum(tl.maximum(position - selected * 8 + 1, 0), 8)
-        bits = tl.where((selected >= 0) & active, (1 << length) - 1, 0)
-        tl.store(Mask + row * (K + 1) + compact_col, bits, valid)
-        nonnegative = tl.maximum(selected, 0)
-        physical = tl.load(
-            Table + row * TABLE_ROW + nonnegative // (BLOCK_SIZE // 8) * TABLE_COL,
-            valid,
-            other=0,
-        )
-        page = physical * PAGE_STRIDE + nonnegative % (BLOCK_SIZE // 8)
-        tl.store(Pages + prefix + compact_col, page, valid)
-        tl.store(Indptr + row, prefix)
-        if row == BATCH - 1:
-            tl.store(Indptr + BATCH, prefix + count)
 
 
 def select_regions(
@@ -593,7 +547,6 @@ def select_regions(
     backend: str = "auto",
     *,
     topk_lengths: torch.Tensor | None = None,
-    paged_decode: PagedDecodeMetadata | None = None,
     paged_prefill: PagedPrefillMetadata | None = None,
     sort: bool = True,
 ) -> torch.Tensor:
@@ -604,14 +557,12 @@ def select_regions(
     rows, regions = scores.shape
     k = min(topk, regions)
     if paged_prefill is not None:
-        if paged_decode is not None or regions <= topk:
+        if regions <= topk:
             raise ValueError("Fused prefill pages require scored prefill only")
         if paged_prefill.block_size not in (16, 32, 64, 128):
             raise ValueError("Unsupported prefill cache block size")
-    if not sort and (paged_decode is not None or paged_prefill is not None):
+    if not sort and paged_prefill is not None:
         raise ValueError("Fused page metadata requires sorted regions")
-    if paged_decode is not None and (k != 512 or regions <= topk):
-        raise ValueError("Fused paged decode requires top-k 512 and more regions")
     if regions <= topk:
         return select_all_regions(current, k)
     output = torch.empty((rows, k + 1), device=scores.device, dtype=torch.long)
@@ -644,24 +595,6 @@ def select_regions(
     )
     scratch = torch.empty((rows, k + 1), device=scores.device, dtype=torch.int32)
     paged_kwargs = {}
-    if paged_decode is not None:
-        paged_kwargs = dict(
-            PREPARE_PAGED=True,
-            Positions=paged_decode.positions,
-            Active=paged_decode.active,
-            Table=paged_decode.block_table,
-            Mask=paged_decode.mask,
-            Pages=paged_decode.indices,
-            Indptr=paged_decode.indptr,
-            BATCH=rows,
-            BLOCK_B=triton.next_power_of_2(rows),
-            POSITION_STRIDE=paged_decode.positions.stride(0),
-            ACTIVE_STRIDE=paged_decode.active.stride(0),
-            TABLE_ROW=paged_decode.block_table.stride(0),
-            TABLE_COL=paged_decode.block_table.stride(1),
-            BLOCK_SIZE=paged_decode.block_size,
-            PAGE_STRIDE=paged_decode.page_stride or paged_decode.block_size // 8,
-        )
     if paged_prefill is not None:
         paged_kwargs = dict(
             PREPARE_PREFILL=True,

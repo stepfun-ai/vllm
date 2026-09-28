@@ -10,10 +10,9 @@ window split, and a combine kernel merges splits and applies the gate.
 
 import torch
 
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
-_PDL = current_platform.is_arch_support_pdl()
+from .sparse_decode_attention import _PDL, _gate
 
 
 @triton.jit(do_not_specialize=["SCALE"])
@@ -52,8 +51,6 @@ def _swa_decode_split(
     BLOCK_N: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    # PDL: launch overlaps the producer's tail; wait before reading its
-    # outputs. No early trigger, so our writes stay visible downstream.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     # A program covers PACK consecutive tokens of one request and all GROUP
@@ -121,11 +118,7 @@ def _swa_decode_split(
     token = first_token + row_token
     out = Output + token.to(tl.int64)[:, None] * OUT_ROW + head[:, None] * OUT_HEAD
     # Match the unfused path: BF16 attention times sigmoid rounded to gate dtype.
-    gate = tl.load(
-        Gate + token.to(tl.int64) * GATE_ROW + head * GATE_HEAD, live, other=0.0
-    ).to(tl.float32)
-    sigmoid = tl.div_rn(1.0, 1.0 + tl.extra.cuda.libdevice.exp(-gate))
-    sigmoid = sigmoid.to(Gate.dtype.element_ty).to(tl.float32)
+    sigmoid = _gate(Gate, token, head, live, True, GATE_ROW, GATE_HEAD)
     inverse = tl.where(total > 0, 1.0 / tl.maximum(total, 1e-30), 0.0)
     if SPLITS == 1:
         _store_gated(
@@ -178,8 +171,6 @@ def _swa_decode_combine(
     BLOCK_S: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    # PDL: launch overlaps the producer's tail; wait before reading its
-    # outputs. No early trigger, so our writes stay visible downstream.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     token = tl.program_id(0)
@@ -202,11 +193,7 @@ def _swa_decode_combine(
     attention = tl.sum(tl.where(weight[:, None] > 0, partial * weight[:, None], 0.0), 0)
     # Match the unfused path: BF16 attention times sigmoid rounded to gate dtype.
     attention = attention.to(Output.dtype.element_ty).to(tl.float32)
-    gate = tl.load(Gate + token.to(tl.int64) * GATE_ROW + head * GATE_HEAD).to(
-        tl.float32
-    )
-    sigmoid = tl.div_rn(1.0, 1.0 + tl.extra.cuda.libdevice.exp(-gate))
-    sigmoid = sigmoid.to(Gate.dtype.element_ty).to(tl.float32)
+    sigmoid = _gate(Gate, token, head, True, True, GATE_ROW, GATE_HEAD)
     tl.store(
         Output + token.to(tl.int64) * OUT_ROW + head * OUT_HEAD + d,
         attention * sigmoid,
@@ -217,8 +204,12 @@ def _swa_decode_combine(
 def swa_decode_plan(
     tokens: int, kv_heads: int, group: int, query_len: int, num_sms: int, window: int
 ) -> tuple[int, int]:
-    """(pack, splits): pack verify tokens once (token, KV head) rows fill
-    ~one wave, since their windows overlap; then split the window."""
+    """Return (pack, splits) for a decode batch.
+
+    MTP verify tokens of a request are packed into one program when
+    (token, KV head) programs already fill about a wave, since their windows
+    overlap; the window is then split to fill the GPU.
+    """
     pack = (
         query_len
         if query_len > 1 and tokens * kv_heads >= 128 and query_len * group <= 64

@@ -26,7 +26,6 @@ def _compact_prefill_pages(
     QUERY_DIM: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     QUERY_WIDTH: tl.constexpr,
-    COPY_QUERY: tl.constexpr,
     REGION_COUNT,
     REGION_ROW: tl.constexpr,
     REGION_COL: tl.constexpr,
@@ -56,21 +55,20 @@ def _compact_prefill_pages(
     )
     page = physical * PAGE_STRIDE + region % (BLOCK_SIZE // 8)
     tl.store(Pages + start + col, page, col < count)
-    if COPY_QUERY:
-        q_col = tl.program_id(0) * 256 + tl.arange(0, 256)
-        value = tl.load(
-            Query
-            + row * QUERY_ROW
-            + (q_col // HEAD_DIM) * QUERY_HEAD
-            + (q_col % HEAD_DIM) * QUERY_DIM,
-            q_col < QUERY_WIDTH,
-            other=0,
-        )
-        tl.store(
-            ContiguousQuery + row * QUERY_WIDTH + q_col,
-            value,
-            q_col < QUERY_WIDTH,
-        )
+    q_col = tl.program_id(0) * 256 + tl.arange(0, 256)
+    value = tl.load(
+        Query
+        + row * QUERY_ROW
+        + (q_col // HEAD_DIM) * QUERY_HEAD
+        + (q_col % HEAD_DIM) * QUERY_DIM,
+        q_col < QUERY_WIDTH,
+        other=0,
+    )
+    tl.store(
+        ContiguousQuery + row * QUERY_WIDTH + q_col,
+        value,
+        q_col < QUERY_WIDTH,
+    )
 
 
 def fill_prefill_pages(
@@ -81,20 +79,13 @@ def fill_prefill_pages(
     pages,
     block_size,
     query,
-    *,
-    page_stride=None,
-    contiguous_query=None,
+    contiguous_query,
+    page_stride,
 ):
+    """Emit compact pages and copy ``query`` into ``contiguous_query``."""
     rows, count = regions.shape
-    copy_query = contiguous_query is not None or not query.is_contiguous()
-    if contiguous_query is None:
-        contiguous_query = (
-            torch.empty_like(query, memory_format=torch.contiguous_format)
-            if copy_query
-            else query
-        )
     width = query.shape[1] * query.shape[2]
-    tiles = max(triton.cdiv(count, 128), triton.cdiv(width, 256) if copy_query else 1)
+    tiles = max(triton.cdiv(count, 128), triton.cdiv(width, 256))
     _compact_prefill_pages[(tiles, rows)](
         regions,
         table,
@@ -106,17 +97,15 @@ def fill_prefill_pages(
         *query.stride(),
         query.shape[2],
         width,
-        copy_query,
         count,
         *regions.stride(),
         *table.stride(),
         owners.stride(0),
         block_size,
-        block_size // 8 if page_stride is None else page_stride,
+        page_stride,
         128,
         num_warps=4,
     )
-    return contiguous_query
 
 
 def view_sparse_kv_pages(cache):
@@ -242,13 +231,11 @@ class CompactPagedPrefill:
         )
 
     def prepare_chunk(self, start, query, cache, regions, table, owners):
+        assert self.query_buffer is not None
         end = start + query.shape[0]
         assert 0 <= start < end <= self.query_shape[0]
         assert query.shape[1:] == self.query_shape[1:]
         assert regions.shape == (query.shape[0], self.region_count)
-        destination = (
-            self.query_buffer[start:end] if self.query_buffer is not None else None
-        )
         fill_prefill_pages(
             regions,
             table,
@@ -257,8 +244,8 @@ class CompactPagedPrefill:
             self.pages,
             cache.shape[2],
             query,
-            page_stride=self.page_stride,
-            contiguous_query=destination,
+            self.query_buffer[start:end],
+            self.page_stride,
         )
 
     def finish(self, query, cache, out):

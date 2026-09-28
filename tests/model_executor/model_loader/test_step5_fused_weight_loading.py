@@ -110,6 +110,7 @@ def test_step5_attention_quantizes_projections_but_not_kv_cache(
     class FakeAttention(nn.Module):
         def __init__(self, *_args, **kwargs):
             super().__init__()
+            self.impl = SimpleNamespace(supports_headwise_gate=lambda: False)
             attention_quant_configs.append(kwargs["quant_config"])
 
     class FakeRotaryEmbedding(nn.Module):
@@ -170,12 +171,11 @@ def test_step5_custom_linear_batch_invariance(monkeypatch, kind, output_width, r
     torch.testing.assert_close(actual.float(), oracle, rtol=0.005, atol=0.01)
 
 
-def _make_fused_projection(*loaded_shards: str, has_gate: bool = True):
+def _make_fused_projection(*loaded_shards: str):
     projection = step5_model.Step5FusedQKVIndexerLinear.__new__(
         step5_model.Step5FusedQKVIndexerLinear
     )
     nn.Module.__init__(projection)
-    projection.has_gate = has_gate
     projection._loaded_shards = set(loaded_shards)
     return projection
 
@@ -439,48 +439,6 @@ def test_step5_mtp_dense_flag_is_false_when_a_draft_block_is_moe():
     assert not step5_mtp._is_step5_mtp_dense(mtp.model)
 
 
-def test_step5_mtp_exposes_moe_runner_to_eplb_and_updates_metadata():
-    mtp = _make_mtp_with_optional_moe(use_moe=True)
-    runner = mtp.moe_layers[0]
-    expert_load_view = torch.zeros(1)
-    logical_to_physical_map = torch.zeros(1, dtype=torch.int32)
-    logical_replica_count = torch.ones(1, dtype=torch.int32)
-
-    assert is_mixture_of_experts(mtp)
-    mtp.set_eplb_state(
-        expert_load_view,
-        logical_to_physical_map,
-        logical_replica_count,
-    )
-    mtp.update_physical_experts_metadata(
-        num_physical_experts=12,
-        num_local_physical_experts=5,
-    )
-
-    assert mtp.expert_weights == [[runner.weight]]
-    assert runner.eplb_calls == [
-        {
-            "moe_layer_idx": 0,
-            "expert_load_view": expert_load_view,
-            "logical_to_physical_map": logical_to_physical_map,
-            "logical_replica_count": logical_replica_count,
-        }
-    ]
-    assert runner.update_expert_map_calls == 1
-    assert mtp.num_physical_experts == 12
-    assert mtp.num_redundant_experts == 4
-
-
-def test_step5_mtp_rejects_local_physical_expert_count_changes():
-    mtp = _make_mtp_with_optional_moe(use_moe=True)
-
-    with pytest.raises(ValueError, match="cannot change the number of local"):
-        mtp.update_physical_experts_metadata(
-            num_physical_experts=12,
-            num_local_physical_experts=4,
-        )
-
-
 def test_step5_dsa_rejects_kv_transfer_before_cache_binding():
     vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(is_kv_transfer_instance=True)
@@ -502,9 +460,8 @@ def test_step5_dsa_parallel_geometry_accepts_supported_layout(tp_size):
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("fused_checkpoint", [False, True])
 def test_step5_provider_shards_preserve_complete_group_projections(
-    monkeypatch, default_vllm_config, tp_size, fused_checkpoint
+    monkeypatch, default_vllm_config, tp_size
 ):
     """TP1/2 retain all local groups; TP8/16 replicate complete index heads."""
     torch.manual_seed(127)
@@ -544,13 +501,8 @@ def test_step5_provider_shards_preserve_complete_group_projections(
             index_tp_size=4,
             params_dtype=torch.float32,
         )
-        if fused_checkpoint:
-            projection.weight_loader_v2(
-                projection.weight, torch.cat(list(weights.values()))
-            )
-        else:
-            for name, weight in weights.items():
-                projection.weight_loader_v2(projection.weight, weight, name)
+        for name, weight in weights.items():
+            projection.weight_loader_v2(projection.weight, weight, name)
         indexer = step5_model.Step5SparseIndexerIndexTPLinear(
             8, 16, params_dtype=torch.float32, index_tp_size=4
         )
@@ -656,33 +608,12 @@ def test_fused_qkv_indexer_validation_reports_and_resets_complete_weight():
     assert module.projection._loaded_shards == set()
 
 
-def test_fused_qkv_indexer_accepts_local_fused_checkpoint_weight():
+def test_fused_qkv_indexer_rejects_prefused_checkpoint_weight():
     projection = _make_fused_projection()
-    projection._fused_checkpoint_shard_sizes = ()
-    param = nn.Parameter(torch.zeros(8, 4))
-    loaded_weight = torch.arange(32, dtype=torch.float32).view(8, 4)
-
-    projection.weight_loader_v2(param, loaded_weight)
-
-    torch.testing.assert_close(param, loaded_weight)
-    assert projection._loaded_shards == projection.required_shard_ids()
-
-
-def test_fused_qkv_indexer_rejects_malformed_fused_checkpoint_weight():
-    projection = _make_fused_projection()
-    projection._fused_checkpoint_shard_sizes = (
-        ("q", 2),
-        ("k", 1),
-        ("v", 1),
-        ("index_q", 2),
-        ("index_k", 1),
-        ("index_z", 1),
-        ("index_g", 1),
-    )
     param = nn.Parameter(torch.zeros(8, 4))
 
-    with pytest.raises(ValueError, match="expected local 8 or global 9"):
-        projection.weight_loader_v2(param, torch.zeros(7, 4))
+    with pytest.raises(NotImplementedError, match="pre-fused qkv_indexer_proj"):
+        projection.weight_loader_v2(param, torch.zeros(8, 4))
 
 
 def test_step5_full_load_validates_but_weight_transfer_can_be_partial(monkeypatch):
@@ -739,10 +670,6 @@ def test_step5_main_loader_accepts_base_prefixes_and_skips_later_layers():
         model,
         [
             ("model.layers.0.weight", torch.tensor([1.0])),
-            (
-                "model.layers.0.moe.experts.3.gate_proj.weight",
-                torch.tensor([5.0]),
-            ),
             ("layers.1.weight", torch.tensor([2.0])),
             ("model.layers.2.weight", torch.tensor([3.0])),
             ("layers.3.weight", torch.tensor([4.0])),
@@ -785,26 +712,33 @@ def test_step5_mtp_loader_selects_and_rewrites_only_draft_layers():
     )
 
 
-def test_step5_sparse_config_prefers_native_section_and_keeps_legacy_alias():
-    native = SimpleNamespace(
-        step5_sparse_config={"enabled": False},
-        step3p5_sparse_config={"enabled": True},
-        sparse_config={"enabled": True},
-    )
-    legacy = SimpleNamespace(step3p5_sparse_config={"enabled": True})
+@pytest.mark.parametrize(
+    "config",
+    [
+        SimpleNamespace(step5_sparse_config={"enabled": True}),
+        SimpleNamespace(step3p5_sparse_config={"enabled": True}),
+        SimpleNamespace(sparse_config={"softmax_variant": "ssmax"}),
+    ],
+)
+def test_step5_sparse_config_rejects_legacy_aliases(config):
+    with pytest.raises(NotImplementedError):
+        get_step5_sparse_config(config)
 
-    assert get_step5_sparse_config(native) is None
-    assert get_step5_sparse_config(legacy) is not None
+
+@pytest.mark.parametrize("enabled", ["false", 0])
+def test_step5_sparse_config_rejects_non_bool_enabled(enabled):
+    with pytest.raises(ValueError, match="must be a bool"):
+        get_step5_sparse_config(SimpleNamespace(sparse_config={"enabled": enabled}))
 
 
 @pytest.mark.parametrize(
     ("config", "expected"),
     [
-        (SimpleNamespace(step5_sparse_config={"enabled": True}), True),
-        (SimpleNamespace(step5_sparse_config={}), True),
+        (SimpleNamespace(sparse_config={"enabled": True}), True),
+        (SimpleNamespace(sparse_config={}), True),
         # ``enabled`` controls sparse execution; section presence still
         # advertises the split-KV/replay contract required by the checkpoint.
-        (SimpleNamespace(step5_sparse_config={"enabled": False}), True),
+        (SimpleNamespace(sparse_config={"enabled": False}), True),
         (SimpleNamespace(), False),
     ],
 )
@@ -812,9 +746,8 @@ def test_step5_sparse_checkpoint_capability_tracks_declared_layout(config, expec
     assert checkpoint_has_step5_sparse_config(config) is expected
 
 
-@pytest.mark.parametrize("enabled", [False, "false", 0])
-def test_step5_sparse_config_respects_checkpoint_disable(enabled):
-    config = SimpleNamespace(sparse_config={"enabled": enabled})
+def test_step5_sparse_config_respects_checkpoint_disable():
+    config = SimpleNamespace(sparse_config={"enabled": False})
     assert get_step5_sparse_config(config) is None
     assert checkpoint_has_step5_sparse_config(config)
 
@@ -841,7 +774,7 @@ def test_step5_sparse_config_reads_checkpoint_geometry():
 
 def test_step5_sparse_config_retains_ssmax_compatibility_metadata():
     config = SimpleNamespace(
-        step5_sparse_config={
+        sparse_config={
             "enabled": True,
             "sparse_indexer_softmax_variant": "ssmax",
         }

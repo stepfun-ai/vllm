@@ -375,7 +375,7 @@ class Step5SparseSummaryCache:
         ):
             tensor[destinations] = snapshot
         journals = [self._speculative_tails.get(src, {}) for src in sources]
-        for src, dst, journal in zip(sources, destinations, journals):
+        for dst, journal in zip(destinations, journals):
             copied = {}
             for slot, saved in journal.items():
                 state = tuple(t.clone() for t in saved)
@@ -476,10 +476,6 @@ class Step5SparseSummaryCacheLayer(torch.nn.Module, AttentionLayerBase):
         )
         self.kv_cache = self._cache.mean.view(kv.shape[0], -1)
         self._target_impl.summary_cache = self._cache
-
-    @property
-    def side_kv_cache(self):
-        return self.kv_cache.unsqueeze(0)
 
     def zero_kv_cache_side_storage(self, block_ids):
         if self._cache is not None:

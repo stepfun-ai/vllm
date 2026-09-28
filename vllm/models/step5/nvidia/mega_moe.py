@@ -12,7 +12,6 @@ from torch import nn
 import vllm.envs as envs
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
@@ -23,8 +22,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.deep_gemm import _import_deep_gemm
-
-logger = init_logger(__name__)
 
 
 class _BufferPool:
@@ -360,7 +357,6 @@ class Step5MegaMoEExperts(nn.Module):
         if hidden_states.dtype != torch.bfloat16:
             raise ValueError("MegaMoE expects BF16 hidden states")
         buffer = self.get_symm_buffer()
-        assert self.pool is not None
         if self.fp8:
             prepare_megamoe_inputs(
                 hidden_states,
@@ -406,22 +402,6 @@ class Step5MegaMoEExperts(nn.Module):
             activation_clamp=self.activation_clamp,
             **shared_kwargs,
         )
-        if not getattr(self, "_kernel_logged", False):
-            if self.group.rank() == 0:
-                logger.info(
-                    "Step5 MegaMoE executed: layer=%s kernel=%s mma=%s "
-                    "weight_dtype=%s buffer_owner=%s tokens=%d "
-                    "fused_shared=%d output_dtype=%s",
-                    self.prefix,
-                    "fp8_fp4_mega_moe" if self.fp8 else "bf16_mega_moe",
-                    self.mma_type,
-                    self.w13_weight.dtype,
-                    id(self.pool.owner),
-                    n,
-                    self.num_shared_experts,
-                    output.dtype,
-                )
-            self._kernel_logged = True
         return output
 
     def forward(self, hidden_states, topk_weights, topk_ids, padding=None):

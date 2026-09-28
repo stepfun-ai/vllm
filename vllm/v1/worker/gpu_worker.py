@@ -106,7 +106,7 @@ from .gpu.warmup import warmup_kernels
 from .utils import (
     prepare_kv_cache_side_storage_for_memory_profiling,
     request_memory,
-    reset_kv_cache_side_storage_runtime_state,
+    reset_kv_cache_side_storage_and_log,
 )
 
 logger = init_logger(__name__)
@@ -950,19 +950,9 @@ class Worker(WorkerBase):
             else:
                 _warmup_v1_sampler(self.model_runner, last_hidden_states)
 
-        num_side_storages, num_scratch_buffers = (
-            reset_kv_cache_side_storage_runtime_state(
-                self.compilation_config.static_forward_context
-            )
+        reset_kv_cache_side_storage_and_log(
+            self.compilation_config.static_forward_context, "startup warmup"
         )
-        if num_side_storages:
-            torch.accelerator.synchronize()
-            logger.info(
-                "Reset KV side-storage state after startup warmup: "
-                "storages=%d scratch_buffers=%d",
-                num_side_storages,
-                num_scratch_buffers,
-            )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

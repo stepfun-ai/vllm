@@ -4,7 +4,7 @@
 
 import copy
 import typing
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any
 
 import regex as re
@@ -288,8 +288,6 @@ def _verify_step5_dsa_kv_transfer_compatibility(vllm_config: VllmConfig) -> None
 
 def _step5_groups_per_rank(total_groups: int, tp_size: int) -> int:
     """Return the number of contiguous groups visible on one TP rank."""
-    total_groups = int(total_groups)
-    tp_size = int(tp_size)
     if total_groups <= 0 or tp_size <= 0:
         raise ValueError(
             "Step5 parallel group counts must be positive, got "
@@ -312,9 +310,6 @@ def _step5_group_partition(
     tp_rank: int,
 ) -> tuple[int, int, int]:
     """Return the first local group, group count, and replication factor."""
-    total_groups = int(total_groups)
-    tp_size = int(tp_size)
-    tp_rank = int(tp_rank)
     if total_groups <= 0 or tp_size <= 0:
         raise ValueError(
             "Step5 replicated group counts must be positive, got "
@@ -344,11 +339,6 @@ def _validate_step5_dsa_parallel_geometry(
     must describe the same global and per-rank geometry; otherwise the model
     still constructs but selects regions for the wrong query/KV heads.
     """
-    total_num_heads = int(total_num_heads)
-    total_num_kv_heads = int(total_num_kv_heads)
-    indexer_num_heads = int(indexer_num_heads)
-    index_tp_size = int(index_tp_size)
-    tp_size = int(tp_size)
     if total_num_heads <= 0 or total_num_kv_heads <= 0:
         raise ValueError(
             "Step5 attention head counts must be positive, got "
@@ -416,20 +406,18 @@ def _per_layer_value(
 def _is_step5_full_attention_layer(
     config: Any,
     layer_idx: int,
-    sparse_config: Any | None = None,
+    sparse_config: Any,
 ) -> bool:
     layer_types = _get_step5_layer_types(config)
     layer_type = (
         layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
     )
-    if sparse_config is not None:
-        apply_to = getattr(
-            sparse_config,
-            "apply_to_layer_types",
-            ("full_attention",),
-        )
-        return layer_type in apply_to
-    return layer_type == "full_attention"
+    apply_to = getattr(
+        sparse_config,
+        "apply_to_layer_types",
+        ("full_attention",),
+    )
+    return layer_type in apply_to
 
 
 class Step5FusedQKVIndexerLinear(QKVParallelLinear):
@@ -454,7 +442,7 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         *,
         indexer_q_output_size: int,
         indexer_kv_output_size: int,
-        gate_output_size: int | None,
+        gate_output_size: int,
         proxy_dim: int,
         index_tp_size: int,
         params_dtype: torch.dtype | None = None,
@@ -480,20 +468,10 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             )
 
         tp_size = self.tp_size
-        self.proxy_dim = int(proxy_dim)
-        self.has_gate = gate_output_size is not None and int(gate_output_size) > 0
-        self._fused_checkpoint_shard_sizes = (
-            ("q", self.total_num_heads * self.head_size),
-            ("k", self.total_num_kv_heads * self.head_size),
-            ("v", self.total_num_kv_heads * self.v_head_size),
-            ("index_q", int(indexer_q_output_size)),
-            ("index_k", int(indexer_kv_output_size)),
-            ("index_z", int(indexer_kv_output_size)),
-            ("index_g", int(gate_output_size or 0)),
-        )
+        self.proxy_dim = proxy_dim
 
-        total_index_q_heads = int(indexer_q_output_size) // self.proxy_dim
-        total_index_kv_heads = int(indexer_kv_output_size) // self.proxy_dim
+        total_index_q_heads = indexer_q_output_size // self.proxy_dim
+        total_index_kv_heads = indexer_kv_output_size // self.proxy_dim
         if tp_size >= total_index_kv_heads:
             self.local_index_kv_heads = 1
             self.index_kv_head_replicas = tp_size // total_index_kv_heads
@@ -502,22 +480,11 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             self.index_kv_head_replicas = 1
         # Keep each provider's complete index Q-head set. Providers are sharded
         # for TP <= index_tp_size and replicated above it, preserving top-k.
-        index_tp_size = int(index_tp_size)
-        if index_tp_size <= 0:
-            index_tp_size = tp_size
-        self.index_group_start, self.local_index_groups, ranks_per_index = (
-            _step5_group_partition(
-                total_groups=index_tp_size,
-                tp_size=tp_size,
-                tp_rank=self.tp_rank,
-            )
+        self.index_group_start, self.local_index_groups, _ = _step5_group_partition(
+            total_groups=index_tp_size,
+            tp_size=tp_size,
+            tp_rank=self.tp_rank,
         )
-        if total_index_q_heads <= 0 or total_index_q_heads % index_tp_size != 0:
-            raise ValueError(
-                "Step5 sparse indexer q heads must be divisible by "
-                f"index_tp_size, got total_index_q_heads={total_index_q_heads}, "
-                f"index_tp_size={index_tp_size}."
-            )
         if total_index_kv_heads <= 0:
             raise ValueError(
                 "Step5 sparse indexer requires at least one KV head, got "
@@ -537,22 +504,12 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
                 "size when replicated, got "
                 f"total_index_kv_heads={total_index_kv_heads}, tp_size={tp_size}."
             )
-        _validate_step5_dsa_parallel_geometry(
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=total_num_kv_heads,
-            indexer_num_heads=total_index_q_heads,
-            index_tp_size=index_tp_size,
-            tp_size=tp_size,
-        )
         self.local_index_q_heads = (
             total_index_q_heads // index_tp_size * self.local_index_groups
         )
-        self.index_q_head_replicas = ranks_per_index
-        self.local_gate_size = (
-            typing.cast(int, gate_output_size) // tp_size if self.has_gate else 0
-        )
+        self.local_gate_size = gate_output_size // tp_size
 
-        self.qkv_size = int(self.output_size_per_partition)
+        self.qkv_size = self.output_size_per_partition
         self.indexer_size = (
             self.local_index_q_size
             + self.local_index_k_size
@@ -579,15 +536,15 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
 
     @property
     def local_index_q_size(self) -> int:
-        return int(self.local_index_q_heads * self.proxy_dim)
+        return self.local_index_q_heads * self.proxy_dim
 
     @property
     def local_index_k_size(self) -> int:
-        return int(self.local_index_kv_heads * self.proxy_dim)
+        return self.local_index_kv_heads * self.proxy_dim
 
     @property
     def local_index_z_size(self) -> int:
-        return int(self.local_index_kv_heads * self.proxy_dim)
+        return self.local_index_kv_heads * self.proxy_dim
 
     def validate_shard_id(self, loaded_shard_id: Any) -> TypeIs[str | None]:
         if loaded_shard_id in self.INDEXER_SHARD_IDS:
@@ -605,8 +562,6 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             shard_index = self.tp_rank // self.index_kv_head_replicas
             return shard_index * self.local_index_k_size, self.local_index_k_size
         if shard_id == "index_g":
-            if not self.has_gate:
-                raise ValueError("Sparse indexer gate is disabled.")
             return self.tp_rank * self.local_gate_size, self.local_gate_size
         raise ValueError(f"Unsupported sparse indexer shard: {shard_id}.")
 
@@ -632,8 +587,10 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
         loaded_shard_id: str | None = None,
     ) -> None:
         if loaded_shard_id is None:
-            self._load_fused_checkpoint_weight(param, loaded_weight)
-            return
+            raise NotImplementedError(
+                "Step5 expects separate q/k/v/sparse_indexer_*/g_proj checkpoint "
+                "tensors; a pre-fused qkv_indexer_proj weight is not supported."
+            )
         if loaded_shard_id in self.INDEXER_SHARD_IDS:
             src_offset, shard_size = self._indexer_source_offset(loaded_shard_id)
             dst_offset = self._indexer_dest_offset(loaded_shard_id)
@@ -643,46 +600,8 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
             super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
         self._loaded_shards.add(loaded_shard_id)
 
-    def _load_fused_checkpoint_weight(
-        self,
-        param: BasevLLMParameter,
-        loaded_weight: torch.Tensor,
-    ) -> None:
-        if loaded_weight.ndim != 2 or loaded_weight.shape[1] != param.data.shape[1]:
-            raise ValueError(
-                "Step5 fused qkv+indexer checkpoint weight must be a 2D tensor "
-                f"with input dimension {param.data.shape[1]}, got "
-                f"{tuple(loaded_weight.shape)}."
-            )
-        if loaded_weight.shape == param.data.shape:
-            param.data.copy_(loaded_weight)
-            self._loaded_shards.update(self.required_shard_ids())
-            return
-
-        shard_sizes = [
-            (shard_id, shard_size)
-            for shard_id, shard_size in self._fused_checkpoint_shard_sizes
-            if shard_size > 0
-        ]
-        expected_rows = sum(shard_size for _, shard_size in shard_sizes)
-        if loaded_weight.shape[0] != expected_rows:
-            raise ValueError(
-                "Step5 fused qkv+indexer checkpoint weight has an unexpected "
-                f"output dimension: expected local {param.data.shape[0]} or "
-                f"global {expected_rows}, got {loaded_weight.shape[0]}."
-            )
-
-        offset = 0
-        for shard_id, shard_size in shard_sizes:
-            shard = loaded_weight.narrow(0, offset, shard_size)
-            self.weight_loader_v2(param, shard, shard_id)
-            offset += shard_size
-
     def required_shard_ids(self) -> set[str]:
-        required = {"q", "k", "v", "index_q", "index_k", "index_z"}
-        if self.has_gate:
-            required.add("index_g")
-        return required
+        return {"q", "k", "v", "index_q", "index_k", "index_z", "index_g"}
 
     def assert_fully_loaded(self, prefix: str) -> None:
         """Fail unless this load covered every shard, then forget the record.
@@ -717,22 +636,16 @@ class Step5FusedQKVIndexerLinear(QKVParallelLinear):
     def split_indexer(
         self,
         qkzg: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-    ]:
-        sections = [
-            self.local_index_q_size,
-            self.local_index_k_size,
-            self.local_index_z_size,
-        ]
-        if not self.has_gate:
-            index_q, index_k, index_z = qkzg.split(sections, dim=-1)
-            return index_q, index_k, index_z, None
-        sections.append(self.local_gate_size)
-        index_q, index_k, index_z, gate = qkzg.split(sections, dim=-1)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        index_q, index_k, index_z, gate = qkzg.split(
+            [
+                self.local_index_q_size,
+                self.local_index_k_size,
+                self.local_index_z_size,
+                self.local_gate_size,
+            ],
+            dim=-1,
+        )
         return index_q, index_k, index_z, gate
 
 
@@ -767,9 +680,6 @@ class Step5SparseIndexerIndexTPLinear(nn.Module):
         super().__init__()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        index_tp_size = int(index_tp_size)
-        if index_tp_size <= 0:
-            index_tp_size = tp_size
         self.index_group_start, local_groups, _ = _step5_group_partition(
             total_groups=index_tp_size,
             tp_size=tp_size,
@@ -875,8 +785,6 @@ class Step5MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        self.prefix = prefix
-        self.hidden_size = hidden_size
         self.limit = None
         layer_idx = extract_layer_index(prefix)
         swiglu_limit = _per_layer_value(
@@ -935,16 +843,15 @@ class Step5Attention(nn.Module):
         zero_centered: bool = True,
         vllm_config: VllmConfig | None = None,
         sparse_config: Step5SparseConfig | None = None,
-        model_has_dsa_layers: bool = False,
         norm_dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        if qkv_bias:
+            raise NotImplementedError("Step5 attention_bias is not supported.")
         self.hidden_size = hidden_size
         self.total_num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
-        self.tp_size = tp_size
         self.layer_idx = extract_layer_index(prefix)
-        self.prefix = prefix
         sparse_indexer_base_rope_parameters = (
             dict(rope_scaling) if rope_scaling is not None else {}
         )
@@ -993,8 +900,6 @@ class Step5Attention(nn.Module):
                 f"{self.total_num_kv_heads}."
             )
         if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             if self.total_num_kv_heads % tp_size != 0:
                 raise ValueError(
                     "Step5 KV heads must be divisible by tensor parallel size "
@@ -1002,8 +907,6 @@ class Step5Attention(nn.Module):
                     f"num_kv_heads={self.total_num_kv_heads}, tp_size={tp_size}."
                 )
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             if tp_size % self.total_num_kv_heads != 0:
                 raise ValueError(
                     "Step5 KV heads must divide tensor parallel size when "
@@ -1043,13 +946,10 @@ class Step5Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
 
-        # Q/K/V and the per-head attention gate consume the same normalized
-        # hidden states. Pack them into one
-        # column-parallel GEMM if KV heads are partitioned (rather than
-        # replicated) across TP ranks.  The local output layout is
-        # [Q, K, V, gate].
+        # Pack Q/K/V and the per-head gate into one column-parallel GEMM when
+        # KV heads are partitioned (not replicated) across TP ranks. The local
+        # output layout is [Q, K, V, gate].
         self.fuse_qkv_gate = (
             use_head_wise_attn_gate
             and self.total_num_kv_heads >= tp_size
@@ -1077,7 +977,6 @@ class Step5Attention(nn.Module):
                 )
             )
         )
-        self.sparse_config = sparse_config
         self.use_dsa_backend = sparse_config is not None and sliding_window is None
         attn_backend: type[AttentionBackend] | None
         self.sparse_summary_cache: Any = None
@@ -1093,18 +992,6 @@ class Step5Attention(nn.Module):
             ):
                 raise NotImplementedError(
                     f"Step5 DSA requires B300 SM103; got {capability}."
-                )
-            if self.num_heads % self.num_kv_heads != 0:
-                raise ValueError(
-                    "Step5 DSA query heads must be divisible by local KV heads, "
-                    f"got query_heads={self.num_heads}, "
-                    f"kv_heads={self.num_kv_heads}."
-                )
-            queries_per_kv_head = self.num_heads // self.num_kv_heads
-            if queries_per_kv_head not in (4, 8, 16):
-                raise ValueError(
-                    "Step5 DSA supports 4, 8, or 16 local query heads per KV "
-                    f"head, got {queries_per_kv_head}."
                 )
             if self.head_dim not in (128, 192):
                 raise ValueError(
@@ -1125,10 +1012,9 @@ class Step5Attention(nn.Module):
                 index_tp_size=int(sparse_config.index_tp_size),
                 tp_size=tp_size,
             )
-            if qkv_bias:
-                raise ValueError(
-                    "Step5 DSA layers fuse qkv with the sparse indexer into "
-                    "one bias-free GEMM, but attention_bias is enabled."
+            if not use_head_wise_attn_gate:
+                raise NotImplementedError(
+                    "Step5 DSA layers require use_head_wise_attn_gate=true."
                 )
             proxy_dim = int(sparse_config.proxy_dim)
             # The sparse-indexer architecture comes from model config. Register
@@ -1144,9 +1030,7 @@ class Step5Attention(nn.Module):
                 indexer_kv_output_size=(
                     int(sparse_config.sparse_indexer_num_k_heads) * proxy_dim
                 ),
-                gate_output_size=(
-                    self.total_num_heads if use_head_wise_attn_gate else None
-                ),
+                gate_output_size=self.total_num_heads,
                 proxy_dim=proxy_dim,
                 index_tp_size=int(sparse_config.index_tp_size),
                 quant_config=quant_config,
@@ -1162,17 +1046,12 @@ class Step5Attention(nn.Module):
                     self.total_num_kv_heads * self.head_dim,
                     self.total_num_heads,
                 ],
-                bias=qkv_bias,
+                bias=False,
                 quant_config=quant_config,
                 # Keep the original prefix so quantization configuration that
                 # targets qkv_proj continues to apply to the fused module.
                 prefix=f"{prefix}.qkv_proj",
             )
-            if self.qkvg_proj.bias is not None:
-                # g_proj is bias-free.  The fused allocation includes a gate
-                # bias only because qkv_bias applies to the first three shards.
-                with torch.no_grad():
-                    self.qkvg_proj.bias[-self.num_heads :].zero_()
             self.params_dtype = self.qkvg_proj.params_dtype
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -1180,7 +1059,7 @@ class Step5Attention(nn.Module):
                 self.head_dim,
                 self.total_num_heads,
                 self.total_num_kv_heads,
-                bias=qkv_bias,
+                bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -1197,13 +1076,13 @@ class Step5Attention(nn.Module):
             dict(rope_scaling) if rope_scaling is not None else {}
         )
         rope_parameters.setdefault("rope_type", "default")
-        if self.rope_theta is not None:
-            rope_parameters["rope_theta"] = self.rope_theta
+        if rope_theta is not None:
+            rope_parameters["rope_theta"] = rope_theta
         rope_parameters["partial_rotary_factor"] = partial_rotary_factor
 
         sparse_indexer_base_rope_parameters.setdefault("rope_type", "default")
-        if self.rope_theta is not None:
-            sparse_indexer_base_rope_parameters["rope_theta"] = self.rope_theta
+        if rope_theta is not None:
+            sparse_indexer_base_rope_parameters["rope_theta"] = rope_theta
         sparse_indexer_base_rope_parameters["partial_rotary_factor"] = (
             partial_rotary_factor
         )
@@ -1258,12 +1137,10 @@ class Step5Attention(nn.Module):
         # shares one raw allocation across KV cache groups.
         if self.use_dsa_backend:
             attn_backend = Step5DSAAttentionBackend
-        elif model_has_dsa_layers:
+        else:
             from .sparse_attention import Step5SplitKVFlashAttentionBackend
 
             attn_backend = Step5SplitKVFlashAttentionBackend
-        else:
-            attn_backend = None
         sparse_impl_args: dict[str, Any] = {}
         if self.use_dsa_backend:
             dsa_vllm_config = typing.cast(VllmConfig, vllm_config)
@@ -1295,10 +1172,9 @@ class Step5Attention(nn.Module):
             attn_backend=attn_backend,
             **sparse_impl_args,
         )
-        if cache_config is not None and model_has_dsa_layers:
-            # Prefix-cache reuse requires replaying at least one cache page for
-            # DSA-capable checkpoints. The same rule applies to their dense
-            # fallback, while native dense checkpoints do not need it.
+        if cache_config is not None:
+            # Prefix-cache reuse must replay at least one cache page, for DSA
+            # layers and for dense layers sharing their KV layout.
             self.attn.kv_cache_prefix_recompute_tokens = int(cache_config.block_size)
         if self.use_dsa_backend:
             from .sparse_summary_cache import Step5SparseSummaryCacheLayer
@@ -1354,7 +1230,6 @@ class Step5Attention(nn.Module):
 
         self.fuse_swa_gate = (
             not self.use_dsa_backend
-            and model_has_dsa_layers
             and self.use_head_wise_attn_gate
             and self.params_dtype == torch.bfloat16
             and current_platform.is_device_capability(103)
@@ -1449,7 +1324,6 @@ class Step5Attention(nn.Module):
             kv_cache_dummy_dep = q.new_empty(0)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # Add qk-norm inline similar to Qwen3 MOE attention
             q_by_head = q.view(
                 *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
             )
@@ -1529,15 +1403,19 @@ class Step5SparseAttention:
         self.sparse_rotary_emb = self._build_sparse_rotary_emb()
         self._indexer_native_rope = not self.sparse_rotary_emb.enabled()
         owner.add_module("sparse_indexer_rotary_emb", self.sparse_rotary_emb)
-        self.fuse_qkv_preparation = (
+        if not (
             owner.params_dtype == torch.bfloat16
-            and owner.head_dim == 192
             and int(sparse_config.proxy_dim) == 256
             and int(sparse_config.sparse_indexer_num_k_heads) == 1
             and self.sparse_rotary_emb.is_neox_style
             and self.sparse_rotary_emb.rotary_dim > 0
             and not self.sparse_rotary_emb.use_flashinfer
-        )
+        ):
+            raise NotImplementedError(
+                "Step5 DSA requires BF16 params, proxy_dim=256, one sparse "
+                "indexer K head and a non-FlashInfer NeoX indexer RoPE."
+            )
+        self.fuse_qkv_preparation = owner.head_dim == 192
 
     def prepare_qkv(
         self,
@@ -1592,8 +1470,6 @@ class Step5SparseAttention:
             decode_z=index_z if cache is not None else None,
             decode_slots=decode_slots,
         )
-        if owner.use_head_wise_attn_gate and gate is None:
-            raise RuntimeError("Sparse indexer gate output is missing.")
         return (q, k, v), (
             index_q,
             index_k,
@@ -1721,23 +1597,6 @@ class Step5SparseAttention:
             dtype=self.owner.params_dtype,
         )
 
-    def _apply_sparse_indexer_rope(
-        self,
-        positions: torch.Tensor,
-        index_q: torch.Tensor,
-        index_k: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        sparse_rotary_emb = self.sparse_rotary_emb
-        proxy_dim = int(index_q.shape[-1])
-        positions = positions.reshape(-1).to(device=index_q.device, dtype=torch.long)
-        q_shape = tuple(index_q.shape)
-        k_shape = tuple(index_k.shape)
-        q = index_q.reshape(q_shape[0], -1, proxy_dim)
-        k = index_k.reshape(k_shape[0], -1, proxy_dim)
-        q, k = sparse_rotary_emb(positions, q, k)
-        k = typing.cast(torch.Tensor, k)
-        return q.reshape(q_shape), k.reshape(k_shape)
-
     def _project_sparse_indexer(
         self,
         positions: torch.Tensor,
@@ -1749,85 +1608,41 @@ class Step5SparseAttention:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
         bool,
     ]:
-        index_q, index_k, index_z, extra_dims = (
-            self.owner.qkv_indexer_proj.split_indexer(qkzg)
+        from .ops.indexer_norm_rope import indexer_norm_rope
+
+        owner = self.owner
+        index_q, index_k, index_z, extra_dims = owner.qkv_indexer_proj.split_indexer(
+            qkzg
         )
-        weights, _ = self.owner.sparse_indexer_w(hidden_states)
-
-        num_tokens = int(hidden_states.shape[0])
-        proxy_dim = int(self.sparse_config.proxy_dim)
-        q_width = int(index_q.shape[-1])
-        k_width = int(index_k.shape[-1])
-        num_q_heads = q_width // proxy_dim
-        num_k_heads = k_width // proxy_dim
-        num_local_kv_heads = int(self.owner.num_kv_heads)
-        q_heads_per_kv = num_q_heads // num_local_kv_heads
-
-        if (
-            index_q.is_cuda
-            and index_q.dtype == torch.bfloat16
-            and proxy_dim == 256
-            and num_k_heads == 1
-            and self.sparse_rotary_emb.is_neox_style
-            and self.sparse_rotary_emb.rotary_dim > 0
-            and not self.sparse_rotary_emb.use_flashinfer
-        ):
-            from .ops.indexer_norm_rope import indexer_norm_rope
-
-            cache = (
-                typing.cast(Any, self.owner.attn.impl).summary_cache
-                if decode_slots is not None
-                else None
-            )
-            index_q, index_k, weights = indexer_norm_rope(
-                index_q,
-                index_k,
-                weights,
-                self.owner.sparse_indexer_q_norm.weight,
-                self.owner.sparse_indexer_k_norm.weight,
-                self.owner.sparse_indexer_k_norm.bias,
-                self.sparse_rotary_emb.cos_sin_cache,
-                positions.reshape(-1),
-                self.owner.sparse_indexer_q_norm.variance_epsilon,
-                self.owner.zero_centered,
-                native_rope=self._indexer_native_rope,
-                num_groups=num_local_kv_heads,
-                decode_cache=cache,
-                decode_z=index_z if cache is not None else None,
-                decode_slots=decode_slots if cache is not None else None,
-            )
-            index_z = index_z.view(num_tokens, num_k_heads, proxy_dim)
-            if self.owner.use_head_wise_attn_gate and extra_dims is None:
-                raise RuntimeError("Sparse indexer gate output is missing.")
-            return index_q, index_k, weights, index_z, extra_dims, cache is not None
-
-        index_k = self.owner.sparse_indexer_k_norm(index_k.contiguous())
-        index_q = index_q.view(
-            num_tokens,
-            num_local_kv_heads,
-            q_heads_per_kv,
-            proxy_dim,
-        ).contiguous()
-        index_q = self.owner.sparse_indexer_q_norm(index_q)
-        index_k = index_k.view(num_tokens, num_k_heads, proxy_dim).contiguous()
-        index_q, index_k = self._apply_sparse_indexer_rope(positions, index_q, index_k)
-        index_z = index_z.view(num_tokens, num_k_heads, proxy_dim).contiguous()
-
-        weights = weights.view(
-            num_tokens,
-            num_local_kv_heads,
-            q_heads_per_kv,
+        weights, _ = owner.sparse_indexer_w(hidden_states)
+        cache = (
+            typing.cast(Any, owner.attn.impl).summary_cache
+            if decode_slots is not None
+            else None
         )
-        weights = weights.to(dtype=torch.float32)
-
-        weights = weights * (float(q_heads_per_kv) ** -0.5)
-        if self.owner.use_head_wise_attn_gate and extra_dims is None:
-            raise RuntimeError("Sparse indexer gate output is missing.")
-        return index_q, index_k, weights, index_z, extra_dims, False
+        index_q, index_k, weights = indexer_norm_rope(
+            index_q,
+            index_k,
+            weights,
+            owner.sparse_indexer_q_norm.weight,
+            owner.sparse_indexer_k_norm.weight,
+            owner.sparse_indexer_k_norm.bias,
+            self.sparse_rotary_emb.cos_sin_cache,
+            positions.reshape(-1),
+            owner.sparse_indexer_q_norm.variance_epsilon,
+            owner.zero_centered,
+            native_rope=self._indexer_native_rope,
+            num_groups=int(owner.num_kv_heads),
+            decode_cache=cache,
+            decode_z=index_z if cache is not None else None,
+            decode_slots=decode_slots if cache is not None else None,
+        )
+        index_z = index_z.view(int(hidden_states.shape[0]), 1, 256)
+        return index_q, index_k, weights, index_z, extra_dims, cache is not None
 
 
 class Step5MoE(nn.Module):
@@ -1843,7 +1658,6 @@ class Step5MoE(nn.Module):
         self.layer_idx = extract_layer_index(prefix)
 
         self.ep_size = get_ep_group().device_group.size()
-        self.ep_rank = get_ep_group().device_group.rank()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
@@ -1855,11 +1669,6 @@ class Step5MoE(nn.Module):
         self.n_redundant_experts = parallel_config.eplb_config.num_redundant_experts
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
-
-        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
-        self.physical_expert_end = (
-            self.physical_expert_start + self.n_local_physical_experts
-        )
 
         if self.tp_size > config.moe_num_experts:
             raise ValueError(
@@ -1875,16 +1684,13 @@ class Step5MoE(nn.Module):
             params_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
-        self.use_moe_router_bias = config.use_moe_router_bias
-        if not self.use_moe_router_bias:
+        if not config.use_moe_router_bias:
             raise ValueError("Step5 MoE currently requires use_moe_router_bias=true.")
-        self.routed_scaling_factor = config.moe_router_scaling_factor
         self.router_bias = nn.Parameter(
             torch.zeros(config.moe_num_experts, dtype=torch.float32),
             requires_grad=False,
         )
-        self.need_fp32_gate = config.need_fp32_gate
-        if not self.need_fp32_gate:
+        if not config.need_fp32_gate:
             raise ValueError(
                 "Step5 MoE requires need_fp32_gate=true for stable router logits."
             )
@@ -1909,12 +1715,6 @@ class Step5MoE(nn.Module):
                     f"{swiglu_limit}."
                 )
             activation = "swiglustep"
-            logger.debug(
-                "step5 layer_idx: %s, activation: %s, limit: %s",
-                self.layer_idx,
-                activation,
-                swiglu_limit,
-            )
 
         self.fuse_all_reduce, reduce_results = _step5_moe_reduce_policy(
             self.tp_size,
@@ -2029,7 +1829,11 @@ class Step5DecoderLayer(nn.Module):
             cache_config = copy.copy(cache_config)
             cache_config.sliding_window = None
         sparse_config = get_step5_sparse_config(config)
-        checkpoint_has_dsa_layers = checkpoint_has_step5_sparse_config(config)
+        if not checkpoint_has_step5_sparse_config(config):
+            raise NotImplementedError(
+                "Step5 requires a checkpoint with a sparse_config section; "
+                "dense-only checkpoints are not supported."
+            )
         use_dsa_for_layer = (
             sparse_config is not None
             and _is_step5_full_attention_layer(config, layer_idx, sparse_config)
@@ -2096,7 +1900,6 @@ class Step5DecoderLayer(nn.Module):
                 zero_centered=config.zero_centered,
                 vllm_config=vllm_config,
                 sparse_config=sparse_config if use_dsa_for_layer else None,
-                model_has_dsa_layers=checkpoint_has_dsa_layers,
                 norm_dtype=norm_dtype,
             )
         else:
@@ -2113,10 +1916,6 @@ class Step5DecoderLayer(nn.Module):
             and get_dp_group().world_size == 1
             and not self.use_sequence_parallel
         )
-        if self.use_fused_all_reduce:
-            logger.warning_once("Step5 fused all-reduce is enabled.")
-        else:
-            logger.warning_once("Step5 fused all-reduce is disabled.")
 
         moe_layers_idx = _get_step5_moe_layer_indices(config)
         if layer_idx in moe_layers_idx:
@@ -2149,15 +1948,6 @@ class Step5DecoderLayer(nn.Module):
             zero_centered=config.zero_centered,
             dtype=norm_dtype,
         )
-        self.prefix = prefix
-
-    def add_and_maybe_inplace_all_reduce(
-        self, in1: torch.Tensor, in2: torch.Tensor
-    ) -> torch.Tensor:
-        hidden_states = self._add_for_residual(in1, in2)
-        if not self.use_fused_all_reduce:
-            return hidden_states
-        return self.tp_group.all_reduce(hidden_states)
 
     def _add_for_residual(self, in1: torch.Tensor, in2: torch.Tensor) -> torch.Tensor:
         if self.fp32_residual_connection:
@@ -2186,19 +1976,15 @@ class Step5DecoderLayer(nn.Module):
                 if shared_output is None
                 else self._add_for_residual(moe_output, shared_output)
             )
-            # When fuse_all_reduce=True, the runner does NOT
-            # all-reduce (reduce_results=False), so we must all-reduce
-            # the combined output here. When fuse_all_reduce=False,
-            # routed output is either already reduced by the combine kernel or
-            # reduced by _maybe_reduce_output. The shared expert path is a
-            # separate RowParallelLinear. Under SP the shared MLP either uses
-            # replicated weights or completes its own FP32 reduce-scatter.
+            # With fuse_all_reduce the runner and shared expert skip their own
+            # reductions, so reduce the combined output once here. Otherwise
+            # each path is already reduced (combine kernel, RowParallelLinear, or
+            # replicated / FP32 reduce-scatter shared MLP under SP).
             if self.moe.fuse_all_reduce:
                 if self.use_fused_all_reduce:
                     combined = self.tp_group.all_reduce(combined)
                 else:
                     combined = tensor_model_parallel_all_reduce(combined)
-                return combined
             return combined
         return self.mlp(hidden_states)
 
@@ -2257,19 +2043,12 @@ class Step5Model(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
-        self.vllm_config = vllm_config
         self.use_sequence_parallel = _step5_use_sequence_parallel(vllm_config)
         config = vllm_config.model_config.hf_config
         self.vocab_size = config.vocab_size
         self.config = config
         self.fp32_residual_connection = config.fp32_residual_connection
-        logger.info(
-            "Step5 fp32_residual_connection: %s",
-            self.fp32_residual_connection,
-        )
-
         self.moe_num_experts = config.moe_num_experts
-        self.parallel_config = vllm_config.parallel_config
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -2353,9 +2132,6 @@ class Step5Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        from vllm.model_executor.layers.fused_moe import (
-            fused_moe_make_expert_params_mapping,
-        )
         from vllm.model_executor.model_loader.weight_utils import (
             default_weight_loader,
             maybe_remap_kv_scale_name,
@@ -2393,7 +2169,9 @@ class Step5Model(nn.Module):
         base_layer = (
             "base_layer." if any(".base_layer." in name for name in params_dict) else ""
         )
-        # Old packed 3D format: .moe.gate_proj.weight [num_experts, out, in]
+        # Packed 3D format: .moe.gate_proj.weight [num_experts, out, in]. Each
+        # entry is a substring of its scale names (weight_scale_inv, ...), so
+        # it maps those too.
         expert_params_mapping = [
             (
                 f".moe.experts.routed_experts.{base_layer}w13_weight",
@@ -2410,63 +2188,7 @@ class Step5Model(nn.Module):
                 ".moe.down_proj.weight",
                 "w2",
             ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight_scale_2",
-                ".moe.gate_proj.weight_scale_2",
-                "w1",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight_scale_2",
-                ".moe.up_proj.weight_scale_2",
-                "w3",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w2_weight_scale_2",
-                ".moe.down_proj.weight_scale_2",
-                "w2",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight_scale",
-                ".moe.gate_proj.weight_scale",
-                "w1",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_weight_scale",
-                ".moe.up_proj.weight_scale",
-                "w3",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w2_weight_scale",
-                ".moe.down_proj.weight_scale",
-                "w2",
-            ),
-            # Required due to the Step3 HF model's packed expert format:
-            # input scales are stored as moe.{gate,up,down}_proj.input_scale
-            # rather than the standard per-expert format handled generically.
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_input_scale",
-                ".moe.gate_proj.input_scale",
-                "w1",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w13_input_scale",
-                ".moe.up_proj.input_scale",
-                "w3",
-            ),
-            (
-                f".moe.experts.routed_experts.{base_layer}w2_input_scale",
-                ".moe.down_proj.input_scale",
-                "w2",
-            ),
         ]
-        # New per-expert format: .moe.experts.E.gate_proj.weight_packed [out, in]
-        per_expert_mapping = fused_moe_make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.moe_num_experts,
-        )
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
 
@@ -2491,53 +2213,28 @@ class Step5Model(nn.Module):
                 return loaded_params
             local_name = remapped_name
 
-            # Per-expert MoE weights (new format from LLM Compressor):
-            # .moe.experts.{E}.{gate,up,down}_proj.{weight_packed,scale,...}
-            # Each weight is individual per-expert, not stacked 3D.
             if ".moe.experts." in local_name:
-                is_expert_weight = False
-                for mapping in per_expert_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in local_name:
-                        continue
-                    is_expert_weight = True
-                    name_mapped = local_name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name_mapped, self):
-                        continue
-                    if name_mapped not in params_dict:
-                        continue
-                    param = params_dict[name_mapped]
-                    weight_loader = typing.cast(
-                        Callable[..., bool], param.weight_loader
+                if is_pp_missing_parameter(local_name, self):
+                    return loaded_params
+                if local_name not in params_dict:
+                    raise NotImplementedError(
+                        f"Unsupported Step5 MoE checkpoint tensor {name!r}: only "
+                        "the packed 3D expert format is supported."
                     )
-                    success = weight_loader(
-                        param,
-                        loaded_weight,
-                        name_mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                        return_success=True,
-                    )
-                    if success:
-                        loaded_params.add(name_mapped)
-                        break
-                else:
-                    if (
-                        not is_expert_weight
-                        and not is_pp_missing_parameter(local_name, self)
-                        and local_name in params_dict
-                    ):
-                        # Not an expert proj — use default loader
-                        # (e.g. share_expert weights if they matched)
-                        param = params_dict[local_name]
-                        fallback_weight_loader = getattr(
-                            param,
-                            "weight_loader",
-                            default_weight_loader,
-                        )
-                        fallback_weight_loader(param, loaded_weight)
-                        loaded_params.add(local_name)
+                param = params_dict[local_name]
+                getattr(param, "weight_loader", default_weight_loader)(
+                    param, loaded_weight
+                )
+                loaded_params.add(local_name)
                 return loaded_params
+            if any(
+                f".moe.{proj}.input_scale" in local_name
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            ):
+                raise NotImplementedError(
+                    f"Unsupported Step5 MoE checkpoint tensor {name!r}: expert "
+                    "input scales are not supported."
+                )
 
             for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
                 if weight_name not in local_name:
@@ -2681,7 +2378,6 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         else:
             self.lm_head = PPMissingLayer()
 
-        # Set MoE hyperparameters
         self.moe_layers: list[Any] = []
         example_layer: Step5MoE | None = None
         for layer in self.model.layers:
@@ -2709,17 +2405,13 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ):
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.fp32_residual_connection:
             hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states = self.model.norm(hidden_states)
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)

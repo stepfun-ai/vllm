@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product as iprod
 from typing import Any, Protocol, runtime_checkable
@@ -99,6 +99,31 @@ class KVCacheSideStorageMemoryProfiler(Protocol):
     ) -> None: ...
 
 
+def _iter_unique_layers(
+    forward_context: dict[str, Any],
+    layer_type: type,
+) -> Iterator[tuple[str, Any]]:
+    """Yield the first ``(name, layer)`` for each distinct ``layer_type`` layer."""
+    seen_layers: set[int] = set()
+    for layer_name, layer in forward_context.items():
+        layer_id = id(layer)
+        if layer_id in seen_layers:
+            continue
+        seen_layers.add(layer_id)
+        if isinstance(layer, layer_type):
+            yield layer_name, layer
+
+
+def _layer_name_to_group_id(
+    kv_cache_groups: Sequence[KVCacheGroupSpec],
+) -> dict[str, int]:
+    return {
+        layer_name: group_id
+        for group_id, group in enumerate(kv_cache_groups)
+        for layer_name in group.layer_names
+    }
+
+
 def prepare_kv_cache_side_storage_for_memory_profiling(
     static_forward_context: dict[str, Any],
     device: torch.device,
@@ -111,16 +136,11 @@ def prepare_kv_cache_side_storage_for_memory_profiling(
 
     Returns the number of distinct profiling owners that were prepared.
     """
-    seen_layers: set[int] = set()
     seen_profile_owners: set[int] = set()
     num_profile_owners = 0
-    for layer in static_forward_context.values():
-        layer_id = id(layer)
-        if layer_id in seen_layers:
-            continue
-        seen_layers.add(layer_id)
-        if not isinstance(layer, KVCacheSideStorageMemoryProfiler):
-            continue
+    for _, layer in _iter_unique_layers(
+        static_forward_context, KVCacheSideStorageMemoryProfiler
+    ):
         profile_owner = layer.kv_cache_side_storage_memory_profile_key(
             static_forward_context
         )
@@ -146,20 +166,32 @@ def reset_kv_cache_side_storage_runtime_state(
     """
     num_storages = 0
     num_scratch_buffers = 0
-    seen_layers: set[int] = set()
-    for layer in static_forward_context.values():
-        layer_id = id(layer)
-        if layer_id in seen_layers:
-            continue
-        seen_layers.add(layer_id)
-        if not isinstance(layer, KVCacheSideStorageLayer):
-            continue
+    for _, layer in _iter_unique_layers(
+        static_forward_context, KVCacheSideStorageLayer
+    ):
         storage_count, scratch_buffer_count = (
             layer.reset_kv_cache_side_storage_runtime_state()
         )
         num_storages += int(storage_count)
         num_scratch_buffers += int(scratch_buffer_count)
     return num_storages, num_scratch_buffers
+
+
+def reset_kv_cache_side_storage_and_log(
+    static_forward_context: dict[str, Any],
+    phase: str,
+) -> None:
+    num_side_storages, num_scratch_buffers = reset_kv_cache_side_storage_runtime_state(
+        static_forward_context
+    )
+    if num_side_storages:
+        torch.accelerator.synchronize()
+        logger.info(
+            "Reset KV side-storage state after %s: storages=%d scratch_buffers=%d",
+            phase,
+            num_side_storages,
+            num_scratch_buffers,
+        )
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
@@ -291,14 +323,9 @@ class KVBlockZeroer:
                         f"{previous_group_id},{group.kv_cache_group_id}"
                     )
 
-        seen_side_storage_layers: set[int] = set()
-        for layer_name, layer in static_forward_context.items():
-            if not isinstance(layer, KVCacheSideStorageLayer):
-                continue
-            layer_id = id(layer)
-            if layer_id in seen_side_storage_layers:
-                continue
-            seen_side_storage_layers.add(layer_id)
+        for layer_name, layer in _iter_unique_layers(
+            static_forward_context, KVCacheSideStorageLayer
+        ):
             owner_name = layer.main_layer_name
             group_id = layer_name_to_group_id.get(owner_name)
             if group_id is None:
@@ -334,7 +361,6 @@ class KVBlockZeroer:
                         "KV cache block size must be divisible by the kernel "
                         f"block size: spec={spec.block_size}, kernel={kernel_bs}"
                     )
-                ratio = spec.block_size // kernel_bs
                 block_dim = 0
 
                 for layer_name in group.layer_names:
@@ -351,11 +377,6 @@ class KVBlockZeroer:
                             "KV kernel blocks must divide into logical blocks"
                         )
                     el = kv.element_size()
-                    if block_dim < 0 or block_dim >= kv.ndim:
-                        raise ValueError(
-                            f"Invalid KV block dimension {block_dim} for "
-                            f"tensor shape={tuple(kv.shape)}"
-                        )
                     block_stride_bytes = kv.stride(block_dim) * el
                     if block_stride_bytes <= 0 or block_stride_bytes % 4 != 0:
                         raise ValueError(
@@ -969,14 +990,8 @@ def bind_kv_cache_to_layers(
     # Some model-specific state is physically aligned with an owner KV cache
     # but intentionally omitted from the generic KV specs. Bind it only after
     # every regular KV cache is available.
-    seen_layers: set[int] = set()
-    for layer in forward_context.values():
-        layer_id = id(layer)
-        if layer_id in seen_layers:
-            continue
-        seen_layers.add(layer_id)
-        if isinstance(layer, KVCacheSideStorageLayer):
-            layer.bind_kv_cache_side_storage(forward_context)
+    for _, layer in _iter_unique_layers(forward_context, KVCacheSideStorageLayer):
+        layer.bind_kv_cache_side_storage(forward_context)
 
     ordered_layer_names = sorted(
         kv_caches, key=lambda name: extract_layer_index(name, num_attn_module)
@@ -1078,18 +1093,10 @@ def release_kv_cache_side_storage_blocks(
     block_ids_by_group: Sequence[Sequence[int]],
 ) -> None:
     """Release request state without invalidating reusable prefix-cache payloads."""
-    layer_name_to_group_id = {
-        layer_name: group_id
-        for group_id, group in enumerate(kv_cache_groups)
-        for layer_name in group.layer_names
-    }
-    seen_layers: set[int] = set()
-    for layer_name, layer in static_forward_context.items():
-        if not isinstance(layer, KVCacheSideStorageRequestLifecycle):
-            continue
-        if id(layer) in seen_layers:
-            continue
-        seen_layers.add(id(layer))
+    layer_name_to_group_id = _layer_name_to_group_id(kv_cache_groups)
+    for layer_name, layer in _iter_unique_layers(
+        static_forward_context, KVCacheSideStorageRequestLifecycle
+    ):
         group_id = layer_name_to_group_id.get(layer.main_layer_name)
         if group_id is None or group_id >= len(block_ids_by_group):
             raise ValueError(
@@ -1107,33 +1114,24 @@ def copy_kv_cache_side_storage_blocks(
     num_blocks: int,
 ) -> None:
     """Apply owner KV copy-on-write mappings to aligned side storage."""
-    layer_name_to_group_id = {
-        layer_name: group_id
-        for group_id, group in enumerate(kv_cache_groups)
-        for layer_name in group.layer_names
-    }
-    seen_layers: set[int] = set()
-    for layer_name, layer in static_forward_context.items():
-        layer_id = id(layer)
-        if layer_id in seen_layers:
-            continue
-        seen_layers.add(layer_id)
-        if isinstance(layer, KVCacheSideStorageLayer):
-            group_id = layer_name_to_group_id.get(layer.main_layer_name)
-            if group_id is None:
-                raise ValueError(
-                    "KV side-storage layer has no owner KV cache group: "
-                    f"layer={layer_name!r}, owner={layer.main_layer_name!r}"
-                )
-            if group_id >= len(kv_cache_block_copies_by_group):
-                raise ValueError(
-                    "KV side-storage copy mappings are missing the owner "
-                    f"group {group_id}."
-                )
-            layer.copy_kv_cache_side_storage(
-                kv_cache_block_copies_by_group[group_id],
-                num_blocks,
+    layer_name_to_group_id = _layer_name_to_group_id(kv_cache_groups)
+    for layer_name, layer in _iter_unique_layers(
+        static_forward_context, KVCacheSideStorageLayer
+    ):
+        group_id = layer_name_to_group_id.get(layer.main_layer_name)
+        if group_id is None:
+            raise ValueError(
+                "KV side-storage layer has no owner KV cache group: "
+                f"layer={layer_name!r}, owner={layer.main_layer_name!r}"
             )
+        if group_id >= len(kv_cache_block_copies_by_group):
+            raise ValueError(
+                f"KV side-storage copy mappings are missing the owner group {group_id}."
+            )
+        layer.copy_kv_cache_side_storage(
+            kv_cache_block_copies_by_group[group_id],
+            num_blocks,
+        )
 
 
 def is_residual_scattered_for_sp(

@@ -244,7 +244,7 @@ from .utils import (
     copy_kv_cache_side_storage_blocks,
     prepare_kernel_block_sizes,
     release_kv_cache_side_storage_blocks,
-    reset_kv_cache_side_storage_runtime_state,
+    reset_kv_cache_side_storage_and_log,
     sanity_check_mm_encoder_outputs,
 )
 
@@ -1036,19 +1036,9 @@ class GPUModelRunner(
         self.late_interaction_runner.clear()
 
     def post_kv_cache_wake_up(self) -> None:
-        num_side_storages, num_scratch_buffers = (
-            reset_kv_cache_side_storage_runtime_state(
-                self.compilation_config.static_forward_context
-            )
+        reset_kv_cache_side_storage_and_log(
+            self.compilation_config.static_forward_context, "wake-up"
         )
-        if num_side_storages:
-            torch.accelerator.synchronize()
-            logger.info(
-                "Reset KV side-storage state after wake-up: "
-                "storages=%d scratch_buffers=%d",
-                num_side_storages,
-                num_scratch_buffers,
-            )
 
     def _get_positions(self, num_tokens: Any):
         if isinstance(num_tokens, int):
@@ -1495,6 +1485,7 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+
             if not is_last_rank:
                 if not req_data.new_token_ids:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
@@ -1605,7 +1596,6 @@ class GPUModelRunner(
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Materialize this step's scheduler lifecycle once, after compaction.
-        # No request-object mirror or add/remove/condense synchronization is needed.
         is_prefilling = self.input_batch.is_prefilling
         is_prefilling.zero_()
         req_indices = self.input_batch.req_id_to_index
@@ -2610,18 +2600,10 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            # UBatch metadata builders own independent persistent buffers (for
-            # example FA3 SWA tile-alignment metadata).  Do not reuse metadata
-            # built by another ubatch: ``update_block_table`` only replaces the
-            # KV-cache views and shallow-copies every other field, which would
-            # alias the first ubatch's persistent buffers and let concurrent
-            # builders overwrite one another.  Keep ``None`` distinct for the
-            # non-ubatched path as well.
-            cache_key = (
-                kv_cache_spec,
-                type(builder),
-                ubid,
-            )
+            # UBatch builders own independent persistent buffers, and
+            # ``update_block_table`` shallow-copies them, so never reuse metadata
+            # across ubatches.
+            cache_key = (kv_cache_spec, type(builder), ubid)
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -6055,7 +6037,6 @@ class GPUModelRunner(
                 scales with context length.
             disable_kv_cache_writes: Keep a runtime idle-DP dummy from reading
                 or writing live request KV state.
-
             allow_microbatching: Whether the dummy batch may be split into
                 microbatches.
             is_graph_capturing: Whether this run is a cudagraph capture.
@@ -7123,19 +7104,9 @@ class GPUModelRunner(
         set_cudagraph_capturing_enabled(False)
 
         torch.accelerator.synchronize()
-        num_side_storages, num_scratch_buffers = (
-            reset_kv_cache_side_storage_runtime_state(
-                self.compilation_config.static_forward_context
-            )
+        reset_kv_cache_side_storage_and_log(
+            self.compilation_config.static_forward_context, "graph capture"
         )
-        if num_side_storages:
-            logger.info(
-                "Reset KV side-storage state after graph capture: "
-                "storages=%d scratch_buffers=%d",
-                num_side_storages,
-                num_scratch_buffers,
-            )
-            torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 
         # Lock workspace to prevent resizing during execution.

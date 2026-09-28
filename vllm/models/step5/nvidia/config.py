@@ -29,11 +29,7 @@ class Step5SparseConfig:
     apply_to_layer_types: tuple[str, ...] = ("full_attention",)
 
 
-_STEP5_SPARSE_SECTION_NAMES = (
-    "step5_sparse_config",
-    "step3p5_sparse_config",
-    "sparse_config",
-)
+_UNSUPPORTED_SPARSE_SECTION_NAMES = ("step5_sparse_config", "step3p5_sparse_config")
 _SUPPORTED_SOFTMAX_VARIANTS = {"softmax", "standard", "ssmax"}
 _SUPPORTED_INDEXER_Q_HEADS_PER_PROVIDER = (2, 4)
 _STEP5_SPARSE_PROXY_DIM = 256
@@ -50,30 +46,20 @@ _STEP5_SPARSE_FIXED_OPTIONS = {
 }
 
 
-def _truthy(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
 def _config_value(config: Any, name: str) -> Any:
-    if config is None:
-        return None
     if isinstance(config, dict):
         return config.get(name)
     return getattr(config, name, None)
 
 
 def _get_sparse_config_section(config: Any) -> Any:
-    for name in _STEP5_SPARSE_SECTION_NAMES:
-        value = _config_value(config, name)
-        if value is not None:
-            return value
-    return None
+    for name in _UNSUPPORTED_SPARSE_SECTION_NAMES:
+        if _config_value(config, name) is not None:
+            raise NotImplementedError(
+                f"Step5 reads the sparse layout from sparse_config; {name} is "
+                "unsupported."
+            )
+    return _config_value(config, "sparse_config")
 
 
 def checkpoint_has_step5_sparse_config(config: Any) -> bool:
@@ -82,8 +68,7 @@ def checkpoint_has_step5_sparse_config(config: Any) -> bool:
     Section presence determines the shared KV layout, even when sparse
     execution is disabled in the checkpoint.
     """
-    section = _get_sparse_config_section(config)
-    return section is not None
+    return _get_sparse_config_section(config) is not None
 
 
 def get_step5_sparse_config(config: Any) -> Step5SparseConfig | None:
@@ -91,12 +76,19 @@ def get_step5_sparse_config(config: Any) -> Step5SparseConfig | None:
     section = _get_sparse_config_section(config)
     if section is None:
         return None
+    if _config_value(section, "softmax_variant") is not None:
+        raise NotImplementedError(
+            "Step5 sparse_config.softmax_variant is unsupported; use "
+            "sparse_indexer_softmax_variant."
+        )
     enabled = _config_value(section, "enabled")
-    if enabled is not None and not _truthy(enabled):
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ValueError(
+            f"Step5 sparse_config.enabled must be a bool, got {enabled!r}."
+        )
+    if enabled is False:
         return None
-    softmax_variant = _config_value(
-        section, "sparse_indexer_softmax_variant"
-    ) or _config_value(section, "softmax_variant")
+    softmax_variant = _config_value(section, "sparse_indexer_softmax_variant")
     if softmax_variant is not None and str(softmax_variant).lower() not in (
         _SUPPORTED_SOFTMAX_VARIANTS
     ):
@@ -117,36 +109,27 @@ def get_step5_sparse_config(config: Any) -> Step5SparseConfig | None:
         if field.name == "apply_to_layer_types":
             continue
         value = _config_value(section, field.name)
-        if field.name == "sparse_indexer_softmax_variant" and value is None:
-            value = _config_value(section, "softmax_variant")
         if field.name == "index_tp_size" and value is None:
             # The checkpoint schema calls this field num_provider_groups.
             value = _config_value(section, "num_provider_groups")
         if value is None or value == "":
             value = default
         elif isinstance(default, bool):
-            value = _truthy(value)
+            if not isinstance(value, bool):
+                raise ValueError(
+                    f"Step5 sparse_config.{field.name} must be a bool, got {value!r}."
+                )
         elif isinstance(default, int):
             value = int(value)
         elif isinstance(default, str):
             value = str(value)
         values[field.name] = value
-    values["enabled"] = True
     apply_to_layer_types = _config_value(section, "apply_to_layer_types")
     if apply_to_layer_types is None:
         apply_to_layer_types = defaults.apply_to_layer_types
-    if isinstance(apply_to_layer_types, str):
-        apply_to_layer_types = tuple(
-            item.strip().lower()
-            for item in apply_to_layer_types.split(",")
-            if item.strip()
-        )
-    else:
-        apply_to_layer_types = tuple(
-            str(item).strip().lower()
-            for item in apply_to_layer_types
-            if str(item).strip()
-        )
+    apply_to_layer_types = tuple(
+        str(item).strip().lower() for item in apply_to_layer_types if str(item).strip()
+    )
     if apply_to_layer_types != ("full_attention",):
         raise ValueError(
             "Step5 DSA integration requires "
@@ -154,29 +137,29 @@ def get_step5_sparse_config(config: Any) -> Step5SparseConfig | None:
             f"mixed layer selections are unsupported, got {apply_to_layer_types!r}."
         )
     values["apply_to_layer_types"] = apply_to_layer_types
-    proxy_dim = int(values["proxy_dim"])
+    proxy_dim = values["proxy_dim"]
     if proxy_dim != _STEP5_SPARSE_PROXY_DIM:
         raise ValueError(f"Step5 DSA requires proxy_dim=256, got {proxy_dim}.")
-    region_block_size = int(values["region_block_size"])
+    region_block_size = values["region_block_size"]
     if region_block_size != _STEP5_SPARSE_REGION_BLOCK_SIZE:
         raise ValueError(
             f"Step5 DSA requires region_block_size=8, got {region_block_size}."
         )
-    topk = int(values["topk"])
+    topk = values["topk"]
     if not 1 <= topk <= _STEP5_SPARSE_TOPK_MAX:
         raise ValueError(f"Step5 DSA requires topk in [1, 1024], got {topk}.")
-    indexer_num_k_heads = int(values["sparse_indexer_num_k_heads"])
+    indexer_num_k_heads = values["sparse_indexer_num_k_heads"]
     if indexer_num_k_heads != 1:
         raise ValueError(
             "Step5 sparse indexer currently requires exactly one KV head, got "
             f"sparse_indexer_num_k_heads={indexer_num_k_heads}."
         )
-    index_tp_size = int(values["index_tp_size"])
+    index_tp_size = values["index_tp_size"]
     if index_tp_size <= 0:
         raise ValueError(
             f"Step5 sparse indexer index_tp_size must be positive, got {index_tp_size}."
         )
-    indexer_num_heads = int(values["sparse_indexer_num_heads"])
+    indexer_num_heads = values["sparse_indexer_num_heads"]
     if indexer_num_heads <= 0 or indexer_num_heads % index_tp_size != 0:
         raise ValueError(
             "Step5 sparse_indexer_num_heads must be positive and divisible by "
@@ -192,7 +175,7 @@ def get_step5_sparse_config(config: Any) -> Step5SparseConfig | None:
             f"{indexer_q_heads_per_provider} "
             f"({indexer_num_heads} / {index_tp_size})."
         )
-    indexer_rope_dim = int(values["sparse_indexer_rope_dim"])
+    indexer_rope_dim = values["sparse_indexer_rope_dim"]
     if (
         indexer_rope_dim <= 0
         or indexer_rope_dim > proxy_dim

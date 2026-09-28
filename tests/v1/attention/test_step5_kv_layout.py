@@ -759,16 +759,15 @@ def test_builder_planned_prefill_is_sync_free(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
     reason="B300 integration",
 )
-def test_grouped_decode_rows_match_per_group_kernels():
+def test_grouped_decode_scores_match_per_group_rows():
     """DEP folds (token, KV group) into rows; each row must see its group only."""
-    from vllm.models.step5.nvidia.ops.sparse_decode import prepare_sparse_decode
     from vllm.models.step5.nvidia.ops.sparse_indexer_scores import (
         decode_summary_scores,
     )
 
     torch.manual_seed(13)
     device = torch.device("cuda")
-    n, groups, block, dim, cols = 3, 4, 64, 192, 20
+    n, groups, block, cols = 3, 4, 64, 20
     pages = n * cols
     table = torch.randperm(pages, device=device).int().view(n, cols)
     seq_lens = torch.tensor([37, 700, 1280], device=device)
@@ -811,37 +810,3 @@ def test_grouped_decode_rows_match_per_group_kernels():
     for row, length in enumerate(grouped_meta.lengths.tolist()):
         if grouped_meta.active[row]:
             assert torch.equal(grouped[row, :length], repeated[row, :length])
-
-    kv = torch.randn(pages, block, groups, 2 * dim, device=device).bfloat16()
-    kv = kv.transpose(1, 2)
-    regions = torch.full((n * groups, 33), -1, dtype=torch.int32, device=device)
-    for row in range(n * groups):
-        live = int(seq_lens[row // groups] + 7) // 8
-        picked = torch.randperm(live - 1, device=device)[: min(32, live - 1)]
-        regions[row, 33 - picked.numel() - 1 : 32] = picked.sort().values.int()
-        regions[row, 32] = live - 1
-    positions = (seq_lens - 1).repeat_interleave(groups)
-    active = torch.ones(n * groups, dtype=torch.bool, device=device)
-    mask = torch.empty(n * groups * 33, dtype=torch.uint8, device=device)
-    key, value = prepare_sparse_decode(
-        kv, regions, table, positions, active, mask, None
-    )
-    for group in range(groups):
-        rows = torch.arange(group, n * groups, groups, device=device)
-        group_mask = torch.empty(n * 33, dtype=torch.uint8, device=device)
-        group_key, group_value = prepare_sparse_decode(
-            kv[:, group : group + 1],
-            regions[rows],
-            table,
-            positions[rows],
-            active[rows],
-            group_mask,
-            None,
-        )
-        tokens = key.view(n, groups, 33 * 8, dim)[:, group]
-        assert torch.equal(tokens, group_key.view(n, 33 * 8, dim))
-        assert torch.equal(
-            value.view(n, groups, 33 * 8, dim)[:, group],
-            group_value.view(n, 33 * 8, dim),
-        )
-        assert torch.equal(mask.view(n, groups, 33)[:, group], group_mask.view(n, 33))

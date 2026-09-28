@@ -13,6 +13,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+# PDL: kernels launch during the producer's tail and gdc_wait before reading
+# its outputs. No early trigger, so their writes stay visible downstream.
 _PDL = current_platform.is_arch_support_pdl()
 
 
@@ -54,8 +56,6 @@ def _sparse_decode_split(
     FP8: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    # PDL: launch overlaps the producer's tail; wait before reading its
-    # outputs. No early trigger, so our writes stay visible downstream.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     # Row r is KV group r % GROUPS; its request is r // ROWS_PER_REQUEST.
@@ -191,8 +191,6 @@ def _sparse_decode_combine(
     GATE_HEAD: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    # PDL: launch overlaps the producer's tail; wait before reading its
-    # outputs. No early trigger, so our writes stay visible downstream.
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
