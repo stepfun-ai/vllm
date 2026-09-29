@@ -233,6 +233,16 @@ def warmup_kernels(
         rejection_sampler.enable_adaptive_verification = False
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+        if model_runner.num_speculative_steps > 0 and not model_runner.is_pooling_model:
+            # Requests without logits processing verify drafts on the model's
+            # logits dtype rather than FP32, which Triton compiles separately.
+            _warmup_kernels(
+                model_runner,
+                worker_execute_model,
+                worker_sample_tokens,
+                sampling_params=SamplingParams(temperature=0.0),
+                max_num_reqs=1,
+            )
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -244,6 +254,8 @@ def _warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    sampling_params: SamplingParams | None = None,
+    max_num_reqs: int | None = None,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -293,6 +305,7 @@ def _warmup_kernels(
         model_runner.scheduler_config.max_num_seqs,
         model_runner.scheduler_config.max_num_batched_tokens
         // max(prompt_len, decode_query_len),
+        max_num_reqs or model_runner.scheduler_config.max_num_seqs,
     )
     if max_blocks_per_req > 0:
         # Reserve block 0 (null block) and ensure we have enough blocks.
@@ -313,7 +326,7 @@ def _warmup_kernels(
         pooling_params = PoolingParams(task=pooling_task)
         pooling_params.verify(model_runner.model_config)
     else:
-        sampling_params = SamplingParams.for_sampler_warmup()
+        sampling_params = sampling_params or SamplingParams.for_sampler_warmup()
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.

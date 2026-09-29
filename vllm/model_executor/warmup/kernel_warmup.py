@@ -147,7 +147,7 @@ def _warmup_attention_backends(model_runner: "GPUModelRunner") -> None:
     max_num_reqs = getattr(model_runner, "max_num_reqs", None)
     if max_num_reqs is None:
         scheduler_config = getattr(model_runner, "scheduler_config", None)
-        max_num_reqs = getattr(scheduler_config, "max_num_seqs", 1)
+        max_num_reqs = getattr(scheduler_config, "max_num_seqs", None) or 1
     max_num_reqs = max(1, int(max_num_reqs))
     num_decode_reqs = min(max_num_reqs, 2)
     num_decode_reqs = min(
@@ -191,7 +191,7 @@ def deep_gemm_kernel_warmup(worker: "Worker") -> None:
         deep_gemm_warmup(
             worker.get_model(), worker.scheduler_config.max_num_batched_tokens
         )
-    worker._deep_gemm_warmup_done = True
+    worker._deep_gemm_warmup_done = True  # type: ignore[attr-defined]
 
 
 def _warmup_bf16x3_router_gemm(
@@ -254,6 +254,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
+    from vllm.model_executor.warmup.step5_dsa_warmup import step5_dsa_warmup
 
     if not worker.use_v2_model_runner:
         # The KV-block zeroing kernel is driven by the scheduler's
@@ -318,6 +319,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
     deepseek_v4_sparse_mla_attention_warmup(worker)
+    step5_dsa_warmup(worker)
 
     deep_gemm_kernel_warmup(worker)
 

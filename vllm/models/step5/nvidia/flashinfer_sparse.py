@@ -157,6 +157,58 @@ class Step5FlashInferSparse:
             paged_prefill=paged_prefill,
         )
 
+    def warmup_prefill_scoring(self, max_regions, topk, paired_heads, device):
+        """JIT the scored-prefill variants a startup warmup step cannot reach.
+
+        Per-chunk metadata specializes on the chunk size, which shrinks as the
+        context grows, and paired logits compile for ``next_n = 2``; either
+        would otherwise compile mid-serving on the first such prefill.
+        """
+        from flashinfer.attn_scores import compute_paged_mqa_logits_schedule
+
+        from .ops.prefill_indexer_metadata import prefill_indexer_chunk_size
+
+        rows = torch.arange(2, device=device)
+        owners = torch.zeros(2, dtype=torch.long, device=device)
+        chunk_regions: dict[int, int] = {}
+        for regions in range(topk + 1, max(max_regions, topk + 1) + 1, 256):
+            chunk_regions.setdefault(prefill_indexer_chunk_size(regions), regions)
+        for regions in chunk_regions.values():
+            positions = rows + (regions - 1) * 8
+            self.prefill_metadata(owners, positions, regions, topk)
+        if paired_heads:
+            regions = topk + 1
+            pages = (regions + 127) // 128 * 4
+            packed = torch.zeros((pages, 32, 1, 260), dtype=torch.uint8, device=device)
+            lengths = torch.full((1,), regions, dtype=torch.int32, device=device)
+            self._logits(
+                q=torch.zeros(
+                    (1, 2, paired_heads, 256), dtype=torch.float8_e4m3fn, device=device
+                ),
+                kv_fused=packed,
+                weights=torch.zeros((2, paired_heads), device=device),
+                context_lens=lengths,
+                block_table=torch.arange(pages, dtype=torch.int32, device=device)[None],
+                max_context_len=regions,
+                schedule_meta=compute_paged_mqa_logits_schedule(lengths),
+            )
+
+    def prefill_pair_inputs(self, indexer):
+        """Per-chunk (context, table, schedule) of consecutive row pairs."""
+        from flashinfer.attn_scores import compute_paged_mqa_logits_schedule
+
+        pairs = []
+        for meta in indexer:
+            lengths = meta.lengths[1::2].contiguous()
+            pairs.append(
+                (
+                    lengths,
+                    meta.block_table[::2].contiguous(),
+                    compute_paged_mqa_logits_schedule(lengths),
+                )
+            )
+        return pairs
+
     def pack_summaries(self, mean, block_table, regions):
         return pack_summary_pages(mean, block_table, regions)
 
@@ -277,9 +329,26 @@ class Step5FlashInferSparse:
         *,
         block_table=None,
         schedule_meta=None,
+        pairs=None,
+        paired_heads=0,
     ):
+        """With ``pairs`` (from ``prefill_pair_inputs``), consecutive row pairs
+        of one request are scored as ``next_n=2`` on their ``paired_heads``
+        real heads rather than zero-padding each row to the MMA minimum."""
         q = query[:, 0]
         w = weights[:, 0]
+        if pairs is not None:
+            assert q.dtype == torch.float8_e4m3fn and q.shape[0] % 2 == 0
+            pair_lengths, pair_table, pair_schedule = pairs
+            return self._logits(
+                q=q[:, :paired_heads].unflatten(0, (-1, 2)),
+                kv_fused=packed,
+                weights=w[:, :paired_heads],
+                context_lens=pair_lengths,
+                block_table=pair_table,
+                max_context_len=regions,
+                schedule_meta=pair_schedule,
+            )
         if q.dtype != torch.float8_e4m3fn:
             q = q.float()
             w = w.float()

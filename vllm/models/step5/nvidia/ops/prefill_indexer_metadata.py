@@ -119,10 +119,14 @@ def _prepare_prefill_indexer(
 
 
 def prefill_indexer_chunk_size(regions: int) -> int:
-    """Bound FP32 logits to 128 MiB for the model's 1M-token context."""
+    """Bound FP32 logits to 128 MiB for the model's 1M-token context.
+
+    Each chunk costs a few host launches per DSA layer, so chunks are as large
+    as the bound allows.
+    """
     padded_regions = triton.cdiv(max(1, regions), 256) * 256
     rows = max(1, (128 << 20) // (4 * padded_regions))
-    return max(256, min(1024, 1 << (rows.bit_length() - 1)))
+    return max(256, min(4096, 1 << (rows.bit_length() - 1)))
 
 
 def prepare_prefill_indexer(
@@ -191,7 +195,8 @@ def prepare_prefill_indexer(
             triton.next_power_of_2(num_sms + 1),
             need_scores,
             regions if not need_scores else 0,
-            triton.next_power_of_2(regions + 1) if not need_scores else 1,
+            # Sized by topk, not the prompt: every short prompt reuses one variant.
+            triton.next_power_of_2(topk + 1) if not need_scores else 1,
             chunk_size,
             chunk_size.bit_length(),
             num_warps=4,

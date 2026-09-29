@@ -810,3 +810,39 @@ def test_grouped_decode_scores_match_per_group_rows():
     for row, length in enumerate(grouped_meta.lengths.tolist()):
         if grouped_meta.active[row]:
             assert torch.equal(grouped[row, :length], repeated[row, :length])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="B300 integration",
+)
+def test_paired_prefill_logits_match_padded_rows():
+    """Scoring row pairs as next_n=2 equals scoring each zero-padded row."""
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    n, block, topk, heads = 1024, 32, 512, 4
+    context = 9000
+    pages = (context + n) // block + 2
+    table = torch.randperm(pages, device=device).int().unsqueeze(0)
+    mean = torch.randint(0, 120, (pages, block // 8, 256), device=device).to(
+        torch.uint8
+    )
+    positions = torch.arange(context, context + n, device=device)
+    owners = torch.zeros(n, dtype=torch.long, device=device)
+    num_regions = (context + n + 7) // 8
+    adapter = Step5FlashInferSparse(device)
+    (meta,) = adapter.prefill_metadata(owners, positions, num_regions, topk)
+    packed, packed_pages = adapter.pack_summaries(mean, table, num_regions)
+    # The indexer emits zero-padded heads beyond the real ones.
+    query = torch.zeros(n, 1, 8, 256, device=device, dtype=torch.float8_e4m3fn)
+    query[:, :, :heads] = torch.randn(n, 1, heads, 256, device=device).to(query.dtype)
+    weights = torch.zeros(n, 1, 8, device=device)
+    weights[:, :, :heads] = torch.randn(n, 1, heads, device=device)
+    args = (query, weights, packed, packed_pages, owners, meta.lengths, num_regions)
+    padded = adapter.logits(
+        *args, block_table=meta.block_table, schedule_meta=meta.schedule
+    )
+    (pairs,) = adapter.prefill_pair_inputs([meta])
+    paired = adapter.logits(*args, pairs=pairs, paired_heads=heads)
+    for row, length in enumerate(meta.topk_lengths.tolist()):
+        assert torch.equal(paired[row, :length], padded[row, :length])

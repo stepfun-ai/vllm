@@ -346,6 +346,13 @@ def _pack_summaries(
         raise ValueError("Live packing needs decode slots")
     tile_pages = 4 if batch >= 16 and pages >= 256 else 2
     workers = max(triton.cdiv(pages, tile_pages), 1) if live_only else max(pages, 1)
+    # Constexprs only the decode schedule and live packing read. Prefill
+    # passes constants: specializing on the context length or batch would
+    # JIT a new variant mid-serving (~0.4 s) each time one crosses a power of 2.
+    decode = metadata is not None
+    block_batch = triton.next_power_of_2(max(batch, 1)) if decode else 1
+    search_steps = max(batch, 1).bit_length() if decode else 1
+    block_pages = triton.next_power_of_2(max(pages, 1)) if live_only else 1
     if batch and (pages or metadata is not None):
         _pack_summary_pages[(workers, batch)](
             mean,
@@ -365,12 +372,12 @@ def _pack_summaries(
             slots.stride(0) if slots is not None else 0,
             seq_lens.stride(0) if seq_lens is not None else 0,
             batch,
-            triton.next_power_of_2(max(batch, 1)),
+            block_batch,
             num_sms,
             triton.next_power_of_2(num_sms + 1),
-            max(batch, 1).bit_length(),
+            search_steps,
             LIVE_ONLY=live_only,
-            BLOCK_PAGES=triton.next_power_of_2(max(pages, 1)),
+            BLOCK_PAGES=block_pages,
             TILE_PAGES=tile_pages if live_only else 1,
         )
     return packed.view(-1, 32, 1, 260), pages, metadata
@@ -516,6 +523,13 @@ def _stable_topk_regions(
             sorted_col = tl.arange(0, BLOCK_SORT)
             selected = tl.load(output + sorted_col, sorted_col <= K, other=2147483647)
             selected = tl.sort(selected, descending=False)
+        elif PREPARE_PREFILL:
+            # Page metadata reads the row back; the unsorted layout (-1 left
+            # padding, current last) already matches its compact-page contract.
+            tl.debug_barrier()
+            sorted_col = tl.arange(0, BLOCK_SORT)
+            selected = tl.load(output + sorted_col, sorted_col <= K, other=-1)
+            selected = selected.to(tl.int32)
         else:
             selected = tl.full([BLOCK_SORT], -1, tl.int32)
 
@@ -561,8 +575,6 @@ def select_regions(
             raise ValueError("Fused prefill pages require scored prefill only")
         if paged_prefill.block_size not in (16, 32, 64, 128):
             raise ValueError("Unsupported prefill cache block size")
-    if not sort and paged_prefill is not None:
-        raise ValueError("Fused page metadata requires sorted regions")
     if regions <= topk:
         return select_all_regions(current, k)
     output = torch.empty((rows, k + 1), device=scores.device, dtype=torch.long)

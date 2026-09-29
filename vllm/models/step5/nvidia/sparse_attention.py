@@ -293,6 +293,8 @@ class Step5DSAMetadataBuilder(FlashAttentionMetadataBuilder):
 
 class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
     num_speculative_tokens = 0
+    # Real sparse-indexer heads per provider group; 0 disables row pairing.
+    indexer_heads = 0
     can_return_lse_for_decode = False
     supports_dcp = False
 
@@ -363,6 +365,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             sinks=self.sinks,
         )
         self.sparse_topk = sparse_config.topk
+        self.indexer_heads = (
+            sparse_config.sparse_indexer_num_heads // sparse_config.index_tp_size
+        )
         self.max_num_seqs = max_num_seqs or 1
         self.max_num_regions = ((max_model_len or 1048576) + 7) // 8
         self.adapter = None
@@ -609,6 +614,15 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                 else None
             ),
         )
+        # Pairs of consecutive rows of one request fill the logits MMA with
+        # their real heads instead of zero-padding each row to eight heads.
+        paired = (
+            self.adapter.prefill_pair_inputs(indexer)
+            if num_regions > self.sparse_topk
+            and self.indexer_heads * 2 == 8
+            and not (query_lens % 2).any()
+            else None
+        )
         return (
             owners,
             positions,
@@ -618,6 +632,7 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             paged_plan,
             summary_plan,
             staged,
+            paired,
         )
 
     def _forward_prefill(
@@ -648,6 +663,7 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             paged_plan,
             summary_plan,
             staged,
+            paired,
         ) = attn_metadata.step5_runtime
         attn_cache, attn_table = kv_cache, table
         if staged is not None:
@@ -676,7 +692,7 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
             )
         # Bound logits and gathered KV scratch independently of prefill length.
         start = 0
-        for indexer_meta in indexer:
+        for chunk, indexer_meta in enumerate(indexer):
             end = start + indexer_meta.current.numel()
             current = indexer_meta.current
             if packed_summaries is None:
@@ -693,6 +709,8 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                     num_regions,
                     block_table=indexer_meta.block_table,
                     schedule_meta=indexer_meta.schedule,
+                    pairs=paired[chunk] if paired is not None else None,
+                    paired_heads=self.indexer_heads,
                 )
                 selected = self.adapter.select_regions(
                     scores,
@@ -704,6 +722,9 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
                         if paged_plan is not None
                         else None
                     ),
+                    # Attention is order-independent; skipping the 1K sort
+                    # makes selection ~2x cheaper.
+                    sort=False,
                 )
             if paged_plan is not None:
                 if paged_plan.query_buffer is not None:

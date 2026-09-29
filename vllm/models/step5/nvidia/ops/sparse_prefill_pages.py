@@ -12,7 +12,7 @@ from vllm.triton_utils import tl, triton
 from .sparse_indexer import PagedPrefillMetadata
 
 
-@triton.jit(do_not_specialize=["REGION_COUNT"])
+@triton.jit(do_not_specialize=["REGION_COUNT", "REGION_ROW"])
 def _compact_prefill_pages(
     Regions,
     Table,
@@ -27,7 +27,7 @@ def _compact_prefill_pages(
     HEAD_DIM: tl.constexpr,
     QUERY_WIDTH: tl.constexpr,
     REGION_COUNT,
-    REGION_ROW: tl.constexpr,
+    REGION_ROW,
     REGION_COL: tl.constexpr,
     TABLE_ROW: tl.constexpr,
     TABLE_COL: tl.constexpr,

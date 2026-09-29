@@ -89,6 +89,8 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     runner = SimpleNamespace(
         adaptive_verification=manager,
         rejection_sampler=rejection_sampler,
+        num_speculative_steps=0,
+        is_pooling_model=False,
     )
 
     def run_steps(model_runner, execute, sample):
