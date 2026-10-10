@@ -43,7 +43,12 @@ class Step5FlashInferSparse:
         self._topk_backend = (
             config.kernel_config.sparse_indexer_topk_backend if config else "auto"
         )
-        self._logits = fp8_paged_mqa_logits
+        if torch.cuda.get_device_capability(device) == (9, 0):
+            from .ops.sparse_indexer_scores import paged_mqa_logits_sm90
+
+            self._logits = paged_mqa_logits_sm90
+        else:
+            self._logits = fp8_paged_mqa_logits
         properties = torch.cuda.get_device_properties(device)
         self._num_sms = properties.multi_processor_count
         self._workspace = torch.empty(128 << 20, dtype=torch.uint8, device=device)

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B300 DSA integration through MRV2 metadata: prefill and graph replay."""
+"""Hopper/B300 DSA integration through MRV2 metadata: prefill and graph replay."""
 
 import math
 from types import SimpleNamespace
@@ -33,6 +33,7 @@ def mrv2_metadata(default_vllm_config):
         uses_alibi=False,
         rswa_window=None,
         is_mm_prefix_lm=False,
+        is_diffusion=False,
         hf_config=SimpleNamespace(model_type="step5"),
         dtype=torch.bfloat16,
     )
@@ -88,7 +89,7 @@ def mrv2_metadata(default_vllm_config):
             ),
             query_start_loc_cpu=starts,
             max_query_len=max_query_len,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens.to(torch.int32),
             max_seq_len=block_table.shape[1] * block_size,
             block_tables=[block_table],
             slot_mappings=slot_mapping.unsqueeze(0),
@@ -102,8 +103,9 @@ def mrv2_metadata(default_vllm_config):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 @pytest.mark.parametrize("n,topk", [(41, 2), (97, 512), (4105, 512)])
 @pytest.mark.parametrize("groups,heads_per_group", [(1, 8), (2, 16), (4, 16)])
@@ -209,8 +211,9 @@ def test_dsa_chunked_prefill_and_decode_match_causal_reference(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 @pytest.mark.parametrize("groups", [1, 4])
 @pytest.mark.parametrize("block", [16, 32])
@@ -292,8 +295,9 @@ def test_fp8_prefill_matches_bf16_on_dequantized_cache(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 @pytest.mark.parametrize("n,topk", [(43, 2), (4107, 512)])
 @pytest.mark.parametrize("output_padding", [0, 2])
@@ -422,8 +426,9 @@ def test_full_decode_graph_replay_matches_eager_with_padding(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 @pytest.mark.parametrize("groups", [1, 4])
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3])
@@ -620,8 +625,9 @@ def test_mtp_verify_graph_decode_matches_prefill_path(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 @pytest.mark.parametrize("groups", [1, 4])
 @pytest.mark.parametrize("fp8", [False, True])
@@ -756,8 +762,9 @@ def test_builder_planned_prefill_is_sync_free(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 def test_grouped_decode_scores_match_per_group_rows():
     """DEP folds (token, KV group) into rows; each row must see its group only."""
@@ -813,8 +820,9 @@ def test_grouped_decode_scores_match_per_group_rows():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300 integration",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300 integration",
 )
 def test_paired_prefill_logits_match_padded_rows():
     """Scoring row pairs as next_n=2 equals scoring each zero-padded row."""

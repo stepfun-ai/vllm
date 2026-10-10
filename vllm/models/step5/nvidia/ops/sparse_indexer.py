@@ -580,10 +580,6 @@ def select_regions(
     output = torch.empty((rows, k + 1), device=scores.device, dtype=torch.long)
     if not rows:
         return output
-    # DeepSelect requires the output row stride to be a multiple of 32 bytes.
-    indices = torch.empty(
-        (rows, triton.cdiv(k, 8) * 8), device=scores.device, dtype=torch.int32
-    )[:, :k]
     # Step5 requires exact FP32 ordering. The cooperative/persistent backends
     # can select the wrong cutoff for scores separated by one FP32 epsilon.
     if backend == "auto":
@@ -597,6 +593,13 @@ def select_regions(
         raise ValueError(
             "Step5 requires exact FP32 top-k; use auto, deep_select, or per_row."
         )
+    # Only DeepSelect guarantees a deterministic unsorted selection order.
+    sort = sort or backend != "deep_select"
+    # DeepSelect needs 32-byte row alignment; per_row writes contiguous rows.
+    stride = triton.cdiv(k, 8) * 8 if backend == "deep_select" else k
+    indices = torch.empty((rows, stride), device=scores.device, dtype=torch.int32)[
+        :, :k
+    ]
     get_indexer_topk(backend)(
         scores,
         current.to(torch.int32).contiguous() if topk_lengths is None else topk_lengths,

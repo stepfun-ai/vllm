@@ -8,8 +8,9 @@ import torch
 from vllm.models.step5.nvidia.ops.swa_decode import swa_decode_gated
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300",
 )
 
 

@@ -10,8 +10,9 @@ from vllm.models.step5.nvidia.ops.sparse_decode_attention import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-    reason="B300",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((9, 0), (10, 3)),
+    reason="Hopper or B300",
 )
 
 
@@ -117,7 +118,8 @@ def test_sparse_decode_fused_gate_matches_gate_kernel(groups, heads, splits):
     torch.testing.assert_close(fused.reshape(tokens, -1), expected, rtol=0, atol=0)
 
 
-def test_unsorted_selection_keeps_decode_layout():
+@pytest.mark.parametrize("topk", [2, 7, 512])
+def test_unsorted_selection_keeps_decode_layout(topk):
     """sort=False picks the same regions, left-padded with current last."""
     from vllm.models.step5.nvidia.ops.sparse_indexer import select_regions
 
@@ -127,10 +129,52 @@ def test_unsorted_selection_keeps_decode_layout():
     scores = torch.randn(len(lengths), 2048, device=device)
     scores[3, :100] = 0.5
     current = torch.tensor(lengths, device=device)
-    expected = select_regions(scores, current, 512)
-    actual = select_regions(scores, current, 512, sort=False)
+    expected = select_regions(scores, current, topk)
+    actual = select_regions(scores, current, topk, backend="per_row", sort=False)
     for row, length in enumerate(lengths):
-        live = min(length, 512)
-        assert (actual[row, : 512 - live] == -1).all()
-        assert actual[row, 512] == length
-        assert torch.equal(actual[row].sort().values, expected[row])
+        live = min(length, topk)
+        assert (actual[row, : topk - live] == -1).all()
+        assert actual[row, topk] == length
+        assert torch.equal(actual[row], expected[row])
+        reference = scores[row, :length].argsort(descending=True, stable=True)[:live]
+        assert torch.equal(
+            actual[row, topk - live : topk].sort().values, reference.sort().values
+        )
+
+
+@pytest.mark.parametrize("heads,next_n", [(4, 2), (8, 1), (8, 2), (16, 1)])
+def test_hopper_paged_scores_match_reference(heads, next_n):
+    """Packed scales, query pairs and page boundaries preserve weighted logits."""
+    from vllm.models.step5.nvidia.ops.sparse_indexer_scores import paged_mqa_logits_sm90
+
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    batch, regions, block, dim = 3, 257, 32, 256
+    pages_per_request = (regions + block - 1) // block
+    pages = batch * pages_per_request
+    table = torch.randperm(pages, device=device).int().view(batch, pages_per_request)
+    lengths = torch.tensor([0, 33, regions], dtype=torch.int32, device=device)
+    keys = torch.randn(pages, block, dim, device=device).to(torch.float8_e4m3fn)
+    scales = torch.rand(pages, block, device=device) + 0.25
+    packed = torch.empty((pages, block * (dim + 4)), dtype=torch.uint8, device=device)
+    packed[:, : block * dim] = keys.view(torch.uint8).reshape(pages, -1)
+    packed[:, block * dim :] = scales.view(torch.uint8).reshape(pages, -1)
+    packed = packed.view(pages, block, 1, dim + 4)
+    q = torch.randn(batch, next_n, heads + 4, dim, device=device).to(
+        torch.float8_e4m3fn
+    )
+    q = q[:, :, :heads]  # Preserve the strides of a projection split.
+    weights = torch.randn(batch * next_n, heads + 4, device=device)[:, :heads]
+    actual = paged_mqa_logits_sm90(q, packed, weights, lengths, table, regions)
+    for request, length in enumerate(lengths.tolist()):
+        rows = slice(request * next_n, (request + 1) * next_n)
+        positions = torch.arange(length, device=device)
+        physical = table[request, positions // block].long()
+        k = keys.float()[physical, positions % block].double()
+        dot = torch.einsum("nhd,rd->nhr", q[request].double(), k).clamp_min(0)
+        expected = (dot * weights[rows].double()[:, :, None]).sum(1)
+        expected *= scales[physical, positions % block].double()
+        torch.testing.assert_close(
+            actual[rows, :length].double(), expected, rtol=2e-5, atol=1e-4
+        )
+        assert torch.isneginf(actual[rows, length:]).all()

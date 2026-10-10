@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""B300 sparse attention using FlashInfer and PyTorch."""
+"""Hopper and B300 sparse attention using FlashInfer and Triton."""
 
 import functools
 from typing import Any, ClassVar, NamedTuple, cast
@@ -328,8 +328,12 @@ class Step5DSAAttentionImpl(Step5SplitKVFlashAttentionImpl):
         )
         self.kv_cache_dtype = kv_cache_dtype
         config = get_current_vllm_config_or_none()
-        if not current_platform.is_device_capability(103):
-            raise NotImplementedError("Step5 DSA currently supports B300 (SM103) only")
+        capability = current_platform.get_device_capability()
+        if (
+            capability is None
+            or not Step5DSAAttentionBackend.supports_compute_capability(capability)
+        ):
+            raise NotImplementedError("Step5 DSA requires SM90 or SM103")
         if config is not None:
             # FlashInfer builds host-side ragged plans before CUDA graph capture.
             config.compilation_config.cudagraph_num_of_warmups = max(
@@ -927,7 +931,7 @@ class Step5DSAAttentionBackend(Step5SplitKVFlashAttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability == DeviceCapability(10, 3)
+        return capability in (DeviceCapability(9, 0), DeviceCapability(10, 3))
 
     @staticmethod
     def get_attention_warmup_num_tokens() -> int:
